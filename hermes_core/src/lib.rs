@@ -14,5 +14,7 @@
 
 pub mod json;
 pub mod rpc;
+pub mod auth;
+pub mod error;
 
 uniffi::setup_scaffolding!();
