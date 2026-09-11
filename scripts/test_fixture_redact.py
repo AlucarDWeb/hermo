@@ -98,6 +98,27 @@ class RedactFrameTest(unittest.TestCase):
         self.assertIn("session_id", out["params"])
         self.assertIn("session_id", out["params"]["payload"])
 
+    def test_widened_field_list_and_prompt_type_guard(self):
+        frame = {
+            "params": {
+                "payload": {
+                    "instructions": "system instructions",
+                    "working_directory": "/home/me/proj",
+                    "tools": {"shell": ["bash"]},
+                    "prompt": "a prompt body",
+                    "usage": {"prompt": 1234, "completion": 56},
+                }
+            }
+        }
+        payload = fr.redact_frame(frame)["params"]["payload"]
+        self.assertEqual(payload["instructions"], fr.REDACTED)
+        self.assertEqual(payload["working_directory"], fr.REDACTED)
+        self.assertEqual(payload["tools"], {})
+        self.assertEqual(payload["prompt"], fr.REDACTED)
+        # `usage.prompt` is a numeric token count and must survive untouched
+        self.assertEqual(payload["usage"]["prompt"], 1234)
+        self.assertEqual(payload["usage"]["completion"], 56)
+
     def test_redaction_is_idempotent(self):
         frame = {
             "params": {

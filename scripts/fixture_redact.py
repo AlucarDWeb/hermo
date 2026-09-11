@@ -7,9 +7,14 @@ installed skill list, MCP server status and the absolute cwd. None of that belon
 public repository, so every frame passes through `redact_frame()` before it is written,
 and existing fixtures can be cleaned in place.
 
-The scrub is recursive and key-based: it redacts by field name at any depth, so it keeps
-working when the gateway nests these payloads differently in a future version. Durable
-session ids (`session_id` / `stored_session_id`) are redacted by VALUE in event payloads
+The field lists are deliberately wider than today's payloads: `instructions`, the
+`working_directory` aliases, camelCase prompt aliases and a **string** `prompt` (a numeric
+`usage.prompt` token count must survive) are redacted too, and `tools` is emptied alongside
+`skills` / `mcp_servers` / `skill_commands`, because a future gateway shape must not slip
+through the same list that missed the durable `session.title.session_id`.
+
+The scrub is recursive and key-based (by field name, at any depth). Durable session ids
+(`session_id` / `stored_session_id`) are redacted by VALUE in event payloads
 (the key is kept so the shape stays recognizable); the per-turn `session_id` on `params`
 is a short-lived id and stays untouched.
 
@@ -28,15 +33,18 @@ REDACTED = "<redacted>"
 _SCALAR_FIELDS = (
     "system_prompt",
     "systemPrompt",
+    "instructions",
     "stored_session_id",
     "storedSessionId",
     "conversation_id",
     "conversationId",
     "session_key",
     "sessionKey",
+    "working_directory",
+    "working_dir",
 )
-#: Collection fields that leak the user's installed capabilities.
-_COLLECTION_FIELDS = ("skills", "mcp_servers", "skill_commands")
+#: Collection fields that leak the user's installed capabilities or environment.
+_COLLECTION_FIELDS = ("skills", "mcp_servers", "skill_commands", "tools")
 #: Durable-id fields whose VALUE is redacted wherever they appear (key kept).
 _SESSION_ID_VALUE_FIELDS = ("session_id", "stored_session_id", "sessionId", "storedSessionId")
 
@@ -53,6 +61,10 @@ def _scrub(node) -> None:
                 node[key] = "/redacted"
             elif key in _SESSION_ID_VALUE_FIELDS and isinstance(value, str) and value:
                 # Redact the durable-id VALUE, keep the key so the shape stays.
+                node[key] = REDACTED
+            elif key == "prompt" and isinstance(value, str) and value:
+                # `usage.prompt` is a numeric token count and must survive; a string
+                # `prompt` is a prompt body wherever it appears.
                 node[key] = REDACTED
             else:
                 _scrub(value)
