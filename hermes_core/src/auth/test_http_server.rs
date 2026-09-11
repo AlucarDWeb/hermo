@@ -24,6 +24,8 @@ pub enum RouteKind {
     Ticket,
     Me,
     Logout,
+    /// A request a gated route refused for a missing cookie.
+    Denied,
 }
 
 /// Static route config: kind → (status, body, optional Set-Cookie).
@@ -33,11 +35,17 @@ pub struct Route {
     pub status: StatusCode,
     pub body: Value,
     pub set_cookie: Option<String>,
+    /// Wire-level gate (PR #3 finding 1): when set, a request whose
+    /// `Cookie` header does not contain this substring is answered 401
+    /// regardless of `status` — the fake backend then inspects the wire
+    /// like the real dashboard does instead of answering every ticket
+    /// request blind. Test-only cookie values, never real secrets.
+    pub require_cookie: Option<String>,
 }
 
 impl Route {
     pub fn status(status: StatusCode, body: Value) -> Self {
-        Self { kind: RouteKind::Status, status, body, set_cookie: None }
+        Self { kind: RouteKind::Status, status, body, set_cookie: None, require_cookie: None }
     }
 
     pub fn login_ok() -> Self {
@@ -46,7 +54,8 @@ impl Route {
             status: StatusCode::OK,
             body: json!({"ok": true, "next": "/"}),
             // Test-only fixed value, never a real session secret.
-            set_cookie: Some("hermo_session_at=test-access-cookie; Path=/".into()),
+            set_cookie: Some("hermes_session_at=test-access-cookie; Path=/".into()),
+            require_cookie: None,
         }
     }
 
@@ -56,15 +65,23 @@ impl Route {
             status,
             body: json!({"detail": "invalid credentials"}),
             set_cookie: None,
+            require_cookie: None,
         }
     }
 
-    pub fn ticket_ok() -> Self {
+    /// The gated ws-ticket route: answers 401 unless the request carries
+    /// the access cookie the login route set. This is what makes the
+    /// cookie-reuse test non-tautological — a ticket hit proves the jar
+    /// actually carried the cookie over the wire. (The old ungated
+    /// `ticket_ok()` was removed: a ticket route that answers blind is
+    /// exactly what PR #3 finding 1 forbids.)
+    pub fn ticket_gated() -> Self {
         Self {
             kind: RouteKind::Ticket,
             status: StatusCode::OK,
             body: json!({"ticket": "test-ticket-1", "ttl_seconds": 30}),
             set_cookie: None,
+            require_cookie: Some("hermes_session_at=test-access-cookie".into()),
         }
     }
 
@@ -74,6 +91,7 @@ impl Route {
             status,
             body: json!({"detail": "unauthorized"}),
             set_cookie: None,
+            require_cookie: None,
         }
     }
 
@@ -83,6 +101,7 @@ impl Route {
             status: StatusCode::OK,
             body: json!({"username": "hermo-test", "provider": "basic"}),
             set_cookie: None,
+            require_cookie: None,
         }
     }
 
@@ -92,6 +111,7 @@ impl Route {
             status: StatusCode::OK,
             body: json!({"ok": true}),
             set_cookie: None,
+            require_cookie: None,
         }
     }
 }
@@ -203,10 +223,32 @@ async fn serve_one(
 
     let path_only = path.split('?').next().unwrap_or_default();
     let kind = kind_for_path(path_only);
+    // Wire inspection (PR #3 finding 1): the raw `Cookie` header, so a
+    // route can refuse requests that did not carry the login cookie.
+    let cookie_header = head
+        .split("\r\n")
+        .find_map(|l| l.strip_prefix("Cookie: ").or_else(|| l.strip_prefix("cookie: ")))
+        .unwrap_or_default()
+        .to_string();
     let (status_line, extra_headers, body) = match kind.and_then(|k| {
         routes.iter().find(|r| r.kind == k).map(|r| (k, r))
     }) {
         Some((kind, route)) => {
+            if let Some(required) = &route.require_cookie {
+                if !cookie_header.contains(required.as_str()) {
+                    // Missing cookie on the wire: 401, exactly like the
+                    // real dashboard's gated ws-ticket route. Not counted
+                    // as a "handled" hit for the OK route.
+                    *counters.lock().entry(RouteKind::Denied).or_insert(0) += 1;
+                    return write_response(
+                        stream,
+                        "HTTP/1.1 401 Unauthorized\r\n",
+                        "",
+                        &json!({"detail": "unauthorized: missing session cookie"}).to_string(),
+                    )
+                    .await;
+                }
+            }
             *counters.lock().entry(kind).or_insert(0) += 1;
             let set_cookie = route
                 .set_cookie
@@ -225,6 +267,15 @@ async fn serve_one(
             json!({"detail": "no such route"}).to_string(),
         ),
     };
+    write_response(stream, &status_line, &extra_headers, &body).await
+}
+
+async fn write_response(
+    mut stream: TcpStream,
+    status_line: &str,
+    extra_headers: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let response = format!(
         "{status_line}Content-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()

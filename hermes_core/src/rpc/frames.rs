@@ -57,6 +57,19 @@ pub struct RpcError {
     pub data: Value,
 }
 
+// PR #3 finding 6 (Dependency Rule): the entity (`error.rs`) must not
+// import adapter types, so the `From<…> for CoreError` impls live next to
+// the types that define them — an impl may live on either side of the
+// `From` arrow. Conversion behaviour unchanged from the previous home.
+impl From<RpcError> for crate::error::CoreError {
+    fn from(e: RpcError) -> Self {
+        crate::error::CoreError::Rpc {
+            code: e.code,
+            message: e.message,
+        }
+    }
+}
+
 /// Split one WebSocket text frame into JSON lines. Empty lines are dropped;
 /// the returned strings keep no trailing newline.
 pub fn split_lines(frame: &str) -> Vec<&str> {
@@ -340,5 +353,19 @@ mod tests {
                 other => panic!("expected Event, got {:?}", other),
             }
         }
+    }
+
+    /// PR #3 finding 6: this test moved here with the `From<RpcError>`
+    /// impl it pins (it lived in `error.rs`, which must not know adapter
+    /// types). Behaviour unchanged: an RPC error carries its code through.
+    #[test]
+    fn rpc_error_converts_to_core_error() {
+        let e: crate::error::CoreError = RpcError {
+            code: 4009,
+            message: "session busy".into(),
+            data: Value::Null,
+        }
+        .into();
+        assert!(matches!(e, crate::error::CoreError::Rpc { code: 4009, .. }));
     }
 }

@@ -7,11 +7,13 @@
 //! primitive fields) but is not yet exported at the FFI boundary: no
 //! exported interface references it in this stream, so the derive would
 //! only add unused scaffolding.
+//!
+//! Dependency Rule (PR #3 finding 6): the entity must not import adapter
+//! types, so the `From<RpcError>` / `From<ClientError>` impls live next to
+//! the types that define them (`rpc::frames`, `rpc::client`) — an impl can
+//! always live on either side of the arrow.
 
 use thiserror::Error;
-
-use crate::rpc::client::ClientError;
-use crate::rpc::frames::RpcError;
 
 /// Every error the core can surface to a foreign caller.
 #[derive(Debug, Clone, Error)]
@@ -41,6 +43,17 @@ pub enum CoreError {
     /// 401 on a cookie-authenticated call — re-login required.
     #[error("session expired — re-login required")]
     SessionExpired,
+    /// 403 on the WebSocket handshake — the gateway rejected the upgrade
+    /// (auth/host/origin guard, PLAN §1.1: pre-accept rejections surface as
+    /// HTTP 403, the client never sees a close frame). Deliberately NOT
+    /// [`CoreError::Network`]: the app must not retry as if it were offline,
+    /// and the UI must not parse `Network(String)` (PR #3 finding 4).
+    #[error("upgrade rejected by gateway")]
+    UpgradeRejected,
+    /// A stored endpoint URL is malformed (not a QR problem — that is
+    /// [`CoreError::InvalidQr`]).
+    #[error("invalid endpoint url: {0}")]
+    InvalidEndpoint(String),
     /// 429 — the auth backend is rate limiting.
     #[error("rate limited")]
     RateLimited,
@@ -50,26 +63,6 @@ pub enum CoreError {
     /// Any other non-success HTTP status.
     #[error("http status {0}")]
     Http(u16),
-}
-
-impl From<RpcError> for CoreError {
-    fn from(e: RpcError) -> Self {
-        CoreError::Rpc {
-            code: e.code,
-            message: e.message,
-        }
-    }
-}
-
-impl From<ClientError> for CoreError {
-    fn from(e: ClientError) -> Self {
-        match e {
-            ClientError::Rpc { code, message } => CoreError::Rpc { code, message },
-            ClientError::Timeout(_) => CoreError::Timeout,
-            ClientError::Closed(_) => CoreError::NotConnected,
-            ClientError::Transport(s) => CoreError::Network(s),
-        }
-    }
 }
 
 impl From<std::io::Error> for CoreError {
@@ -82,32 +75,9 @@ impl From<std::io::Error> for CoreError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rpc_error_converts() {
-        let e: CoreError = RpcError {
-            code: 4009,
-            message: "session busy".into(),
-            data: serde_json::Value::Null,
-        }
-        .into();
-        assert!(matches!(e, CoreError::Rpc { code: 4009, .. }));
-    }
-
-    #[test]
-    fn client_error_maps_losslessly_where_it_matters() {
-        let timeout: CoreError = ClientError::Timeout(std::time::Duration::from_secs(1)).into();
-        assert!(matches!(timeout, CoreError::Timeout));
-        let closed: CoreError = ClientError::Closed("heartbeat timeout".into()).into();
-        assert!(matches!(closed, CoreError::NotConnected));
-        let transport: CoreError = ClientError::Transport("reset".into()).into();
-        assert!(matches!(transport, CoreError::Network(_)));
-        let rpc: CoreError = ClientError::Rpc {
-            code: 5000,
-            message: "boom".into(),
-        }
-        .into();
-        assert!(matches!(rpc, CoreError::Rpc { code: 5000, .. }));
-    }
+    // The From<…> for CoreError impls moved next to the types that define
+    // them (rpc/frames.rs, rpc/client.rs) — PR #3 finding 6 (Dependency
+    // Rule). The conversion behaviour they pin is unchanged.
 
     #[test]
     fn no_reqwest_or_tungstenite_type_in_display_paths() {

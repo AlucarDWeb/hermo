@@ -58,9 +58,11 @@ fn strip_trailing_slashes(mut url: Url) -> Url {
 /// Parse a `hermes://connect?...` QR payload.
 ///
 /// Rejects: a scheme other than `hermes`, `v != 1`, a missing `url`, a
-/// `url` whose scheme is not `http`/`https`. Every value is
-/// percent-decoded (a `+`-bearing display name and a percent-encoded
-/// space must both survive).
+/// `url` whose scheme is not `http`/`https`, and a `url` carrying embedded
+/// credentials (`http://user:pass@host`) — a dashboard base URL never has
+/// userinfo, and silently accepting one would send passwords in a URL
+/// (PR #3 nit). Every value is percent-decoded (a `+`-bearing display name
+/// and a percent-encoded space must both survive).
 pub fn parse_qr_payload(payload: &str) -> Result<GatewayEndpoint, CoreError> {
     let url = Url::parse(payload.trim()).map_err(|_| CoreError::InvalidQr)?;
     if url.scheme() != "hermes" {
@@ -99,6 +101,10 @@ pub fn parse_qr_payload(payload: &str) -> Result<GatewayEndpoint, CoreError> {
     if base_url.scheme() != "http" && base_url.scheme() != "https" {
         return Err(CoreError::InvalidQr);
     }
+    // Embedded credentials in the base URL: reject (PR #3 nit).
+    if !base_url.username().is_empty() || base_url.password().is_some() {
+        return Err(CoreError::InvalidQr);
+    }
 
     Ok(GatewayEndpoint {
         base_url: strip_trailing_slashes(base_url),
@@ -116,6 +122,10 @@ pub fn percent_decode(raw: &str) -> String {
 /// Map a dashboard base URL + ws-ticket to the gateway WS URL (PLAN §1.1):
 /// `http`→`ws`, `https`→`wss`, path `/api/ws?ticket=…`, preserving a proxy
 /// prefix path if present (`https://example.com/agent` keeps `/agent`).
+///
+/// The ticket goes in via `set_query_pairs` (PR #3 nit), so ticket
+/// characters that carry query syntax meaning (`&`, `=`, `+`, `%`) are
+/// percent-escaped instead of corrupting the query.
 pub fn ws_url(base: &Url, ticket: &str) -> Url {
     let scheme = match base.scheme() {
         "https" => "wss",
@@ -127,7 +137,14 @@ pub fn ws_url(base: &Url, ticket: &str) -> Url {
     let path = out.path().trim_end_matches('/').to_string();
     let prefix = if path.is_empty() { String::new() } else { path };
     out.set_path(&format!("{prefix}/api/ws"));
-    out.set_query(Some(&format!("ticket={ticket}")));
+    // `query_pairs_mut` percent-escapes the value (PR #3 nit): a ticket
+    // carrying `&`, `=` or `+` cannot corrupt the query string the way a
+    // raw `format!("ticket={t}")` could.
+    {
+        let mut pairs = out.query_pairs_mut();
+        pairs.clear();
+        pairs.append_pair("ticket", ticket);
+    }
     out.set_fragment(None);
     out
 }
@@ -204,6 +221,30 @@ mod tests {
             parse_qr_payload("garbage").unwrap_err(),
             CoreError::InvalidQr
         ));
+    }
+
+    #[test]
+    fn qr_rejects_base_url_with_embedded_credentials() {
+        // PR #3 nit: `http://user:pass@host` must not slip through as a
+        // base URL — credentials never belong in a dashboard endpoint.
+        // The pre-fix parser accepted it and stored the userinfo.
+        let err = parse_qr_payload(
+            "hermes://connect?v=1&url=http%3A%2F%2Fuser%3Apass%40host%3A9123&user=u&name=n",
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidQr));
+    }
+
+    #[test]
+    fn ws_url_escapes_query_syntax_in_ticket() {
+        // PR #3 nit: the ticket goes through `set_query_pairs`, so a
+        // ticket carrying query-syntax characters (`&`, `=`, `+`) cannot
+        // corrupt the query string. The pre-fix `format!("ticket={t}")`
+        // produced `ticket=a&b=c` — two spurious query pairs.
+        let base = Url::parse("http://host:9123").unwrap();
+        let ws = ws_url(&base, "a&b=c+d");
+        assert_eq!(ws.as_str(), "ws://host:9123/api/ws?ticket=a%26b%3Dc%2Bd");
+        assert_eq!(ws.query().unwrap().matches('&').count(), 0, "exactly one query pair");
     }
 
     #[test]
