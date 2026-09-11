@@ -79,7 +79,7 @@ pub fn split_lines(frame: &str) -> Vec<&str> {
 /// The `id` may be a string or a number (PLAN.md §1.2: the server answers
 /// string ids with the same string, but the protocol allows numbers).
 pub fn decode(line: &str) -> Option<Decoded> {
-    let value: Value = serde_json::from_str(line.trim()).ok()?;
+    let mut value: Value = serde_json::from_str(line.trim()).ok()?;
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Some(Decoded::Ignored);
     }
@@ -88,16 +88,24 @@ pub fn decode(line: &str) -> Option<Decoded> {
         // `EventParams` field by field so a mistyped `seq`, a missing `type`
         // or a missing `params` degrades to defaults instead of dropping
         // the frame.
-        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        //
+        // PR #1 review carry-over (PLAN §4 T2 item 6): `message.delta`
+        // arrives coalesced at ~30 fps, so the payload is *moved* out of the
+        // parsed value instead of cloning the subtree per frame.
+        let mut params = value.get_mut("params").map(Value::take).unwrap_or(Value::Null);
         let seq = match params.get("seq") {
             Some(Value::Number(_)) => Some(json::i64_at(&params, "seq")),
             _ => None,
         };
+        let payload = params
+            .as_object_mut()
+            .and_then(|o| o.remove("payload"))
+            .unwrap_or(Value::Null);
         return Some(Decoded::Event(EventParams {
             event_type: json::str_at(&params, "type").to_string(),
             session_id: json::str_at(&params, "session_id").to_string(),
             seq,
-            payload: params.get("payload").cloned().unwrap_or(Value::Null),
+            payload,
         }));
     }
     let id = match id_to_string(value.get("id")) {
@@ -106,19 +114,22 @@ pub fn decode(line: &str) -> Option<Decoded> {
         // route, ignore it.
         None => return Some(Decoded::Ignored),
     };
-    if let Some(err) = value.get("error") {
+    if let Some(err) = value.get_mut("error") {
         let code = json::i64_at(err, "code");
         let message = json::str_at(err, "message").to_string();
-        let data = err.get("data").cloned().unwrap_or(Value::Null);
+        let data = err
+            .as_object_mut()
+            .and_then(|o| o.remove("data"))
+            .unwrap_or(Value::Null);
         return Some(Decoded::Error {
             id,
             error: RpcError { code, message, data },
         });
     }
-    if let Some(result) = value.get("result") {
+    if let Some(result) = value.get_mut("result") {
         return Some(Decoded::Result {
             id,
-            result: result.clone(),
+            result: Value::take(result),
         });
     }
     Some(Decoded::Ignored)
