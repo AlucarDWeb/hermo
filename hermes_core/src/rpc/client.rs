@@ -120,6 +120,21 @@ impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
     }
 }
 
+// PR #3 finding 6 (Dependency Rule): the entity (`error.rs`) must not
+// import adapter types, so the `From<…> for CoreError` impls live next to
+// the types that define them — an impl may live on either side of the
+// `From` arrow. Conversion behaviour unchanged from the previous home.
+impl From<ClientError> for crate::error::CoreError {
+    fn from(e: ClientError) -> Self {
+        match e {
+            ClientError::Rpc { code, message } => crate::error::CoreError::Rpc { code, message },
+            ClientError::Timeout(_) => crate::error::CoreError::Timeout,
+            ClientError::Closed(_) => crate::error::CoreError::NotConnected,
+            ClientError::Transport(s) => crate::error::CoreError::Network(s),
+        }
+    }
+}
+
 /// Connection state, published on a watch channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
@@ -685,4 +700,32 @@ fn spawn_heartbeat(shared: Arc<Shared>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::CoreError;
+
+    /// PR #3 finding 6: this test moved here from `error.rs` together with
+    /// the `From<ClientError>` impl it pins (the entity module must not
+    /// import adapter types). Behaviour unchanged: every adapter error the
+    /// app can see keeps its meaning at the domain boundary — a timeout is
+    /// not a network failure, a closed socket is not a transport reset, and
+    /// an RPC error keeps its code.
+    #[test]
+    fn client_error_maps_losslessly_where_it_matters() {
+        let timeout: CoreError = ClientError::Timeout(Duration::from_secs(1)).into();
+        assert!(matches!(timeout, CoreError::Timeout));
+        let closed: CoreError = ClientError::Closed("heartbeat timeout".into()).into();
+        assert!(matches!(closed, CoreError::NotConnected));
+        let transport: CoreError = ClientError::Transport("reset".into()).into();
+        assert!(matches!(transport, CoreError::Network(_)));
+        let rpc: CoreError = ClientError::Rpc {
+            code: 5000,
+            message: "boom".into(),
+        }
+        .into();
+        assert!(matches!(rpc, CoreError::Rpc { code: 5000, .. }));
+    }
 }

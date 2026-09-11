@@ -682,6 +682,7 @@ dependencies = [
  "futures-util",
  "log",
  "parking_lot",
+ "percent-encoding",
  "reqwest",
  "reqwest_cookie_store",
  "serde",
