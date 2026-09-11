@@ -8,10 +8,15 @@ public repository, so every frame passes through `redact_frame()` before it is w
 and existing fixtures can be cleaned in place.
 
 The scrub is recursive and key-based: it redacts by field name at any depth, so it keeps
-working when the gateway nests these payloads differently in a future version.
+working when the gateway nests these payloads differently in a future version. Durable
+session ids (`session_id` / `stored_session_id`) are redacted by VALUE in event payloads
+(the key is kept so the shape stays recognizable); the per-turn `session_id` on `params`
+is a short-lived id and stays untouched.
 
 Usage:
     python scripts/fixture_redact.py <file.jsonl> [<file.jsonl> ...]
+
+Tests: `python3 -m unittest` from `scripts/`.
 """
 
 import json
@@ -20,9 +25,20 @@ import sys
 
 REDACTED = "<redacted>"
 #: Scalar fields whose value is environment-specific or personal.
-_SCALAR_FIELDS = ("system_prompt", "stored_session_id", "conversation_id")
+_SCALAR_FIELDS = (
+    "system_prompt",
+    "systemPrompt",
+    "stored_session_id",
+    "storedSessionId",
+    "conversation_id",
+    "conversationId",
+    "session_key",
+    "sessionKey",
+)
 #: Collection fields that leak the user's installed capabilities.
 _COLLECTION_FIELDS = ("skills", "mcp_servers", "skill_commands")
+#: Durable-id fields whose VALUE is redacted wherever they appear (key kept).
+_SESSION_ID_VALUE_FIELDS = ("session_id", "stored_session_id", "sessionId", "storedSessionId")
 
 
 def _scrub(node) -> None:
@@ -33,8 +49,11 @@ def _scrub(node) -> None:
                 node[key] = REDACTED
             elif key in _COLLECTION_FIELDS and isinstance(value, (dict, list)):
                 node[key] = {} if isinstance(value, dict) else []
-            elif key == "cwd" and isinstance(value, str) and value.startswith("/"):
+            elif key == "cwd" and isinstance(value, str) and value:
                 node[key] = "/redacted"
+            elif key in _SESSION_ID_VALUE_FIELDS and isinstance(value, str) and value:
+                # Redact the durable-id VALUE, keep the key so the shape stays.
+                node[key] = REDACTED
             else:
                 _scrub(value)
     elif isinstance(node, list):

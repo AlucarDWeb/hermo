@@ -26,10 +26,10 @@ build --jobs=4
 build --worker_max_instances=2
 startup --host_jvm_args=-Xmx4g
 
-# Android packaging configs (app target arrives in T6; the platform targets
-# exist from day 1 for the genrules).
-build:device  --android_platforms=//platforms:android_arm64 --fat_apk_cpu=arm64-v8a
-build:emulator --android_platforms=//platforms:android_x86_64 --fat_apk_cpu=x86_64
+# Android packaging configs — DISABLED until T6: --android_platforms cannot
+# resolve against the minimal MODULE.bazel yet (Android rules arrive in T6).
+# build:device  --android_platforms=//platforms:android_arm64 --fat_apk_cpu=arm64-v8a
+# build:emulator --android_platforms=//platforms:android_x86_64 --fat_apk_cpu=x86_64
 
 # Low-memory profile for the NDK-toolchain builds on this laptop.
 build:lowmem --jobs=2 --worker_max_instances=1

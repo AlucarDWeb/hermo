@@ -29,10 +29,16 @@ events.jsonl
   ["once","session","always","deny"] subset, smart_denied, allow_session,
   allow_permanent).
 
-  Environment-derived payload warning: session.info carries the live agent's
-  system_prompt, skills list and mcp_servers status recorded from the loopback
-  capture. These are chat frames required by the reducer (T4), not credentials,
-  but anyone re-recording should expect the same fields.
+  Environment-derived payload warning: the committed session.info frames no
+  longer carry the live agent's system_prompt, skills list, mcp_servers
+  status, cwd, durable session id or other personal/environment values —
+  scripts/fixture_redact.py has replaced each with `<redacted>` (keys are
+  kept so the frame shape is intact, and a nested `session_id` VALUE inside
+  an event payload is redacted too). These are chat frames required by the
+  reducer (T4), not credentials; anyone RE-RECORDING should expect the live
+  capture to contain all of those fields and must re-run
+  `python scripts/fixture_redact.py hermes_core/tests/fixtures/events.jsonl`
+  before committing.
 
 events_synthetic.jsonl
   Lines 1-2: approval.request frames hand-built to the PLAN.md §1.4 shape —

@@ -69,6 +69,13 @@ pub fn split_lines(frame: &str) -> Vec<&str> {
 
 /// Decode one JSON-RPC line into a [`Decoded`].
 ///
+/// `None` vs `Ignored` policy (pinned by tests): invalid JSON → `None`, the
+/// line carries nothing routable. Valid JSON that is not JSON-RPC 2.0 we
+/// care about → [`Decoded::Ignored`]. A notification without an `id` and
+/// without the known `event` method → [`Decoded::Ignored`]. `event` frames
+/// always decode (tolerantly, field by field) even when `params`, `type` or
+/// `seq` are missing or mistyped.
+///
 /// The `id` may be a string or a number (PLAN.md §1.2: the server answers
 /// string ids with the same string, but the protocol allows numbers).
 pub fn decode(line: &str) -> Option<Decoded> {
@@ -77,10 +84,28 @@ pub fn decode(line: &str) -> Option<Decoded> {
         return Some(Decoded::Ignored);
     }
     if value.get("method").and_then(Value::as_str) == Some("event") {
-        let params: EventParams = serde_json::from_value(value.get("params").cloned()?).ok()?;
-        return Some(Decoded::Event(params));
+        // Tolerant event decoding, like the error path below: build
+        // `EventParams` field by field so a mistyped `seq`, a missing `type`
+        // or a missing `params` degrades to defaults instead of dropping
+        // the frame.
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let seq = match params.get("seq") {
+            Some(Value::Number(_)) => Some(json::i64_at(&params, "seq")),
+            _ => None,
+        };
+        return Some(Decoded::Event(EventParams {
+            event_type: json::str_at(&params, "type").to_string(),
+            session_id: json::str_at(&params, "session_id").to_string(),
+            seq,
+            payload: params.get("payload").cloned().unwrap_or(Value::Null),
+        }));
     }
-    let id = id_to_string(value.get("id"))?;
+    let id = match id_to_string(value.get("id")) {
+        Some(id) => id,
+        // Notification without an id and without a known method: nothing to
+        // route, ignore it.
+        None => return Some(Decoded::Ignored),
+    };
     if let Some(err) = value.get("error") {
         let code = json::i64_at(err, "code");
         let message = json::str_at(err, "message").to_string();
@@ -130,7 +155,7 @@ mod tests {
         match decode(line).expect("decodes") {
             Decoded::Result { id, result } => {
                 assert_eq!(id, "7");
-                assert_eq!(crate::json::bool_at(&result, "ok"), true);
+                assert!(crate::json::bool_at(&result, "ok"));
             }
             other => panic!("expected Result, got {:?}", other),
         }
@@ -196,25 +221,102 @@ mod tests {
             Decoded::Event(ev) => assert_eq!(ev.event_type, "future.thing"),
             other => panic!("expected Event, got {:?}", other),
         }
-        // missing params on an event -> None, no panic
-        assert!(decode(r#"{"jsonrpc":"2.0","method":"event"}"#).is_none());
+        // missing params on an event -> still an Event, with empty type
+        match decode(r#"{"jsonrpc":"2.0","method":"event"}"#).unwrap() {
+            Decoded::Event(ev) => {
+                assert_eq!(ev.event_type, "");
+                assert!(ev.seq.is_none());
+            }
+            other => panic!("expected Event, got {:?}", other),
+        }
     }
 
     #[test]
-    fn first_50_fixture_lines_decode_without_error() {
+    fn event_with_float_seq_and_missing_params_still_decode() {
+        // mistyped `seq` (float): kept, truncated to i64
+        let float_seq = decode(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"message.delta","session_id":"s1","seq":1.0,"payload":{}}}"#,
+        )
+        .expect("float seq must not drop the frame");
+        match float_seq {
+            Decoded::Event(ev) => assert_eq!(ev.seq, Some(1)),
+            other => panic!("expected Event, got {:?}", other),
+        }
+        // missing `params`: the event itself must not vanish
+        let no_params =
+            decode(r#"{"jsonrpc":"2.0","method":"event"}"#).expect("no params must not drop the frame");
+        match no_params {
+            Decoded::Event(ev) => {
+                assert_eq!(ev.event_type, "");
+                assert_eq!(ev.session_id, "");
+                assert!(ev.seq.is_none());
+                assert!(ev.payload.is_null());
+            }
+            other => panic!("expected Event, got {:?}", other),
+        }
+        // missing `type` (and `session_id`): degrades to defaults, not dropped
+        let no_type = decode(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"seq":7,"payload":{"a":1}}}"#,
+        )
+        .expect("no type must not drop the frame");
+        match no_type {
+            Decoded::Event(ev) => {
+                assert_eq!(ev.event_type, "");
+                assert_eq!(ev.seq, Some(7));
+                assert_eq!(crate::json::i64_at(&ev.payload, "a"), 1);
+            }
+            other => panic!("expected Event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decode_none_vs_ignored_policy() {
+        // invalid JSON -> None
+        assert!(decode("not json").is_none());
+        // valid JSON that is not JSON-RPC 2.0 -> Ignored
+        assert!(matches!(decode("[]").unwrap(), Decoded::Ignored));
+        // notification without an id and without the known `event` method -> Ignored
+        assert!(matches!(
+            decode(r#"{"jsonrpc":"2.0","method":"ping"}"#).unwrap(),
+            Decoded::Ignored
+        ));
+    }
+
+    #[test]
+    fn whole_fixture_decodes_and_records_wire_facts() {
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/events.jsonl");
         let data = std::fs::read_to_string(fixture).expect("fixture exists");
-        let lines: Vec<&str> = data.lines().take(50).collect();
-        assert_eq!(lines.len(), 50, "fixture must have >= 50 lines");
+        let lines: Vec<&str> = data.lines().collect();
+        assert!(!lines.is_empty(), "fixture must not be empty");
         let mut events = 0;
+        let mut redirected = false;
+        let mut clarify_request = false;
         for line in lines {
             match decode(line) {
-                Some(Decoded::Event(_)) => events += 1,
-                Some(Decoded::Result { .. }) | Some(Decoded::Error { .. }) | Some(Decoded::Ignored) => {}
+                Some(Decoded::Event(ev)) => {
+                    events += 1;
+                    if ev.event_type == "clarify.request" {
+                        clarify_request = true;
+                    }
+                }
+                Some(Decoded::Result { id, result }) => {
+                    // Mid-turn busy submit: verified status == "redirected" (PROVENANCE).
+                    if id == "r-busy" {
+                        assert_eq!(
+                            crate::json::str_at(&result, "status"),
+                            "redirected",
+                            "busy submit must carry status=redirected"
+                        );
+                        redirected = true;
+                    }
+                }
+                Some(Decoded::Error { .. }) | Some(Decoded::Ignored) => {}
                 None => panic!("line failed to decode defensively: {}", line),
             }
         }
         assert!(events > 0, "fixture lines are mostly events");
+        assert!(redirected, "the r-busy result must be present");
+        assert!(clarify_request, "a clarify.request event must be present");
     }
 
     #[test]
