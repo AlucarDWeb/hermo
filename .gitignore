@@ -2,3 +2,18 @@
 # Everything markdown stays out of the public repo except the README.
 *.md
 !README.md
+
+# Rust / Cargo
+/target/
+**/target/
+
+# Bazel
+/bazel-*
+**/bazel-*
+
+# Local tooling
+.venv-tools/
+
+# OS / editor
+.DS_Store
+*.swp

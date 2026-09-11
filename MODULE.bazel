@@ -1,0 +1,10 @@
+module(
+    name = "hermo",
+    version = "0.1.0",
+)
+
+# Minimal on purpose (stream 1, PLAN.md T1): only the platforms dep the
+# genrules need. rules_android / rules_kotlin / rules_jvm_external /
+# rules_android_ndk (+ patch) / tools/signing arrive with the Android app
+# target in T6; rules_apple + SPM arrive with iOS in T15.
+bazel_dep(name = "platforms", version = "1.0.0")

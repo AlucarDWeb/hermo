@@ -1,0 +1,35 @@
+# hermo — Bazel config, copied structurally from just_nutrients_official_app
+# (READ-ONLY reference). Guards keep this laptop alive during full builds.
+
+# Android (primary on Linux)
+build:android --platforms=//platforms:android_arm64
+build:android_armv7 --platforms=//platforms:android_armv7
+build:android_x86_64 --platforms=//platforms:android_x86_64
+
+common --enable_bzlmod
+
+# Build environment the Cargo genrules and SDK discovery rely on.
+build --action_env=PATH --action_env=HOME --action_env=ANDROID_NDK_HOME
+build --action_env=ANDROID_HOME --action_env=ANDROID_SDK_ROOT
+build --action_env=CARGO_HOME --action_env=RUSTUP_HOME
+
+# rules_java toolchains: JDK 25's ct.sym breaks turbine_direct_graal; build
+# host java tools against 21 (Android app targets arrive in T6 — keep the
+# guards now so they are in place).
+build --java_language_version=21
+build --tool_java_language_version=21
+build --java_runtime_version=remotejdk_21
+build --tool_java_runtime_version=remotejdk_21
+
+# Laptop guard: this box froze once on a full build. Cap parallelism.
+build --jobs=4
+build --worker_max_instances=2
+startup --host_jvm_args=-Xmx4g
+
+# Android packaging configs (app target arrives in T6; the platform targets
+# exist from day 1 for the genrules).
+build:device  --android_platforms=//platforms:android_arm64 --fat_apk_cpu=arm64-v8a
+build:emulator --android_platforms=//platforms:android_x86_64 --fat_apk_cpu=x86_64
+
+# Low-memory profile for the NDK-toolchain builds on this laptop.
+build:lowmem --jobs=2 --worker_max_instances=1

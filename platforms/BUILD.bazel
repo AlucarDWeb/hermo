@@ -1,0 +1,28 @@
+package(default_visibility = ["//visibility:public"])
+
+# Android platform targets (iOS platforms are deferred to T15 on the Mac mini;
+# they will be added with exec_compatible_with = ["@platforms//os:macos"]).
+
+platform(
+    name = "android_arm64",
+    constraint_values = [
+        "@platforms//os:android",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+platform(
+    name = "android_armv7",
+    constraint_values = [
+        "@platforms//os:android",
+        "@platforms//cpu:arm",
+    ],
+)
+
+platform(
+    name = "android_x86_64",
+    constraint_values = [
+        "@platforms//os:android",
+        "@platforms//cpu:x86_64",
+    ],
+)
