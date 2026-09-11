@@ -1,0 +1,4 @@
+# Local-only docs: plans, task files, notes, handoffs.
+# Everything markdown stays out of the public repo except the README.
+*.md
+!README.md
