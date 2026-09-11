@@ -25,7 +25,3 @@ scripts/       build and deploy helpers
 
 Build graph is Bazel; Cargo compiles the Rust through genrules. The crate and the app code do not
 depend on that choice.
-
-## Design notes
-
-Planning and design documents are intentionally kept out of this repository.
