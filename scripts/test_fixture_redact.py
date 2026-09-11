@@ -3,6 +3,7 @@
 Run from scripts/:  python3 -m unittest test_fixture_redact
 """
 
+import json
 import unittest
 
 import fixture_redact as fr
@@ -120,19 +121,27 @@ class RedactFrameTest(unittest.TestCase):
         self.assertEqual(payload["usage"]["completion"], 56)
 
     def test_redaction_is_idempotent(self):
-        frame = {
-            "params": {
-                "payload": {
-                    "system_prompt": "p",
-                    "cwd": "/home/me/x",
-                    "session_id": "20260911_130514_77a77f",
-                    "skills": {"a": [1]},
+        # Redact the JSON *text*: redact_frame mutates in place, so comparing two
+        # calls on the same dict object would be tautological (review finding).
+        raw = json.dumps(
+            {
+                "params": {
+                    "payload": {
+                        "system_prompt": "p",
+                        "cwd": "/home/me/x",
+                        "session_id": "20260911_130514_77a77f",
+                        "skills": {"a": [1]},
+                        "tools": {"shell": ["bash"]},
+                    }
                 }
             }
-        }
-        once = fr.redact_frame(dict(frame))
-        twice = fr.redact_frame(once)
+        )
+        once = fr.redact_line(raw)
+        twice = fr.redact_line(once)
         self.assertEqual(once, twice)
+        self.assertEqual(fr.redact_line(twice), twice)
+        self.assertNotIn("20260911_", once)
+        self.assertNotIn("/home/me", once)
 
 
 if __name__ == "__main__":
