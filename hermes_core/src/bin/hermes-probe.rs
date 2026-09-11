@@ -35,7 +35,9 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
-        url: "http://127.0.0.1:9119".into(),
+        // No default: the gateway must be named explicitly (fix pass item 9
+        // — never silently point at a local 9119).
+        url: String::new(),
         token: None,
         prompt: String::new(),
         record: None,
@@ -59,6 +61,9 @@ fn parse_args() -> Result<Args, String> {
             "--watch-close" => args.watch_close = true,
             other => return Err(format!("unknown flag {other}")),
         }
+    }
+    if args.url.is_empty() {
+        return Err("--url is required (dashboard base URL, e.g. http://127.0.0.1:9119)".into());
     }
     if args.prompt.is_empty() {
         return Err("--prompt is required".into());
@@ -200,7 +205,6 @@ async fn main() {
                         break;
                     }
                 }
-                Ok(GatewayEvent::Watermark { .. }) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     eprintln!("hermes-probe: lagged, dropped {n} events");
                 }

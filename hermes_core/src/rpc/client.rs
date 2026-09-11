@@ -8,11 +8,11 @@
 //! Wire facts (PLAN.md §1.1, verified against Hermes v0.21.1): text frames,
 //! newline-delimited JSON-RPC 2.0 both ways; the first inbound frame after
 //! accept is always the `gateway.ready` event; the client sends
-//! `gateway.ping` every `ping_interval` while any inbound frame within
-//! `deadline` keeps the connection alive.
+//! `gateway.ping` every `ping_interval` and closes when no inbound frame
+//! arrives within `deadline`.
 //!
-//! Heartbeat uses **wall-clock** time (`SystemTime`), not `Instant`: on iOS
-//! process suspension the tokio clock stops and a 5-minute background would
+//! The heartbeat wall clock is `SystemTime`, never `Instant`: on iOS process
+//! suspension the tokio clock stops and a 5-minute background pause would
 //! look like zero elapsed time.
 
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, Utf8Bytes};
 use tokio_tungstenite::tungstenite::Message;
@@ -41,8 +41,16 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(15);
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(45);
 /// Timeout for `call()` responses.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
-/// Timeout for `probe_now()` and for waiting on `gateway.ready` at connect.
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Timeout of the foreground `probe_now()` liveness ping.
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long `connect()` waits for `gateway.ready` before failing.
+pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// The one token for every ungraceful death: EOF without a WS close frame,
+/// a reset without a closing handshake, a failed writer send, or `deadline`
+/// of total inbound silence (PLAN §1.1). A negotiated WS Close frame keeps
+/// the server's own reason instead, and a local `close(reason)` keeps its
+/// reason — the three reason kinds never mix.
+pub const UNGRACEFUL_CLOSE_REASON: &str = "heartbeat timeout";
 
 /// Overridable policy numbers for [`GatewayClient`].
 #[derive(Debug, Clone)]
@@ -50,11 +58,16 @@ pub struct ClientConfig {
     /// Send `gateway.ping` at this interval. `Duration::ZERO` disables the
     /// heartbeat task entirely.
     pub ping_interval: Duration,
-    /// Close with `heartbeat timeout` when no inbound frame of any kind
-    /// arrives for this long (wall clock).
+    /// Close with [`UNGRACEFUL_CLOSE_REASON`] when no inbound frame of any
+    /// kind arrives for this long (wall clock).
     pub deadline: Duration,
     /// Per-call response timeout.
     pub call_timeout: Duration,
+    /// Timeout of the foreground `probe_now()` liveness ping (short on
+    /// purpose: a liveness check must never wait out `call_timeout`).
+    pub probe_timeout: Duration,
+    /// How long `connect()` waits for `gateway.ready`.
+    pub ready_timeout: Duration,
 }
 
 impl Default for ClientConfig {
@@ -63,6 +76,8 @@ impl Default for ClientConfig {
             ping_interval: DEFAULT_PING_INTERVAL,
             deadline: DEFAULT_DEADLINE,
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            ready_timeout: DEFAULT_READY_TIMEOUT,
         }
     }
 }
@@ -75,6 +90,8 @@ impl ClientConfig {
             ping_interval: Duration::from_millis(100),
             deadline: Duration::from_millis(300),
             call_timeout: Duration::from_secs(5),
+            probe_timeout: Duration::from_secs(1),
+            ready_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -89,16 +106,12 @@ pub enum ClientError {
     #[error("rpc timeout after {0:?}")]
     Timeout(Duration),
     /// The connection dropped (or was never established) while a call was in
-    /// flight.
+    /// flight. The string is the sticky close reason.
     #[error("connection closed: {0}")]
     Closed(String),
     /// Transport / protocol failure from the underlying WebSocket.
     #[error("transport error: {0}")]
     Transport(String),
-    /// A call was attempted while the client is not open (including during
-    /// the `gateway.ready` handshake).
-    #[error("not connected")]
-    NotConnected,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
@@ -113,30 +126,30 @@ pub enum ConnectionState {
     Idle,
     Connecting,
     Open,
-    /// Terminal state; the string is the reason ("heartbeat timeout", a close
-    /// frame reason, or a transport error).
+    /// Terminal state. The string is the reason and comes from exactly one
+    /// of three kinds, which never mix:
+    ///   * a local close reason (we closed on purpose: `close("user logout")`),
+    ///   * the server's own close-frame reason (a negotiated WS Close),
+    ///   * [`UNGRACEFUL_CLOSE_REASON`] (reset / EOF / dead writer / silence).
+    ///
+    /// First closer wins: once `Closed`, the reason never changes.
     Closed(String),
 }
 
-/// Events delivered to subscribers. `Watermark` keeps the seq/replay_epoch
-/// bookkeeping visible to the upper layers (T4/T5); `Event` is the per-frame
-/// payload.
+/// Events delivered to subscribers: the per-frame payload. Unknown event
+/// types pass through untouched — the wire protocol is internal and grows;
+/// upper layers ignore what they do not know (defensive-parse rule).
 #[derive(Debug, Clone, PartialEq)]
 pub enum GatewayEvent {
     Event(EventParams),
-    /// The server told us its replay epoch (from `gateway.ready` payload) and
-    /// the seq we believe the session to be at.
-    Watermark {
-        replay_epoch: String,
-        last_seq: i64,
-    },
 }
 
 /// Internal message from the API half to the writer task.
 enum Outbound {
     /// A JSON-RPC request line.
     Line(String),
-    /// A protocol-level close: the heartbeat found the connection dead.
+    /// A protocol-level close: a deliberate local close (caller or
+    /// heartbeat deadline).
     CloseNow(String),
 }
 
@@ -150,16 +163,32 @@ struct Shared {
     last_inbound_wall_ms: AtomicU64,
     /// Events broadcast to every subscriber.
     events_tx: broadcast::Sender<GatewayEvent>,
+    /// The subscription `connect()` made BEFORE the reader task started.
+    /// Handed to the first `events()` caller, so frames emitted in the
+    /// `gateway.ready` era are already buffered in it instead of being
+    /// dropped by a zero-receiver broadcast.
+    first_events_rx: Mutex<Option<broadcast::Receiver<GatewayEvent>>>,
+    /// Kept alive forever so `events_tx.send` never fails with zero
+    /// receivers (mirrors `_state_keepalive`).
+    _events_keepalive: broadcast::Receiver<GatewayEvent>,
     /// Per-session seq watermark (session-bound events carry `seq`).
     last_seq: Mutex<HashMap<String, i64>>,
     /// Server's replay epoch from `gateway.ready` ("" until seen).
     replay_epoch: Mutex<String>,
+    /// `skin` object of the `gateway.ready` payload (stashed at connect so
+    /// late subscribers cannot lose it).
+    skin: Mutex<Value>,
     /// Watch half of the connection state.
     state_tx: watch::Sender<ConnectionState>,
     /// Receiver kept alive forever so `send` never fails and `state()` can
     /// clone a live subscription (a watch send with zero receivers drops the
     /// update — the Open transition would be lost otherwise).
     _state_keepalive: watch::Receiver<ConnectionState>,
+    /// Serializes terminal transitions: first closer wins.
+    close_lock: Mutex<()>,
+    /// Wakes the heartbeat task out of its ping sleep when the connection
+    /// dies by other means (writer send failure, reader EOF).
+    heartbeat_wake: Notify,
     /// Handle to the writer task's outbound queue (heartbeat + close).
     outbound_tx: mpsc::UnboundedSender<Outbound>,
 }
@@ -172,8 +201,36 @@ impl Shared {
             .unwrap_or(0)
     }
 
-    fn set_state(&self, state: ConnectionState) {
-        let _ = self.state_tx.send(state);
+    /// Connecting -> Open. Only `connect()` may call this.
+    fn mark_open(&self) {
+        let _ = self.state_tx.send(ConnectionState::Open);
+    }
+
+    /// Terminal transition: first closer wins. Later close attempts (the
+    /// reader's bookkeeping, a caller's `close()`, the heartbeat, the
+    /// writer) must not overwrite the first reason. Returns false when the
+    /// state was already `Closed`.
+    fn close_terminal(&self, reason: &str) -> bool {
+        {
+            let _guard = self.close_lock.lock();
+            if matches!(&*self.state_tx.borrow(), ConnectionState::Closed(_)) {
+                return false;
+            }
+            let _ = self.state_tx.send(ConnectionState::Closed(reason.to_string()));
+        }
+        // Wake the heartbeat so it notices the closed state without waiting
+        // out the rest of the ping interval.
+        self.heartbeat_wake.notify_one();
+        true
+    }
+
+    /// Fail every pending call with `err`. Idempotent: drains whatever is
+    /// left, whoever gets there first.
+    fn fail_pending(&self, err: ClientError) {
+        let mut pending = self.pending.lock();
+        for (_, tx) in pending.drain() {
+            let _ = tx.send(Err(err.clone()));
+        }
     }
 }
 
@@ -196,33 +253,47 @@ impl GatewayClient {
         let ws_url = to_ws_url(url)?;
         let (stream, _resp) = connect_async(&ws_url).await.map_err(ClientError::from)?;
 
-        let (events_tx, _) = broadcast::channel(1024);
+        let (events_tx, events_keepalive) = broadcast::channel(1024);
+        // Subscribe BEFORE the reader starts: this is the receiver handed to
+        // the first `events()` caller, so not even `gateway.ready` can race
+        // a zero-receiver broadcast.
+        let first_events_rx = events_tx.subscribe();
         let (state_tx, state_rx) = watch::channel(ConnectionState::Connecting);
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             last_inbound_wall_ms: AtomicU64::new(Shared::now_wall_ms()),
             pending: Mutex::new(HashMap::new()),
             events_tx,
+            first_events_rx: Mutex::new(Some(first_events_rx)),
+            _events_keepalive: events_keepalive,
             last_seq: Mutex::new(HashMap::new()),
             replay_epoch: Mutex::new(String::new()),
+            skin: Mutex::new(Value::Null),
             state_tx,
             _state_keepalive: state_rx,
+            close_lock: Mutex::new(()),
+            heartbeat_wake: Notify::new(),
             config,
             outbound_tx: outbound_tx.clone(),
         });
-        let client = Self {
+        let client = GatewayClient {
             shared: shared.clone(),
             outbound_tx,
             next_id: Arc::new(AtomicU64::new(1)),
         };
 
         let (sink, stream) = stream.split();
-        let writer = spawn_writer(sink, outbound_rx);
+        let writer = spawn_writer(sink, outbound_rx, shared.clone());
         let _reader = spawn_reader(stream, shared.clone(), writer);
 
-        // Wait for gateway.ready (or failure) before resolving.
-        let mut events = shared.events_tx.subscribe();
-        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        // Wait for gateway.ready (or failure) before resolving, using the
+        // subscription made before the reader spawned.
+        let mut events = shared
+            .first_events_rx
+            .lock()
+            .take()
+            .expect("connect holds the first events subscription");
+        let deadline = tokio::time::Instant::now() + shared.config.ready_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -236,19 +307,29 @@ impl GatewayClient {
                 }
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(_)) => {
-                    let reason = "closed before gateway.ready".to_string();
-                    return Err(ClientError::Closed(reason));
+                    // Cannot happen while `_events_keepalive` lives, but
+                    // degrade instead of hanging.
+                    return Err(ClientError::Closed("closed before gateway.ready".into()));
                 }
                 Ok(Ok(GatewayEvent::Event(ev))) if ev.event_type == "gateway.ready" => {
-                    // replay_epoch lives in the ready payload.
-                    let epoch = json::str_at(&ev.payload, "replay_epoch").to_string();
-                    *shared.replay_epoch.lock() = epoch;
-                    shared.set_state(ConnectionState::Open);
+                    // Stash the ready payload: replay_epoch for the reconnect
+                    // bookkeeping and skin for the upper layers (T4) — both
+                    // readable without subscribing to events.
+                    *shared.replay_epoch.lock() =
+                        json::str_at(&ev.payload, "replay_epoch").to_string();
+                    *shared.skin.lock() =
+                        ev.payload.get("skin").cloned().unwrap_or(Value::Null);
+                    shared.mark_open();
                     break;
                 }
                 Ok(Ok(_)) => continue,
             }
         }
+
+        // Hand the connect-time subscription back for the first `events()`
+        // caller: frames emitted after `gateway.ready` but before the caller
+        // subscribes stay buffered in it instead of being lost.
+        *shared.first_events_rx.lock() = Some(events);
 
         spawn_heartbeat(shared);
         Ok(client)
@@ -259,14 +340,29 @@ impl GatewayClient {
         self.shared.state_tx.subscribe()
     }
 
-    /// Subscribe to server events and watermark updates.
+    /// Subscribe to server events.
+    ///
+    /// The FIRST caller receives the subscription `connect()` used while
+    /// waiting for `gateway.ready` — frames emitted in the ready era are
+    /// already buffered in it. Later callers get fresh subscriptions.
     pub fn events(&self) -> broadcast::Receiver<GatewayEvent> {
-        self.shared.events_tx.subscribe()
+        self.shared
+            .first_events_rx
+            .lock()
+            .take()
+            .unwrap_or_else(|| self.shared.events_tx.subscribe())
     }
 
     /// Most recent server replay epoch (empty until `gateway.ready`).
     pub fn replay_epoch(&self) -> String {
         self.shared.replay_epoch.lock().clone()
+    }
+
+    /// The `skin` object from the `gateway.ready` payload (`Value::Null`
+    /// before it arrived). Stashed at connect so a caller that subscribes
+    /// late cannot lose it.
+    pub fn skin(&self) -> Value {
+        self.shared.skin.lock().clone()
     }
 
     /// Highest seq seen for `session_id` (0 when never seen).
@@ -280,6 +376,16 @@ impl GatewayClient {
     /// unbounded channel, the pending id sits in a map the reader consults,
     /// and events keep flowing while the caller awaits.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, ClientError> {
+        self.call_with_timeout(method, params, self.shared.config.call_timeout)
+            .await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ClientError> {
         if let ConnectionState::Closed(reason) = self.shared.state_tx.borrow().clone() {
             return Err(ClientError::Closed(reason));
         }
@@ -301,13 +407,13 @@ impl GatewayClient {
             return Err(ClientError::Closed("writer task gone".into()));
         }
 
-        match tokio::time::timeout(self.shared.config.call_timeout, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Err(_) => {
                 // Slow responses leave the client usable: the pending entry
                 // is dropped here so a late reply finds no caller and events
                 // keep flowing (brief test (d)).
                 self.shared.pending.lock().remove(&id);
-                Err(ClientError::Timeout(self.shared.config.call_timeout))
+                Err(ClientError::Timeout(timeout))
             }
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(e))) => Err(e),
@@ -315,29 +421,29 @@ impl GatewayClient {
         }
     }
 
-    /// One immediate `gateway.ping` with a short timeout — the foreground
-    /// "is the connection alive?" probe.
+    /// One immediate `gateway.ping` with its own short timeout — the
+    /// foreground "is the connection alive?" probe. It must not wait out the
+    /// much longer `call_timeout`.
     pub async fn probe_now(&self) -> Result<(), ClientError> {
-        self.call(
+        self.call_with_timeout(
             "gateway.ping",
-            serde_json::Value::Null,
+            Value::Null,
+            self.shared.config.probe_timeout,
         )
         .await
         .map(|_| ())
     }
 
-    /// Explicitly close with `reason`; idempotent.
+    /// Explicitly close with `reason`; idempotent. The FIRST close reason
+    /// (here or from the server, or the ungraceful token) sticks.
     pub fn close(&self, reason: &str) {
         self.shutdown(reason);
     }
 
     fn shutdown(&self, reason: &str) {
-        self.shared.set_state(ConnectionState::Closed(reason.to_string()));
-        // Fail every pending call immediately; the writer gets a close too.
-        let mut pending = self.shared.pending.lock();
-        for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(ClientError::Closed(reason.to_string())));
-        }
+        self.shared.close_terminal(reason);
+        self.shared
+            .fail_pending(ClientError::Closed(reason.to_string()));
         let _ = self.outbound_tx.send(Outbound::CloseNow(reason.to_string()));
     }
 }
@@ -352,9 +458,7 @@ fn to_ws_url(url: &str) -> Result<String, ClientError> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| {
-            ClientError::Transport(format!("unsupported url scheme: {url}"))
-        })?;
+        .ok_or_else(|| ClientError::Transport(format!("unsupported url scheme: {url}")))?;
     let scheme = if url.starts_with("https://") { "wss" } else { "ws" };
     let (authority, path_and_query) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -382,19 +486,29 @@ fn to_ws_url(url: &str) -> Result<String, ClientError> {
 }
 
 /// The writer task: drains the outbound channel into the WebSocket sink.
-/// Returns a handle the reader can drop to end the writer.
+/// On a send failure the connection is dying NOW: fail closed with the one
+/// ungraceful token, fail all pending RPCs and wake the heartbeat instead of
+/// silently swallowing sends. (The `deadline` stays for a half-open socket
+/// that still buffers writes; a failed write is a different, immediate
+/// death and must not be claimed to surface in any particular number of
+/// seconds.)
 fn spawn_writer(
     mut sink: futures_util::stream::SplitSink<
         WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
         Message,
     >,
     mut rx: mpsc::UnboundedReceiver<Outbound>,
+    shared: Arc<Shared>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let result = match msg {
                 Outbound::Line(line) => sink.send(Message::text(Utf8Bytes::from(line))).await,
                 Outbound::CloseNow(reason) => {
+                    // Best effort: the close frame may not fit on a socket
+                    // that is already dead — that is exactly what the
+                    // ungraceful token is for, and whoever called for the
+                    // close already published its reason.
                     let _ = sink
                         .send(Message::Close(Some(CloseFrame {
                             code: CloseCode::Normal,
@@ -405,6 +519,11 @@ fn spawn_writer(
                 }
             };
             if result.is_err() {
+                if shared.close_terminal(UNGRACEFUL_CLOSE_REASON) {
+                    shared.fail_pending(ClientError::Closed(
+                        UNGRACEFUL_CLOSE_REASON.to_string(),
+                    ));
+                }
                 break;
             }
         }
@@ -412,7 +531,7 @@ fn spawn_writer(
 }
 
 /// The reader task: splits frames, decodes every line, routes results to
-/// pending oneshots and events to the broadcast, tracks seq watermarks.
+/// pending oneshots and events onto the broadcast, tracks seq watermarks.
 fn spawn_reader(
     mut stream: futures_util::stream::SplitStream<
         WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
@@ -421,7 +540,9 @@ fn spawn_reader(
     writer: tokio::task::JoinHandle<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut closed_reason: Option<String> = None;
+        // Some(ref) only when the server negotiated a real WS Close frame;
+        // every other way out of the loop is ungraceful.
+        let mut server_close_reason: Option<String> = None;
         while let Some(msg) = stream.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
@@ -452,11 +573,22 @@ fn spawn_reader(
                     }
                 }
                 Ok(Message::Close(frame)) => {
-                    closed_reason = Some(
-                        frame
-                            .map(|f| f.reason.to_string())
-                            .unwrap_or_else(|| "closed by server".into()),
-                    );
+                    // A negotiated close is the server's word: keep its
+                    // reason. A frame without a reason text keeps the code,
+                    // so 4401 (ticket invalid) and 4403 (request guard) stay
+                    // distinct (PLAN §1.1) even when the server sends no
+                    // reason string.
+                    server_close_reason = Some(match frame {
+                        Some(f) => {
+                            let reason = f.reason.to_string();
+                            if reason.is_empty() {
+                                format!("closed by server (code {})", f.code)
+                            } else {
+                                reason
+                            }
+                        }
+                        None => "closed by server".into(),
+                    });
                     break;
                 }
                 Ok(Message::Ping(_) | Message::Pong(_)) => {
@@ -471,52 +603,26 @@ fn spawn_reader(
                         .last_inbound_wall_ms
                         .store(Shared::now_wall_ms(), Ordering::Relaxed);
                 }
-                Err(e) => {
-                    // A reset WITHOUT a closing handshake is a silently dead
-                    // socket, not a negotiated close: fold it into the
-                    // heartbeat-timeout path (the deadline decides the
-                    // wording). A real Close frame keeps the server's reason.
-                    closed_reason = Some(match e {
-                        tokio_tungstenite::tungstenite::Error::ConnectionClosed
-                        | tokio_tungstenite::tungstenite::Error::Protocol(
-                            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
-                        ) => String::new(),
-                        other => other.to_string(),
-                    });
+                Err(_e) => {
+                    // Any transport death without a closing handshake —
+                    // reset, EOF-style ConnectionClosed, protocol or utf8
+                    // errors — folds into the ONE ungraceful token, the same
+                    // the silence deadline uses (PLAN §1.1). Details of the
+                    // internal wire errors are deliberately not surfaced as
+                    // a close reason.
                     break;
                 }
             }
         }
-        // Terminal path: fail pending calls, publish the state, end writer.
-        //
-        // The heartbeat task is the authority for the *silent* dead-socket
-        // case (PLAN §1.1: "no inbound frame of any kind for 45 s → drop the
-        // socket"): if the deadline elapsed, or the socket died without a
-        // closing handshake (reset / hard drop, `closed_reason` emptied in
-        // the reader), report `heartbeat timeout`. A reason arriving BEFORE
-        // the deadline with a real Close frame is a server-initiated close
-        // and wins.
-        let deadline_elapsed = {
-            let last = shared.last_inbound_wall_ms.load(Ordering::Relaxed);
-            Shared::now_wall_ms().saturating_sub(last)
-                >= shared.config.deadline.as_millis() as u64
-        };
-        let heartbeat_dead = deadline_elapsed
-            || closed_reason
-                .as_ref()
-                .map(String::is_empty)
-                .unwrap_or(false);
-        let reason = if heartbeat_dead {
-            "heartbeat timeout".to_string()
-        } else {
-            closed_reason.unwrap_or_else(|| "reader ended".into())
-        };
-        shared.set_state(ConnectionState::Closed(reason.clone()));
-        let mut pending = shared.pending.lock();
-        for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(ClientError::Closed(reason.clone())));
-        }
-        drop(pending);
+        // Terminal path: `stream.next()` -> None is an EOF without a WS
+        // close frame; together with the transport-error break above it is
+        // ungraceful and gets [`UNGRACEFUL_CLOSE_REASON`]. A real Close
+        // frame keeps the server reason. Either way the FIRST closer wins:
+        // an earlier `close("…")` or heartbeat timeout is never overwritten.
+        let reason = server_close_reason
+            .unwrap_or_else(|| UNGRACEFUL_CLOSE_REASON.to_string());
+        shared.close_terminal(&reason);
+        shared.fail_pending(ClientError::Closed(reason));
         writer.abort();
     })
 }
@@ -535,7 +641,8 @@ fn record_seq(shared: &Arc<Shared>, ev: &EventParams) {
 }
 
 /// The heartbeat task: pings every `ping_interval` and closes the connection
-/// when no inbound frame of any kind arrived for `deadline` (wall clock).
+/// with the ungraceful token when no inbound frame of any kind arrived for
+/// `deadline` (wall clock). Woken early when the connection dies otherwise.
 fn spawn_heartbeat(shared: Arc<Shared>) {
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -544,30 +651,26 @@ fn spawn_heartbeat(shared: Arc<Shared>) {
             return; // heartbeat disabled
         }
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shared.heartbeat_wake.notified() => {}
+            }
             if let ConnectionState::Closed(_) = shared.state_tx.borrow().clone() {
                 return;
             }
             let last = shared.last_inbound_wall_ms.load(Ordering::Relaxed);
             let now = Shared::now_wall_ms();
             if now.saturating_sub(last) >= shared.config.deadline.as_millis() as u64 {
-                shared.set_state(ConnectionState::Closed("heartbeat timeout".into()));
-                let mut pending = shared.pending.lock();
-                for (_, tx) in pending.drain() {
-                    let _ = tx.send(Err(ClientError::Closed("heartbeat timeout".into())));
-                }
-                drop(pending);
-                let _ = shared
-                    .events_tx
-                    .send(GatewayEvent::Event(EventParams {
-                        event_type: "gateway.closed".into(),
-                        session_id: String::new(),
-                        seq: None,
-                        payload: serde_json::json!({"reason": "heartbeat timeout"}),
-                    }));
+                // The one ungraceful token, sticky (first closer wins). No
+                // synthetic `gateway.closed` event is emitted: the state
+                // watch is the contract (PLAN §1.4).
+                shared.close_terminal(UNGRACEFUL_CLOSE_REASON);
+                shared.fail_pending(ClientError::Closed(
+                    UNGRACEFUL_CLOSE_REASON.to_string(),
+                ));
                 let _ = shared
                     .outbound_tx
-                    .send(Outbound::CloseNow("heartbeat timeout".into()));
+                    .send(Outbound::CloseNow(UNGRACEFUL_CLOSE_REASON.into()));
                 return;
             }
             seq += 1;

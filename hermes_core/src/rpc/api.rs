@@ -116,6 +116,25 @@ pub struct ClarifyAck {
     pub remaining: Vec<String>,
 }
 
+impl ClarifyAck {
+    /// Tolerant wire parser: a missing or mistyped `remaining` degrades to
+    /// an empty vec, a missing `status` to "" — never a panic.
+    fn from_value(value: &Value) -> Self {
+        Self {
+            status: json::str_at(value, "status").to_string(),
+            remaining: value
+                .get("remaining")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
 // ── command.dispatch ────────────────────────────────────────────────────
 
 /// One of the five dispatch result shapes (PLAN §1.3).
@@ -125,8 +144,13 @@ pub enum DispatchOutcome {
     Output(String),
     /// `{type:"alias", target}`.
     Alias(String),
-    /// `{type:"skill", name, message?, display?}`.
-    Skill { name: String, message: String },
+    /// `{type:"skill", name, message?, display?}` — `display` is kept for
+    /// the T10 slash-command surface.
+    Skill {
+        name: String,
+        message: String,
+        display: String,
+    },
     /// `{type:"send", message, notice?}`.
     Send(String),
     /// `{type:"prefill", message}`.
@@ -143,6 +167,7 @@ impl DispatchOutcome {
             "skill" => DispatchOutcome::Skill {
                 name: json::str_at(value, "name").to_string(),
                 message: json::str_at(value, "message").to_string(),
+                display: json::str_at(value, "display").to_string(),
             },
             "send" => DispatchOutcome::Send(json::str_at(value, "message").to_string()),
             "prefill" => DispatchOutcome::Prefill(json::str_at(value, "message").to_string()),
@@ -295,18 +320,7 @@ pub async fn respond_clarify(
         params["question_id"] = json!(qid);
     }
     let result = client.call("clarify.respond", params).await?;
-    Ok(ClarifyAck {
-        status: json::str_at(&result, "status").to_string(),
-        remaining: result
-            .get("remaining")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .map(|v| v.as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
+    Ok(ClarifyAck::from_value(&result))
 }
 
 /// `approval.pending` — re-emitted cards after a reconnect.
@@ -445,7 +459,22 @@ mod tests {
         );
         assert_eq!(
             DispatchOutcome::from_value(&json!({"type": "skill", "name": "n"})),
-            DispatchOutcome::Skill { name: "n".into(), message: "".into() }
+            DispatchOutcome::Skill {
+                name: "n".into(),
+                message: "".into(),
+                display: "".into()
+            }
+        );
+        // The optional `display` field is kept (T10 wants it).
+        assert_eq!(
+            DispatchOutcome::from_value(&json!(
+                {"type": "skill", "name": "n", "message": "m", "display": "/n preview"}
+            )),
+            DispatchOutcome::Skill {
+                name: "n".into(),
+                message: "m".into(),
+                display: "/n preview".into()
+            }
         );
         assert_eq!(
             DispatchOutcome::from_value(&json!({"type": "send", "message": "m"})),
@@ -463,19 +492,21 @@ mod tests {
         assert_eq!(DispatchOutcome::from_value(&json!({})), DispatchOutcome::Unknown);
     }
 
+    /// Wire-shaped, through the production parser (fix pass item 7): a
+    /// batch ack carries the remaining question ids.
     #[test]
     fn clarify_ack_tolerates_missing_remaining() {
-        let ack = ClarifyAck {
-            status: json::str_at(&json!({"status": "ok"}), "status").to_string(),
-            remaining: vec![],
-        };
+        let ack = ClarifyAck::from_value(&json!({"status": "ok", "remaining": ["q2"]}));
         assert_eq!(ack.status, "ok");
-        // A completely empty object degrades to defaults, never panics.
-        let empty = ClarifyAck {
-            status: json::str_at(&json!({}), "status").to_string(),
-            remaining: vec![],
-        };
+        assert_eq!(ack.remaining, vec!["q2".to_string()]);
+        // A completely empty object (or a mistyped remaining) degrades to
+        // defaults, never panics.
+        let empty = ClarifyAck::from_value(&json!({}));
         assert!(empty.status.is_empty());
+        assert!(empty.remaining.is_empty());
+        let mistyped = ClarifyAck::from_value(&json!({"status": "expired", "remaining": 5}));
+        assert_eq!(mistyped.status, "expired");
+        assert!(mistyped.remaining.is_empty());
     }
 
     #[test]

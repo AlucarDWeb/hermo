@@ -10,16 +10,25 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, Utf8Bytes};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use hermes_core::rpc::client::{ClientConfig, ConnectionState, GatewayClient, GatewayEvent};
+use hermes_core::rpc::client::{
+    ClientConfig, ClientError, ConnectionState, GatewayClient, GatewayEvent,
+    UNGRACEFUL_CLOSE_REASON,
+};
 
 /// A running fake gateway: accept loop + a handle for scripted replies.
 struct FakeServer {
     addr: std::net::SocketAddr,
-    /// Send a raw JSON line to the most recently accepted connection.
-    send: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Send a raw message (JSON line or WS Close) to the most recently
+    /// accepted connection.
+    send: tokio::sync::mpsc::UnboundedSender<Message>,
+    /// Tell the connection runner to drop the WebSocket without a close
+    /// handshake — the client sees an abrupt EOF (fix pass item 1).
+    drop_conn: tokio::sync::mpsc::UnboundedSender<()>,
     /// Every inbound line the client sent, in order.
     inbound: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
@@ -58,18 +67,20 @@ impl FakeServer {
             .expect("nonblocking listener");
         let listener = TcpListener::from_std(listener).expect("tokio listener");
         let addr = listener.local_addr().expect("addr");
-        let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (drop_tx, drop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let ws = tokio_tungstenite::accept_async(stream).await.expect("handshake");
-            run_conn(ws, &mut send_rx, in_tx.clone(), script, quiet).await;
+            run_conn(ws, &mut send_rx, drop_rx, in_tx.clone(), script, quiet).await;
         });
 
         FakeServer {
             addr,
             send: send_tx,
+            drop_conn: drop_tx,
             inbound: in_rx,
         }
     }
@@ -79,7 +90,22 @@ impl FakeServer {
     }
 
     fn push(&self, value: Value) {
-        let _ = self.send.send(value.to_string());
+        let _ = self.send.send(Message::text(value.to_string()));
+    }
+
+    /// Send a protocol-level WS Close frame (fix pass item 1: the server's
+    /// negotiated reason must win over the ungraceful token).
+    fn push_close(&self, code: CloseCode, reason: &str) {
+        let _ = self.send.send(Message::Close(Some(CloseFrame {
+            code,
+            reason: Utf8Bytes::from(reason),
+        })));
+    }
+
+    /// Drop the TCP connection without any WS close handshake (crash / RST
+    /// simulation: the client must see an EOF, not a close frame).
+    fn drop_conn(&self) {
+        let _ = self.drop_conn.send(());
     }
 
     /// Next inbound line from the client that is NOT a periodic heartbeat
@@ -103,7 +129,7 @@ impl FakeServer {
             "method": "event",
             "params": {
                 "type": "gateway.ready",
-                "payload": {"heartbeat": true, "replay_epoch": "e-fake", "skin": {}, "change_events": true}
+                "payload": {"heartbeat": true, "replay_epoch": "e-fake", "skin": {"theme": "dark"}, "change_events": true}
             }
         }));
     }
@@ -113,7 +139,8 @@ impl FakeServer {
 /// lines, then hands control to the script.
 async fn run_conn<F, Fut>(
     mut ws: WebSocketStream<TcpStream>,
-    send_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    send_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
+    mut drop_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     in_tx: tokio::sync::mpsc::UnboundedSender<String>,
     script: F,
     quiet: bool,
@@ -135,10 +162,16 @@ async fn run_conn<F, Fut>(
                 // the client connection exists.
                 script_done = true;
             }
+            _ = drop_rx.recv() => {
+                // Drop the WebSocketStream (and its TcpStream) without any
+                // close handshake: the client sees an abrupt EOF, never a
+                // Close frame.
+                return;
+            }
             outbound = send_rx.recv() => {
                 match outbound {
-                    Some(line) => {
-                        if ws.send(Message::text(line)).await.is_err() {
+                    Some(msg) => {
+                        if ws.send(msg).await.is_err() {
                             return;
                         }
                     }
@@ -166,9 +199,13 @@ async fn run_conn<F, Fut>(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => return,
+                    // Keep polling once after a Close frame so tungstenite
+                    // can flush its automatic close reply; but a terminated
+                    // stream (client went away) must END this loop — polling
+                    // it again returns None instantly and would busy-spin.
+                    Some(Ok(Message::Close(_))) | Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                    None | Some(Err(_)) => return,
+                    Some(Ok(_)) => {},
                 }
             }
         }
@@ -230,18 +267,22 @@ async fn request_response_matching() {
         .await
         .expect("connect");
 
-    // Two calls in flight; the server answers them out of order. The calls
-    // and the responder run concurrently — a `call()` only hits the wire
-    // once polled, so the reply loop must run inside the same join.
+    // Two calls in flight; the server answers them OUT OF ORDER (fix pass
+    // item 5): both request ids are held first, then the SECOND request's
+    // result is pushed before the first's. The calls and the responder run
+    // concurrently — a `call()` only hits the wire once polled, so the reply
+    // loop must run inside the same join.
     let c1 = client.call("session.create", json!({"cols": 48}));
     let c2 = client.call("session.list", json!({"limit": 5}));
     let responder = async {
-        let mut ids = Vec::new();
+        let mut reqs = Vec::new();
         for _ in 0..2 {
             let line = server.next_inbound().await;
-            let v: Value = serde_json::from_str(&line).unwrap();
-            ids.push(v["id"].as_str().unwrap().to_string());
-            // Reply to whichever request this was.
+            reqs.push(serde_json::from_str::<Value>(&line).unwrap());
+        }
+        // Reply to the LAST-arrived request first: resolution must be by id,
+        // never by arrival order.
+        for v in reqs.iter().rev() {
             let reply = if v["method"] == "session.create" {
                 json!({"jsonrpc": "2.0", "id": v["id"].clone(), "result": {"session_id": "s-live", "stored_session_id": "s-store"}})
             } else {
@@ -249,16 +290,23 @@ async fn request_response_matching() {
             };
             server.push(reply);
         }
-        ids
+        reqs
     };
-    let (out1, out2, ids) = tokio::join!(c1, c2, responder);
-    assert_eq!(ids.len(), 2);
-    assert_ne!(ids[0], ids[1], "ids must be unique");
+    let (out1, out2, reqs) = tokio::join!(c1, c2, responder);
+    assert_eq!(reqs.len(), 2);
+    assert_ne!(reqs[0]["id"], reqs[1]["id"], "ids must be unique");
+    assert_eq!(reqs[0]["method"], "session.create", "c1 was polled first");
+    assert_eq!(reqs[1]["method"], "session.list");
 
+    // Each result must land on its own call despite the reversed push order:
+    // out1 got the create result (second push), out2 the list result (first
+    // push).
     let created = out1.expect("call 1");
     assert_eq!(created["session_id"], "s-live");
+    assert_eq!(created["stored_session_id"], "s-store");
     let listed = out2.expect("call 2");
     assert!(listed["sessions"].is_array());
+    assert!(created.get("sessions").is_none(), "results must not swap");
 }
 
 #[tokio::test]
@@ -352,6 +400,11 @@ async fn seq_watermarks_track_max_per_session() {
         .await
         .expect("connect");
 
+    // Subscribe BEFORE the pushes (fix pass item 6): relying on events
+    // emitted before the subscription is the same zero-receiver race the
+    // broadcast loses.
+    let mut events = client.events();
+
     // Out-of-order seq: watermark must keep the max, not the last.
     for seq in [5, 2, 9] {
         server.push(json!({
@@ -359,7 +412,6 @@ async fn seq_watermarks_track_max_per_session() {
             "params": {"type": "message.delta", "session_id": "sx", "seq": seq, "payload": {}}
         }));
     }
-    let mut events = client.events();
     for _ in 0..3 {
         let _ = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
@@ -367,6 +419,17 @@ async fn seq_watermarks_track_max_per_session() {
             .expect("no lag");
     }
     assert_eq!(client.last_seq("sx"), 9);
+
+    // A late, lower seq must not move the watermark backwards.
+    server.push(json!({
+        "jsonrpc": "2.0", "method": "event",
+        "params": {"type": "message.delta", "session_id": "sx", "seq": 2, "payload": {}}
+    }));
+    let _ = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("the late seq event must still be delivered")
+        .expect("no lag");
+    assert_eq!(client.last_seq("sx"), 9, "watermark keeps the max");
 }
 
 /// The injected-clock heartbeat test: deadline shortened to 300 ms in
@@ -487,14 +550,212 @@ async fn slow_rpc_does_not_block_events() {
         .await
         .expect("event must arrive while the RPC is pending")
         .expect("no lag");
-    match ev {
-        GatewayEvent::Event(p) => assert_eq!(p.event_type, "status.update"),
-        other => panic!("expected Event, got {other:?}"),
-    }
+    let GatewayEvent::Event(p) = ev;
+    assert_eq!(p.event_type, "status.update");
 
     // Clean up: answer the slow call (already read above) so nothing dangles.
     server.push(json!({"jsonrpc": "2.0", "id": request_id, "result": {"status": "streaming"}}));
     let _ = slow.await;
+}
+
+/// Fix pass item 1: an ungraceful death (EOF without a WS close frame) must
+/// produce the ONE ungraceful token, and a later local close must not
+/// overwrite it (first closer wins, `Closed` is terminal).
+#[tokio::test]
+async fn ungraceful_death_is_one_sticky_reason() {
+    let server = FakeServer::spawn(|_conn| async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    server.ready();
+    let client = GatewayClient::connect(&server.url(), ClientConfig::for_tests())
+        .await
+        .expect("connect");
+    let mut state = client.state();
+
+    // Abrupt TCP death: no WS close frame, no reason text.
+    server.drop_conn();
+
+    loop {
+        tokio::time::timeout(Duration::from_secs(5), state.changed())
+            .await
+            .expect("state change after the drop")
+            .expect("state channel open");
+        if let ConnectionState::Closed(reason) = state.borrow().clone() {
+            assert_eq!(reason, UNGRACEFUL_CLOSE_REASON);
+            break;
+        }
+    }
+
+    // Sticky: a later local close must not overwrite the first reason.
+    client.close("user logout");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *client.state().borrow(),
+        ConnectionState::Closed(UNGRACEFUL_CLOSE_REASON.to_string())
+    );
+    // A call on the dead client reports the sticky reason too.
+    match client.call("gateway.ping", Value::Null).await {
+        Err(ClientError::Closed(reason)) => assert_eq!(reason, UNGRACEFUL_CLOSE_REASON),
+        other => panic!("expected Closed with the sticky reason, got {other:?}"),
+    }
+}
+
+/// Fix pass item 2: a failed writer send must fail closed NOW — the same
+/// ungraceful token, pending RPCs failed — instead of silently breaking.
+#[tokio::test]
+async fn writer_send_failure_fails_closed_ungracefully() {
+    let server = FakeServer::spawn(|_conn| async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    server.ready();
+    let client = GatewayClient::connect(&server.url(), ClientConfig::for_tests())
+        .await
+        .expect("connect");
+
+    // Kill the TCP connection under the client's feet, then issue a call.
+    // Either the reader notices the EOF first or the writer's send fails;
+    // both must end in the same ungraceful token.
+    server.drop_conn();
+    match client.call("session.list", json!({"limit": 1})).await {
+        Err(ClientError::Closed(reason)) => assert_eq!(reason, UNGRACEFUL_CLOSE_REASON),
+        other => panic!("expected Closed with the ungraceful token, got {other:?}"),
+    }
+    assert!(matches!(
+        *client.state().borrow(),
+        ConnectionState::Closed(ref r) if r == UNGRACEFUL_CLOSE_REASON
+    ));
+}
+
+/// Fix pass item 4: a caller subscribing AFTER connect must not lose the
+/// ready-era frames (the connect-time subscription is handed to the first
+/// caller), and the ready payload (`skin`) is stashed, not dropped.
+#[tokio::test]
+async fn late_subscriber_sees_ready_era_frames_and_skin() {
+    let server = FakeServer::spawn(|_conn| async {});
+    server.ready();
+    let client = GatewayClient::connect(&server.url(), ClientConfig::for_tests())
+        .await
+        .expect("connect");
+
+    // Emitted after `gateway.ready` (consumed inside connect) but BEFORE the
+    // caller subscribes: must not be lost.
+    server.push(json!({
+        "jsonrpc": "2.0", "method": "event",
+        "params": {"type": "session.info", "session_id": "s9", "payload": {"model": "m"}}
+    }));
+    // Give the reader time to receive and broadcast the frame.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut events = client.events();
+    let ev = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("ready-era frame must be buffered for the late subscriber")
+        .expect("no lag");
+    let GatewayEvent::Event(p) = ev;
+    assert_eq!(p.event_type, "session.info");
+    assert_eq!(p.session_id, "s9");
+    // The ready payload is stashed, not lost with the handshake.
+    assert_eq!(client.skin()["theme"], "dark");
+    assert_eq!(client.replay_epoch(), "e-fake");
+}
+
+/// Fix pass item 1: a negotiated WS Close frame wins with the server's own
+/// reason — it is NOT folded into the ungraceful token.
+#[tokio::test]
+async fn server_close_frame_keeps_server_reason() {
+    let server = FakeServer::spawn(|_conn| async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    server.ready();
+    let client = GatewayClient::connect(&server.url(), ClientConfig::for_tests())
+        .await
+        .expect("connect");
+    let mut state = client.state();
+
+    server.push_close(CloseCode::Normal, "server says bye");
+
+    loop {
+        tokio::time::timeout(Duration::from_secs(5), state.changed())
+            .await
+            .expect("state change after the close frame")
+            .expect("state channel open");
+        if let ConnectionState::Closed(reason) = state.borrow().clone() {
+            assert_eq!(reason, "server says bye");
+            break;
+        }
+    }
+}
+
+/// Fix pass item 1: close codes without a reason text stay distinct — 4401
+/// (ticket invalid) and 4403 (request guard) must not collapse into one
+/// reason (PLAN §1.1; neither is a reconnect case).
+#[tokio::test]
+async fn server_close_codes_without_reason_stay_distinct() {
+    let mk = || async {
+        let server = FakeServer::spawn(|_conn| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        server.ready();
+        let client = GatewayClient::connect(&server.url(), ClientConfig::for_tests())
+            .await
+            .expect("connect");
+        (server, client)
+    };
+    let (server1, client1) = mk().await;
+    let (server2, client2) = mk().await;
+
+    server1.push_close(CloseCode::Bad(4401), "");
+    server2.push_close(CloseCode::Bad(4403), "");
+
+    let wait = |client: GatewayClient| async move {
+        let mut state = client.state();
+        loop {
+            tokio::time::timeout(Duration::from_secs(5), state.changed())
+                .await
+                .expect("state change")
+                .expect("state channel open");
+            if let ConnectionState::Closed(reason) = state.borrow().clone() {
+                return reason;
+            }
+        }
+    };
+    let (r1, r2) = tokio::join!(wait(client1), wait(client2));
+    assert_eq!(r1, "closed by server (code 4401)");
+    assert_eq!(r2, "closed by server (code 4403)");
+    assert_ne!(r1, r2, "4401 and 4403 are distinct reasons");
+}
+
+/// Fix pass item 3: `probe_now` uses its own short timeout, not the 120 s
+/// `call_timeout` — a silent server answers nothing, so the probe must time
+/// out on `probe_timeout` (200 ms here), not on `call_timeout`. The
+/// heartbeat is disabled so the 45 s silence deadline cannot race the probe.
+#[tokio::test]
+async fn probe_now_times_out_on_probe_timeout() {
+    let server = FakeServer::spawn_silent(|_conn| async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    server.ready();
+    let cfg = ClientConfig {
+        ping_interval: Duration::ZERO,
+        probe_timeout: Duration::from_millis(200),
+        ..ClientConfig::for_tests()
+    };
+    let client = GatewayClient::connect(&server.url(), cfg).await.expect("connect");
+
+    let started = std::time::Instant::now();
+    let result = client.probe_now().await;
+    let elapsed = started.elapsed();
+    match result {
+        Err(ClientError::Timeout(t)) => {
+            assert_eq!(t, Duration::from_millis(200), "probe timeout, not call timeout");
+        }
+        other => panic!("expected Timeout from the probe, got {other:?}"),
+    }
+    // Well under the 5 s call_timeout the old code would have waited.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "probe must not wait out the call timeout, took {elapsed:?}"
+    );
 }
 
 /// `call()` on a closed client fails with Closed, never hangs.
@@ -509,9 +770,35 @@ async fn call_after_close_fails_fast() {
         .expect("connect");
     client.close("test close");
     match client.call("gateway.ping", Value::Null).await {
-        Err(hermes_core::rpc::client::ClientError::Closed(reason)) => {
+        Err(ClientError::Closed(reason)) => {
             assert_eq!(reason, "test close")
         }
         other => panic!("expected Closed, got {other:?}"),
     }
+}
+
+/// Fix pass item 1 (reason-space partition): the three reason kinds never
+/// mix — a local close keeps its reason even though the server echoes a
+/// close frame back (the ping_reply path keeps the socket alive here, so
+/// the local reason is genuinely the first closer).
+#[tokio::test]
+async fn local_close_reason_survives_server_close_echo() {
+    let server = FakeServer::spawn(|_conn| async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    server.ready();
+    let client = GatewayClient::connect(&server.url(), ClientConfig::for_tests())
+        .await
+        .expect("connect");
+    eprintln!("DBG: closing");
+    client.close("test close");
+    eprintln!("DBG: closed, sleeping");
+    for i in 0..5 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        eprintln!("DBG: slept {i}");
+    }
+    eprintln!("DBG: borrowing state");
+    let st = client.state().borrow().clone();
+    eprintln!("DBG: state={st:?}");
+    assert_eq!(st, ConnectionState::Closed("test close".to_string()));
 }
