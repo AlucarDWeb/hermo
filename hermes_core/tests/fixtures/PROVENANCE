@@ -1,0 +1,47 @@
+Provenance of the hermo protocol fixtures (recorded 2026-09-11, Hermes v0.21.1,
+upstream 2ddeba9e, on this dev box).
+
+events.jsonl
+  Recorded live over a loopback gateway (hermes serve on 127.0.0.1, loopback
+  bind, legacy ?token= auth) with scripts/record_fixture.py. All frames are
+  inbound JSON-RPC exactly as received, one object per line. No session token,
+  cookie or Authorization header is present in the file (verified by scanning
+  for the token value itself).
+
+  Scenario coverage, in order:
+    1. gateway.ready + session.create (result) + session.info — plain turn
+    2. message.start/delta/complete — "reply with exactly this sentence"
+    3. tool.generating/start/complete + message.complete — shell
+       `echo hermo-fixture-tool-check` turn
+    4. clarify.request (single-question shape) + session.info mid-clarify —
+       clarify answered via clarify.respond with a question_id
+    5. busy submit: the result of a second prompt.submit ~2 s into a running
+       turn is {"jsonrpc":"2.0","id":"r-busy","result":{"status":"redirected"}}
+       — this is the verified busy-reply shape on v0.21.1 (PLAN.md §1.3 said
+       "session busy"; the wire says status=redirected).
+
+  Not reproducible live: approval.request. This host's agent config runs
+  approval_mode="smart" with yolo=false, and the recorded read-only shell
+  command auto-allowed, so no approval.request ever hit the wire. Forcing one
+  would have required a non-innocuous command. The shape is synthesised in
+  events_synthetic.jsonl from PLAN.md §1.4 (verified field list: request_id,
+  command (already redacted server-side), description, choices
+  ["once","session","always","deny"] subset, smart_denied, allow_session,
+  allow_permanent).
+
+  Environment-derived payload warning: the committed session.info frames no
+  longer carry the live agent's system_prompt, skills list, mcp_servers
+  status, cwd, durable session id or other personal/environment values —
+  scripts/fixture_redact.py has replaced each with `<redacted>` (keys are
+  kept so the frame shape is intact, and a nested `session_id` VALUE inside
+  an event payload is redacted too). These are chat frames required by the
+  reducer (T4), not credentials; anyone RE-RECORDING should expect the live
+  capture to contain all of those fields and must re-run
+  `python scripts/fixture_redact.py hermes_core/tests/fixtures/events.jsonl`
+  before committing.
+
+events_synthetic.jsonl
+  Lines 1-2: approval.request frames hand-built to the PLAN.md §1.4 shape —
+  there is no live capture because the host auto-allowed the recorded tools.
+  session_id "SYNTH" is a placeholder; nothing else is synthetic in the real
+  file.

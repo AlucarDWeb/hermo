@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "uniffi.hermes_core"
+cdylib_name = "hermes_core"
+
+[bindings.swift]
+module_name = "HermesCore"

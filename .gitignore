@@ -2,3 +2,34 @@
 # Everything markdown stays out of the public repo except the README.
 *.md
 !README.md
+
+# Rust / Cargo
+/target/
+**/target/
+
+# Secrets / local auth
+.env
+.env.*
+*.pem
+*.keystore
+*.jks
+
+# Bazel
+/bazel-*
+**/bazel-*
+
+# Local tooling
+.venv-tools/
+
+# Secrets: env files, keys, cookies / token jars
+.env
+.env.*
+*.pem
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc

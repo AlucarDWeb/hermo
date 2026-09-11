@@ -1,0 +1,123 @@
+# ── hermes_core native libraries ─────────────────────────────────────
+# All cargo genrules use tags=["local"] to bypass the Bazel sandbox and reuse
+# the crate's own target/ (same boundary just_nutrients_official_app uses —
+# no rules_rust on day 1). iOS genrules are NOT created here (T15).
+
+CORE_SRCS = glob(
+    [
+        "src/**/*.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "uniffi-bindgen.rs",
+        "uniffi.toml",
+    ],
+    allow_empty = False,
+)
+
+# Capture absolute outs before cd into the crate tree: $@ is relative to the
+# execroot; after cd it would resolve incorrectly.
+
+genrule(
+    name = "libhermes_core_android_arm64",
+    srcs = CORE_SRCS,
+    outs = ["libhermes_core_android_arm64.so"],
+    cmd = """
+        set -euo pipefail
+        OUT="$$(pwd)/$@"
+        export ANDROID_NDK_HOME="$${ANDROID_NDK_HOME:-/opt/android-ndk}"
+        NDK_BIN="$$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        # Reuse the crate's own target/ for incremental local builds.
+        # Toolchain passed via --config (JN pattern TD10): the API-suffixed
+        # clang/llvm-ar names are what let a C/asm dependency (ring,
+        # aws-lc-rs) survive a cold cross build — cc-rs otherwise fails with
+        # "failed to find tool".
+        cargo build --release --target aarch64-linux-android \\
+            --config "target.aarch64-linux-android.linker='$$NDK_BIN/aarch64-linux-android24-clang'" \\
+            --config "target.aarch64-linux-android.ar='$$NDK_BIN/llvm-ar'" \\
+            --config "env.CC_aarch64_linux_android='$$NDK_BIN/aarch64-linux-android24-clang'" \\
+            --config "env.AR_aarch64_linux_android='$$NDK_BIN/llvm-ar'"
+        mkdir -p "$$(dirname "$$OUT")"
+        cp "target/aarch64-linux-android/release/libhermes_core.so" "$$OUT"
+    """,
+    tags = ["local"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "libhermes_core_android_armv7",
+    srcs = CORE_SRCS,
+    outs = ["libhermes_core_android_armv7.so"],
+    cmd = """
+        set -euo pipefail
+        OUT="$$(pwd)/$@"
+        export ANDROID_NDK_HOME="$${ANDROID_NDK_HOME:-/opt/android-ndk}"
+        NDK_BIN="$$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        cargo build --release --target armv7-linux-androideabi \\
+            --config "target.armv7-linux-androideabi.linker='$$NDK_BIN/armv7a-linux-androideabi24-clang'" \\
+            --config "target.armv7-linux-androideabi.ar='$$NDK_BIN/llvm-ar'" \\
+            --config "env.CC_armv7_linux_androideabi='$$NDK_BIN/armv7a-linux-androideabi24-clang'" \\
+            --config "env.AR_armv7_linux_androideabi='$$NDK_BIN/llvm-ar'"
+        mkdir -p "$$(dirname "$$OUT")"
+        cp "target/armv7-linux-androideabi/release/libhermes_core.so" "$$OUT"
+    """,
+    tags = ["local"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "libhermes_core_android_x86_64",
+    srcs = CORE_SRCS,
+    outs = ["libhermes_core_android_x86_64.so"],
+    cmd = """
+        set -euo pipefail
+        OUT="$$(pwd)/$@"
+        export ANDROID_NDK_HOME="$${ANDROID_NDK_HOME:-/opt/android-ndk}"
+        NDK_BIN="$$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        cargo build --release --target x86_64-linux-android \\
+            --config "target.x86_64-linux-android.linker='$$NDK_BIN/x86_64-linux-android24-clang'" \\
+            --config "target.x86_64-linux-android.ar='$$NDK_BIN/llvm-ar'" \\
+            --config "env.CC_x86_64_linux_android='$$NDK_BIN/x86_64-linux-android24-clang'" \\
+            --config "env.AR_x86_64_linux_android='$$NDK_BIN/llvm-ar'"
+        mkdir -p "$$(dirname "$$OUT")"
+        cp "target/x86_64-linux-android/release/libhermes_core.so" "$$OUT"
+    """,
+    tags = ["local"],
+    visibility = ["//visibility:public"],
+)
+
+# ── UniFFI Kotlin bindings ───────────────────────────────────────────
+# Bindgen embeds the .so basename as the JNA library name, and the Bazel out
+# name is not libhermes_core.so — stage a correctly named copy and point
+# --library at it, then copy the generated .kt to the declared out.
+
+genrule(
+    name = "kotlin_bindings",
+    srcs = CORE_SRCS + [":libhermes_core_android_arm64"],
+    outs = ["bindings/uniffi/hermes_core/hermes_core.kt"],
+    cmd = """
+        set -euo pipefail
+        OUT="$$(pwd)/$@"
+        LIB_SRC="$$(pwd)/$(location :libhermes_core_android_arm64)"
+        LIB_DIR="$$(mktemp -d)"
+        OUT_DIR="$$(mktemp -d)"
+        trap 'rm -rf "$$LIB_DIR" "$$OUT_DIR"' EXIT
+        LIB="$$LIB_DIR/libhermes_core.so"
+        cp "$$LIB_SRC" "$$LIB"
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        cargo run --bin uniffi-bindgen -- generate \\
+            --library "$$LIB" \\
+            --language kotlin \\
+            --out-dir "$$OUT_DIR"
+        mkdir -p "$$(dirname "$$OUT")"
+        cp "$$OUT_DIR/uniffi/hermes_core/hermes_core.kt" "$$OUT"
+    """,
+    tags = ["local"],
+    visibility = ["//visibility:public"],
+)
