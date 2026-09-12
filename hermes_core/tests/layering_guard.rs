@@ -111,7 +111,18 @@ fn code_lines(text: &str) -> Vec<(usize, String)> {
         if visible.is_empty() || visible.starts_with("//") {
             continue;
         }
-        out.push((i + 1, visible.to_string()));
+        // T5 (PLAN §4): `CoreError` crosses the FFI boundary, so its derive
+        // carries `uniffi::Error`. That single documented exception is
+        // allowed; every other `uniffi` mention — a `use uniffi::…`, an
+        // `#[uniffi::export]`, or a `#[derive(uniffi::Object)]` on an entity
+        // — stays flagged. Blanket-exempting the whole `#[derive(...)]` line
+        // would have hidden exactly the violation this guard exists for.
+        let scanned = if visible.starts_with("#[derive(") {
+            visible.replace("uniffi::Error", "")
+        } else {
+            visible.to_string()
+        };
+        out.push((i + 1, scanned));
     }
     out
 }
@@ -178,6 +189,37 @@ fn guard_actually_reads_the_sources() {
             .iter()
             .any(|(_, l)| FORBIDDEN.iter().any(|(p, _)| l.contains(p))),
         "`crate::json` is a neutral helper and must stay allowed"
+    );
+}
+
+/// Rule pinned (T5): the FFI boundary exception is exactly ONE derive —
+/// `uniffi::Error` on the domain error type. A derive that pulls the FFI
+/// framework into an entity some other way is still a violation, and this test
+/// fails if the exemption is ever broadened to the whole attribute.
+#[test]
+fn only_uniffi_error_derive_is_exempt() {
+    let allowed = "#[derive(Debug, Clone, Error, uniffi::Error)]\n";
+    assert!(
+        !code_lines(allowed)
+            .iter()
+            .any(|(_, l)| FORBIDDEN.iter().any(|(p, _)| l.contains(p))),
+        "the boundary error derive is allowed"
+    );
+
+    let object = "#[derive(uniffi::Object)]\n";
+    assert!(
+        code_lines(object)
+            .iter()
+            .any(|(_, l)| FORBIDDEN.iter().any(|(p, _)| l.contains(p))),
+        "an uniffi::Object derive on an entity must stay flagged"
+    );
+
+    let imported = "use uniffi::setup_scaffolding;\n";
+    assert!(
+        code_lines(imported)
+            .iter()
+            .any(|(_, l)| FORBIDDEN.iter().any(|(p, _)| l.contains(p))),
+        "a plain uniffi import must stay flagged"
     );
 }
 
