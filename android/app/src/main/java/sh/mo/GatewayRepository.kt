@@ -19,14 +19,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
-/** Transcript state for one session key (plain text rows — the T7 chat screen refines this). */
-data class SessionUiState(
-    val key: String,
-    val title: String = "",
-    val model: String = "",
-    val rows: List<String> = emptyList(),
-)
-
 /**
  * The adapter between [HermesCore] and the UI (PLAN §4 T6 item 5).
  *
@@ -53,6 +45,17 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     private val _sessions = MutableStateFlow<Map<String, SessionUiState>>(emptyMap())
     val sessions: StateFlow<Map<String, SessionUiState>> = _sessions.asStateFlow()
 
+    /**
+     * The session key the UI must render: the repository OWNS the transcript
+     * screen's session (defect suspect #2 — `_sessions` can hold entries for
+     * keys nobody opened, and a screen rendering `keys.firstOrNull()` flips
+     * to an empty foreign session mid-turn, making the rows "vanish"). The
+     * UI reads this, never the map's key order.
+     */
+    private val _currentKey = MutableStateFlow<String?>(null)
+    val currentKey: StateFlow<String?> = _currentKey.asStateFlow()
+
+
     /** Last error, surfaced as one line of text in whatever phase is shown. */
     private val _errorText = MutableStateFlow("")
     val errorText: StateFlow<String> = _errorText.asStateFlow()
@@ -64,13 +67,6 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
 
     /** The paired endpoint, as display text (empty when unpaired). */
     private var endpointText: String = ""
-
-    /**
-     * The session key the UI is driving. The repository owns it so a caller
-     * never passes an absent/stale key and silently does nothing (the device
-     * acceptance run found `send` no-oping for exactly that reason).
-     */
-    private var currentKey: String? = null
 
     init {
         // The single drain point: core events -> phase + transcript state.
@@ -113,15 +109,23 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         val current = _sessions.value[change.key] ?: SessionUiState(key = change.key)
         val updated = when (change.kind) {
             uniffi.hermes_core.TranscriptChangeKind.ROW_APPENDED ->
-                current.copy(rows = current.rows + rowText(change.rowJson))
-            uniffi.hermes_core.TranscriptChangeKind.ROW_UPDATED -> {
-                val rows = current.rows.toMutableList()
-                val idx = change.index.toInt()
-                if (idx in rows.indices) rows[idx] = rowText(change.rowJson)
+                current.copy(rows = applyTranscriptChange(current.rows, "rowAppended", change.index.toLong(), change.rowJson))
+            uniffi.hermes_core.TranscriptChangeKind.ROW_UPDATED ->
+                current.copy(rows = applyTranscriptChange(current.rows, "rowUpdated", change.index.toLong(), change.rowJson))
+            uniffi.hermes_core.TranscriptChangeKind.RESET -> {
+                // FIDELITY FIX (suspect #1, the RESET path): a reset wipes the
+                // rows and the change stream is this app's ONLY transcript
+                // source (the desktop rebuilds from the resume RPC's own
+                // `messages`, which we never see). Honour the clear, then
+                // replay the last-known snapshot back in — idempotent on
+                // index — so a resume/reconnect can never collapse the
+                // transcript to nothing.
+                var rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson)
+                current.rows.forEachIndexed { i, json ->
+                    rows = applyTranscriptChange(rows, "rowAppended", i.toLong(), json)
+                }
                 current.copy(rows = rows)
             }
-            uniffi.hermes_core.TranscriptChangeKind.RESET ->
-                current.copy(rows = emptyList())
             uniffi.hermes_core.TranscriptChangeKind.HEADER_UPDATED -> {
                 // The DTO carries no header payload (`row_json` is empty for
                 // this kind), so the header must be re-read — off the drain
@@ -131,26 +135,10 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             }
         }
         _sessions.value = _sessions.value + (change.key to updated)
-    }
-
-    /** One plain-text line per row (MVP bar: no markdown, no cards). */
-    private fun rowText(rowJson: String): String {
-        if (rowJson.isEmpty()) return ""
-        return try {
-            val obj = JSONObject(rowJson)
-            when (obj.optString("kind")) {
-                "user" -> "You: ${obj.optString("text")}"
-                "assistant" -> "Agent: ${obj.optString("text")}"
-                "thinking" -> "Thinking: ${obj.optString("text")}"
-                "tool" -> {
-                    val done = if (obj.optBoolean("complete")) "done" else "running"
-                    "Tool ${obj.optString("name")} ($done)"
-                }
-                else -> obj.optString("kind")
-            }
-        } catch (_: Exception) {
-            ""
-        }
+        // A transcript change for a key nobody opened must not steal the
+        // screen; but if no session is current yet, the first real transcript
+        // claims it (header/open races).
+        if (_currentKey.value == null) _currentKey.value = change.key
     }
 
     private fun applyError(t: Throwable) {
@@ -204,7 +192,7 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
 
     private suspend fun openMainSession(cols: Int) {
         val key = core.openSession(null, cols.toLong())
-        currentKey = key
+        _currentKey.value = key
         // Register the tab immediately: the Ready screen's Send guard reads
         // this map, so an entry must exist before any header arrives.
         if (_sessions.value[key] == null) {
@@ -223,7 +211,7 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             val model = headerModelOf(summary.headerJson) ?: ""
             val s = _sessions.value[key] ?: SessionUiState(key = key)
             _sessions.value = _sessions.value + (key to s.copy(title = summary.title, model = model))
-            if (currentKey == null) currentKey = key
+            if (_currentKey.value == null) _currentKey.value = key
             // A header that lands after Ready must reach the screen.
             if (model.isNotEmpty()) {
                 _phase.value =
@@ -257,15 +245,18 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
      * rows; a resumed history replaces it after a RESET.
      */
     suspend fun send(text: String): Boolean {
-        val key = currentKey
-        if (key == null) {
+        val key: String = _currentKey.value ?: run {
             _errorText.value = "No open session to send into"
             return false
         }
         return try {
             core.send(key, text)
             val s = _sessions.value[key] ?: SessionUiState(key = key)
-            _sessions.value = _sessions.value + (key to s.copy(rows = s.rows + "You: $text"))
+            // Optimistic local echo as a user row (raw JSON — the stream
+            // replaces it when the replay confirms the turn).
+            val echo = org.json.JSONObject(mapOf("kind" to "user", "text" to text)).toString()
+            _sessions.value = _sessions.value +
+                (key to s.copy(rows = applyTranscriptChange(s.rows, "rowAppended", s.rows.size.toLong(), echo)))
             _errorText.value = ""
             true
         } catch (t: Throwable) {
