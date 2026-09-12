@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">hermo</string>
+    <!-- Unpaired phase: the app's first real screen. -->
+    <string name="unpaired_title">hermo</string>
+    <string name="unpaired_message">This device is not paired with a Hermes agent yet. Paste the pairing payload or the gateway URL.</string>
+    <string name="unpaired_payload_label">Pairing payload or gateway URL</string>
+    <string name="unpaired_cta">Pair this device</string>
+</resources>

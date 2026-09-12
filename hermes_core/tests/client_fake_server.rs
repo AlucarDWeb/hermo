@@ -334,9 +334,9 @@ async fn rpc_error_maps_to_typed_error() {
         }
     );
     match result {
-        Err(hermes_core::rpc::client::ClientError::Rpc { code, message }) => {
+        Err(hermes_core::rpc::client::ClientError::Rpc { code, detail }) => {
             assert_eq!(code, 4009);
-            assert_eq!(message, "session busy");
+            assert_eq!(detail, "session busy");
         }
         other => panic!("expected Rpc error, got {other:?}"),
     }

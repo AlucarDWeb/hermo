@@ -1,0 +1,2 @@
+# Patch files for third-party Bazel modules (applied via single_version_override).
+exports_files(glob(["*.patch"]))

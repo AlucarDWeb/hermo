@@ -31,8 +31,12 @@ pub enum CoreError {
     #[error("operation timed out")]
     Timeout,
     /// The gateway answered a JSON-RPC error object.
-    #[error("rpc error {code}: {message}")]
-    Rpc { code: i64, message: String },
+    // Field is `detail`, not `message`: the Kotlin bindings wrap error
+    // variants in `Throwable`, whose `message` property the generated
+    // `val message` would clash with (uniffi 0.31 gen limitation, found
+    // building //android/app:app in T6A). The wire struct keeps `message`.
+    #[error("rpc error {code}: {detail}")]
+    Rpc { code: i64, detail: String },
     /// Local filesystem failure (cookie jar, session registry).
     #[error("io error: {0}")]
     Io(String),

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext HTTP is allowed ONLY inside the tailnet range (100.64.0.0/10,
+  the CGNAT range Tailscale assigns node addresses) and loopback for local
+  testing. Everything else stays HTTPS-only: no blanket
+  usesCleartextTraffic="true".
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">100.64.0.0</domain>
+    </domain-config>
+</network-security-config>

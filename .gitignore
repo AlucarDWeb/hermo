@@ -13,6 +13,11 @@
 *.pem
 *.keystore
 *.jks
+# ...except the Android DEBUG signing key: it is the standard, publicly known
+# `androiddebugkey`/`android` pair with no authority anywhere, and the APK
+# build (`bazel build //android/app:app`) needs it present. Regenerate it any
+# time with `scripts/make_debug_keystore.sh`. Never put a release key here.
+!android/app/debug.keystore
 
 # Bazel
 /bazel-*

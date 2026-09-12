@@ -1,0 +1,219 @@
+# android/app/BUILD.bazel — hermo Android app shell (T6 stream A).
+#
+# Pattern copied structurally from just_nutrients_official_app
+# (READ-ONLY reference): JustNutrientsApp_android/app/BUILD.bazel.
+# Build: bazel build //android/app:app --config=emulator --config=lowmem
+
+load("@rules_kotlin//kotlin:android.bzl", "kt_android_library")
+load("@rules_kotlin//kotlin:core.bzl", "kt_compiler_plugin")
+load("@rules_android//android:rules.bzl", "android_binary")
+load("@rules_android//android:rules.bzl", "aar_import")
+
+# Jetpack Compose compiler plugin. rules_kotlin 2.4.0 bundles the Kotlin 2.4.0
+# compiler; the matching compose plugin is kotlin-compose-compiler-plugin-
+# embeddable:2.4.0 (see MODULE.bazel).
+kt_compiler_plugin(
+    name = "compose_compiler_plugin",
+    id = "org.jetbrains.kotlin.plugin.compose",
+    target_embedded_compiler = True,
+    visibility = ["//visibility:public"],
+    deps = ["@maven//:org_jetbrains_kotlin_kotlin_compose_compiler_plugin_embeddable"],
+)
+
+# ── hermes_core native libs → minimal AAR → aar_import ──────────────
+# Stage the per-ABI core .so files (genrule output has no JavaInfo, so they
+# reach the APK through a generated AAR, exactly as JN's core_aar does).
+# Basename must be libhermes_core.so (UniFFI load name).
+
+genrule(
+    name = "core_so_arm64",
+    srcs = ["//hermes_core:libhermes_core_android_arm64"],
+    outs = ["jniLibs/arm64-v8a/libhermes_core.so"],
+    cmd = """
+        mkdir -p "$$(dirname "$@")"
+        cp $(location //hermes_core:libhermes_core_android_arm64) "$@"
+    """,
+)
+
+genrule(
+    name = "core_so_armv7",
+    srcs = ["//hermes_core:libhermes_core_android_armv7"],
+    outs = ["jniLibs/armeabi-v7a/libhermes_core.so"],
+    cmd = """
+        mkdir -p "$$(dirname "$@")"
+        cp $(location //hermes_core:libhermes_core_android_armv7) "$@"
+    """,
+)
+
+genrule(
+    name = "core_so_x86_64",
+    srcs = ["//hermes_core:libhermes_core_android_x86_64"],
+    outs = ["jniLibs/x86_64/libhermes_core.so"],
+    cmd = """
+        mkdir -p "$$(dirname "$@")"
+        cp $(location //hermes_core:libhermes_core_android_x86_64) "$@"
+    """,
+)
+
+# Package the per-ABI .so files into a minimal AAR (jni/<abi>/ layout) so
+# aar_import propagates them into the APK.
+genrule(
+    name = "core_native_aar_gen",
+    srcs = [
+        ":core_so_arm64",
+        ":core_so_armv7",
+        ":core_so_x86_64",
+    ],
+    outs = ["hermes_core_native.aar"],
+    cmd = """
+        OUT="$$(pwd)/$@"
+        TMP=$$(mktemp -d)
+        echo '<manifest package="sh.mo.core.native"/>' > $$TMP/AndroidManifest.xml
+        mkdir -p $$TMP/jni/arm64-v8a $$TMP/jni/armeabi-v7a $$TMP/jni/x86_64
+        cp $(location :core_so_arm64) $$TMP/jni/arm64-v8a/libhermes_core.so
+        cp $(location :core_so_armv7) $$TMP/jni/armeabi-v7a/libhermes_core.so
+        cp $(location :core_so_x86_64) $$TMP/jni/x86_64/libhermes_core.so
+        cd $$TMP
+        zip -q -r "$$OUT" AndroidManifest.xml jni
+    """,
+)
+
+aar_import(
+    name = "core_native_aar",
+    aar = ":core_native_aar_gen",
+)
+
+# ── JNA native dispatch libs ────────────────────────────────────────
+# aar_import can't be used on the real JNA AAR: its ImportDepsChecker rejects
+# the AAR's classes.jar (references java.awt — desktop-only paths,
+# runtime-guarded). So extract the AAR's jni/<abi> libs with genrules and feed
+# them through a minimal synthetic AAR whose manifest-only jar passes the
+# checker. Copied verbatim from JN's app BUILD.bazel.
+genrule(
+    name = "jna_aar_copy",
+    srcs = ["@jna_aar//:jna-5.13.0.aar"],
+    outs = ["jna_native.aar"],
+    cmd = "cp $(location @jna_aar//:jna-5.13.0.aar) $@",
+)
+
+genrule(
+    name = "jna_so_arm64",
+    srcs = [":jna_aar_copy"],
+    outs = ["jniLibs_jna/arm64-v8a/libjnidispatch.so"],
+    cmd = """
+        TMP=$$(mktemp -d)
+        unzip -q -o $(location :jna_aar_copy) jni/arm64-v8a/libjnidispatch.so -d $$TMP
+        mkdir -p "$$(dirname "$@")"
+        cp $$TMP/jni/arm64-v8a/libjnidispatch.so "$@"
+    """,
+)
+
+genrule(
+    name = "jna_so_armv7",
+    srcs = [":jna_aar_copy"],
+    outs = ["jniLibs_jna/armeabi-v7a/libjnidispatch.so"],
+    cmd = """
+        TMP=$$(mktemp -d)
+        unzip -q -o $(location :jna_aar_copy) jni/armeabi-v7a/libjnidispatch.so -d $$TMP
+        mkdir -p "$$(dirname "$@")"
+        cp $$TMP/jni/armeabi-v7a/libjnidispatch.so "$@"
+    """,
+)
+
+genrule(
+    name = "jna_so_x86_64",
+    srcs = [":jna_aar_copy"],
+    outs = ["jniLibs_jna/x86_64/libjnidispatch.so"],
+    cmd = """
+        TMP=$$(mktemp -d)
+        unzip -q -o $(location :jna_aar_copy) jni/x86_64/libjnidispatch.so -d $$TMP
+        mkdir -p "$$(dirname "$@")"
+        cp $$TMP/jni/x86_64/libjnidispatch.so "$@"
+    """,
+)
+
+# Minimal AAR wrapping only the extracted jni/<abi>/libs — no classes.jar, so
+# the ImportDepsChecker has nothing to reject.
+genrule(
+    name = "jna_libs_native_aar",
+    srcs = [
+        ":jna_so_arm64",
+        ":jna_so_armv7",
+        ":jna_so_x86_64",
+    ],
+    outs = ["jna_libs_native_packed.aar"],
+    cmd = """
+        OUT="$$(pwd)/$@"
+        TMP=$$(mktemp -d)
+        echo '<manifest package="com.sun.jna.native"/>' > $$TMP/AndroidManifest.xml
+        mkdir -p $$TMP/jni/arm64-v8a $$TMP/jni/armeabi-v7a $$TMP/jni/x86_64
+        cp $(location :jna_so_arm64) $$TMP/jni/arm64-v8a/libjnidispatch.so
+        cp $(location :jna_so_armv7) $$TMP/jni/armeabi-v7a/libjnidispatch.so
+        cp $(location :jna_so_x86_64) $$TMP/jni/x86_64/libjnidispatch.so
+        cd $$TMP
+        zip -q -r "$$OUT" AndroidManifest.xml jni
+    """,
+)
+
+aar_import(
+    name = "jna_native",
+    aar = ":jna_libs_native_aar",
+)
+
+# ── App library + binary ────────────────────────────────────────────
+kt_android_library(
+    name = "app_lib",
+    srcs = glob(
+        ["src/main/java/**/*.kt"],
+    ) + ["//hermes_core:kotlin_bindings"],
+    custom_package = "sh.mo",
+    manifest = "src/main/AndroidManifest.xml",
+    resource_files = glob(["src/main/res/**"]),
+    plugins = [":compose_compiler_plugin"],
+    deps = [
+        "@maven//:net_java_dev_jna_jna",
+        "@maven//:net_java_dev_jna_jna_platform",
+        "@maven//:androidx_core_core_ktx",
+        "@maven//:androidx_collection_collection_jvm",
+        "@maven//:androidx_concurrent_concurrent_futures",
+        "@maven//:com_google_guava_listenablefuture",
+        "@maven//:androidx_lifecycle_lifecycle_runtime_ktx",
+        "@maven//:androidx_lifecycle_lifecycle_viewmodel_compose",
+        "@maven//:androidx_activity_activity_compose",
+        "@maven//:androidx_compose_ui_ui",
+        "@maven//:androidx_compose_ui_ui_graphics",
+        "@maven//:androidx_compose_ui_ui_tooling_preview",
+        "@maven//:androidx_compose_material3_material3",
+        "@maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core",
+        "@maven//:org_jetbrains_kotlinx_kotlinx_coroutines_android",
+    ],
+)
+
+# Debug signing: a freshly generated debug-only keystore (keytool, alias
+# androiddebugkey, store/key password android — the standard Android debug
+# credentials; carries no authority anywhere).
+android_binary(
+    name = "app",
+    custom_package = "sh.mo",
+    debug_key = ":debug_keystore",
+    manifest = "src/main/AndroidManifest.xml",
+    manifest_values = {
+        "minSdkVersion": "24",
+        "targetSdkVersion": "36",
+        "versionCode": "1",
+        "versionName": "0.1.0",
+    },
+    deps = [
+        ":app_lib",
+        # Native libs propagate from the AARs (jni/<abi>/*.so) without needing
+        # NDK C++ toolchains. jna_native packs libjnidispatch.so per-ABI.
+        ":core_native_aar",
+        ":jna_native",
+    ],
+)
+
+# Generated debug keystore (see scripts/make_debug_keystore.sh).
+filegroup(
+    name = "debug_keystore",
+    srcs = ["debug.keystore"],
+)

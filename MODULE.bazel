@@ -3,8 +3,143 @@ module(
     version = "0.1.0",
 )
 
-# Minimal on purpose (stream 1, PLAN.md T1): only the platforms dep the
-# genrules need. rules_android / rules_kotlin / rules_jvm_external /
-# rules_android_ndk (+ patch) / tools/signing arrive with the Android app
-# target in T6; rules_apple + SPM arrive with iOS in T15.
 bazel_dep(name = "platforms", version = "1.0.0")
+
+# Android rules — copied structurally from just_nutrients_official_app
+# (READ-ONLY reference), which builds green on this machine.
+bazel_dep(name = "rules_android", version = "0.7.3")
+bazel_dep(name = "rules_kotlin", version = "2.4.0")
+bazel_dep(name = "rules_jvm_external", version = "6.9")
+
+# Android SDK discovery from $ANDROID_HOME via rules_android's
+# android_sdk_repository extension (Bazel-9 native).
+android_sdk_repository = use_extension(
+    "@rules_android//rules/android_sdk_repository:rule.bzl",
+    "android_sdk_repository_extension",
+)
+use_repo(android_sdk_repository, "androidsdk")
+
+# maven.install pruned to what the app shell needs (PLAN §4 T6 item 2):
+# Compose 1.7.0 line + material3 1.3.1, the compose compiler plugin matching
+# rules_kotlin 2.4.0's Kotlin 2.4.0, the androidx.lifecycle 2.8.3 family,
+# coroutines 1.7.3, activity-compose, core-ktx, and the code scanner for the
+# later pairing QR screen. Markdown renderer deferred until T7 proves the need.
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    aar_import_bzl_label = "@rules_android//android:rules.bzl",
+    artifacts = [
+        # JNA — required by UniFFI-generated Kotlin at runtime (classes).
+        # Declared as the plain jar: coursier rejects the typed
+        # "g:a:aar:v" coordinate, and the per-ABI libjnidispatch.so is
+        # packaged separately through the jna_aar repo rule below (JN
+        # pattern TD2, adapted).
+        "net.java.dev.jna:jna:5.13.0",
+        "net.java.dev.jna:jna-platform:5.13.0",
+
+        # Compose — one consistent 1.7.0 line.
+        "androidx.compose.ui:ui:1.7.0",
+        "androidx.compose.ui:ui-graphics:1.7.0",
+        "androidx.compose.ui:ui-tooling-preview:1.7.0",
+        "androidx.compose.material3:material3:1.3.1",
+
+        # Kotlin 2.x Compose compiler plugin (matches rules_kotlin 2.4.0's
+        # bundled Kotlin 2.4.0 compiler).
+        "org.jetbrains.kotlin:kotlin-compose-compiler-plugin-embeddable:2.4.0",
+
+        # ViewModel / lifecycle — material3 1.3.x hard-pins the 2.8.3 line, so
+        # the whole androidx.lifecycle family stays uniform at 2.8.3.
+        "androidx.lifecycle:lifecycle-runtime:2.8.3",
+        "androidx.lifecycle:lifecycle-common:2.8.3",
+        "androidx.lifecycle:lifecycle-common-java8:2.8.3",
+        "androidx.lifecycle:lifecycle-livedata-core:2.8.3",
+        "androidx.lifecycle:lifecycle-livedata:2.8.3",
+        "androidx.lifecycle:lifecycle-runtime-compose:2.8.3",
+        "androidx.lifecycle:lifecycle-runtime-ktx:2.8.3",
+        "androidx.lifecycle:lifecycle-viewmodel:2.8.3",
+        "androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.3",
+        "androidx.lifecycle:lifecycle-viewmodel-compose:2.8.3",
+        "androidx.lifecycle:lifecycle-viewmodel-savedstate:2.8.3",
+
+        # Coroutines
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3",
+        "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3",
+
+        # profileinstaller's writeProfile path needs AbstractResolvableFuture
+        # (pulled transitively, missed in the Bazel maven graph in JN).
+        "androidx.concurrent:concurrent-futures:1.1.0",
+        # AbstractResolvableFuture extends Guava's ListenableFuture; the
+        # listenablefuture-1.0 stub artifact provides that one class.
+        "com.google.guava:listenablefuture:1.0",
+
+        # Core / activity
+        "androidx.core:core-ktx:1.15.0",
+        "androidx.activity:activity-compose:1.8.2",
+        "androidx.collection:collection:1.4.2",
+
+        # System QR scanner intentionally NOT included: the PoC pairs via
+        # manual text entry (paste `hermes://connect?...` or type URL +
+        # username — the core's parse_qr_payload handles the payload), so
+        # the scanner's dependency chain (which breaks coursier resolution)
+        # is not needed.
+    ],
+    known_contributing_modules = [
+        "hermo",
+        "protobuf",
+    ],
+    repositories = [
+        "https://maven.google.com",
+        "https://repo1.maven.org/maven2",
+    ],
+    resolve_timeout = 1200,
+    # Bazel 9 + rules_android: default aar_import points at legacy
+    # @build_bazel_rules_android which is not on the module graph → ERROR
+    # "name 'aar_import' is not defined". Wire starlark aar_import from
+    # rules_android (JN pattern).
+    use_starlark_android_rules = True,
+    version_conflict_policy = "pinned",
+)
+use_repo(maven, "maven")
+
+# JNA AAR exposure (see android/app/jna_aar_repo.bzl docstring, copied from
+# JN's tools/signing/jna_aar_repo.bzl): rules_jvm_external imports jna as a
+# plain-jar jvm_import, losing the AAR's per-ABI libjnidispatch.so. This repo
+# rule symlinks the cached AAR so BUILD.bazel can repackage its native libs.
+jna_aar_repo = use_repo_rule("//android/app:jna_aar_repo.bzl", "jna_aar")
+
+jna_aar_repo(
+    name = "jna_aar",
+    version = "5.13.0",
+)
+
+# JDK 25's ct.sym breaks the turbine_direct_graal binary shipped in
+# rules_java toolchains (java.lang.Record lookup). Java 21 pins live in
+# .bazelrc.
+
+# NDK — cc toolchain for the Android split transition. rules_android 0.7's
+# android_binary resolves a cc toolchain per --android_platforms entry
+# (_cc_toolchain_split) and aar_import extracts jni/<abi> libs per target
+# platform; without a registered Android cc toolchain, builds with
+# --android_platforms fail ("Unable to find a CC toolchain").
+bazel_dep(name = "rules_android_ndk", version = "0.1.5")
+
+# Bazel 9 fix: rules_android_ndk's BUILD template calls cc_toolchain_suite
+# without loading it (removed native symbol under Bazel 9). Patch adds the
+# missing load() from @rules_cc//cc/toolchains:cc_toolchain_suite.bzl.
+single_version_override(
+    module_name = "rules_android_ndk",
+    patch_strip = 1,
+    patches = ["//third_party:rules_android_ndk_bazel9.patch"],
+    version = "0.1.5",
+)
+
+android_ndk_repository_extension = use_extension(
+    "@rules_android_ndk//:extension.bzl",
+    "android_ndk_repository_extension",
+)
+use_repo(android_ndk_repository_extension, "androidndk")
+
+register_toolchains("@androidndk//:all")
+
+# NDK path comes from ANDROID_NDK_HOME (per-host; /opt/android-ndk here).
+# API 24 matches the app minSdk; the toolchain defaults to 31 otherwise.
+android_ndk_repository_extension.configure(api_level = 24)
