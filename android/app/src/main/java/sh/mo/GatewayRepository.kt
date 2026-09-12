@@ -11,6 +11,7 @@ import uniffi.hermes_core.TranscriptChangeKind
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -55,6 +56,11 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     /** Last error, surfaced as one line of text in whatever phase is shown. */
     private val _errorText = MutableStateFlow("")
     val errorText: StateFlow<String> = _errorText.asStateFlow()
+
+    /** Surface a UI-level message (permission denial, local validation). */
+    fun noteError(text: String) {
+        _errorText.value = text
+    }
 
     /** The paired endpoint, as display text (empty when unpaired). */
     private var endpointText: String = ""
@@ -251,7 +257,7 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
      * rows; a resumed history replaces it after a RESET.
      */
     suspend fun send(text: String): Boolean {
-        val key = currentKey ?: _sessions.value.keys.firstOrNull()
+        val key = currentKey
         if (key == null) {
             _errorText.value = "No open session to send into"
             return false
@@ -287,18 +293,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     private fun EndpointDto.displayText(): String =
         "${displayName} (${username}) — ${baseUrl}"
 
-    /** Parse a shared `hermes://` VIEW intent payload without pairing yet. */
-    fun parseSharedPayload(payload: String): EndpointDto? = try {
-        kotlinx.coroutines.runBlocking { core.parseQr(payload) }
-    } catch (_: Throwable) {
-        null
-    }
-
-    companion object {
-        /** `cols` for the transcript area: width px, density from resources. */
-        fun colsFor(widthPx: Int, density: Float): Int = Cols.from(widthPx, density)
-
-        /** Extract the payload from a `hermes://connect?...` VIEW intent URI. */
-        fun payloadFromIntentUri(uri: android.net.Uri): String = uri.toString()
+    /**
+     * Cancel this repository's scope. The view model calls it from
+     * `onCleared()`, so the drain loop and any in-flight header refresh do not
+     * outlive the screen.
+     */
+    fun close() {
+        scope.cancel()
     }
 }

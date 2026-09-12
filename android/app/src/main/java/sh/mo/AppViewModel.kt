@@ -27,16 +27,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Relaunch path (checklist: 1 h / 25 h later must not ask for the
         // password): saved endpoint + cookie jar first.
         viewModelScope.launch {
-            val cols = Cols.from(
-                (getApp().resources.displayMetrics.widthPixels),
-                getApp().resources.displayMetrics.density,
-            )
-            val resumed = repo.tryResume(cols)
+            val resumed = repo.tryResume(cols())
             if (!resumed) _phaseFallbackUnpaired()
         }
     }
 
     private fun getApp(): Application = getApplication()
+
+    /** `cols` for the transcript area, from this device's own screen. */
+    private fun cols(): Int = Cols.from(
+        getApp().resources.displayMetrics.widthPixels,
+        getApp().resources.displayMetrics.density,
+    )
+
+    /** Re-run the resume path — the Offline banner's Retry. */
+    fun retryResume() {
+        viewModelScope.launch { repo.tryResume(cols()) }
+    }
+
+    /** The runtime CAMERA permission was denied: say so, never fail silently. */
+    fun onCameraPermissionDenied() {
+        repo.noteError("Camera permission is needed to scan the QR — or paste the payload below")
+    }
+
+    override fun onCleared() {
+        repo.close()
+        super.onCleared()
+    }
 
     private fun _phaseFallbackUnpaired() {
         // tryResume returned false: no saved endpoint -> Unpaired.
@@ -56,13 +73,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** PasswordSheet submit. */
     fun submitPassword(password: String) {
-        viewModelScope.launch {
-            val cols = Cols.from(
-                getApp().resources.displayMetrics.widthPixels,
-                getApp().resources.displayMetrics.density,
-            )
-            repo.loginAndConnect(password, cols)
-        }
+        viewModelScope.launch { repo.loginAndConnect(password, cols()) }
     }
 
     /** Scan screen result: a decoded `hermes://connect?...` payload. */

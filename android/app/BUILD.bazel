@@ -196,18 +196,14 @@ kt_android_library(
 )
 
 # ── JVM unit tests (pure pieces, no Android imports) ─────────────────
-kt_jvm_test(
-    name = "pure_tests",
-    srcs = glob(["src/test/java/**/*.kt"]),
-    test_class = "sh.mo.PhaseMachineTest",
-    deps = [
-        "@maven//:junit_junit",
-        "@maven//:com_google_zxing_core",
-        ":pure_lib",
-    ],
-)
+# Each test class needs its own target: `kt_jvm_test` runs ONE class.
+TEST_CLASSES = [
+    "PhaseMachineTest",
+    "ColsTest",
+    "ErrorMessagesTest",
+    "QrDecodeTest",
+]
 
-# Each test class needs its own target (kt_jvm_test runs one class).
 [
     kt_jvm_test(
         name = "pure_tests_" + cls,
@@ -219,21 +215,12 @@ kt_jvm_test(
             ":pure_lib",
         ],
     )
-    for cls in [
-        "ColsTest",
-        "ErrorMessagesTest",
-        "QrDecodeTest",
-    ]
+    for cls in TEST_CLASSES
 ]
 
 test_suite(
     name = "pure_test_suite",
-    tests = [
-        ":pure_tests",
-        ":pure_tests_ColsTest",
-        ":pure_tests_ErrorMessagesTest",
-        ":pure_tests_QrDecodeTest",
-    ],
+    tests = [":pure_tests_" + cls for cls in TEST_CLASSES],
 )
 
 # The pure main sources as a plain JVM library (no Android deps) so the

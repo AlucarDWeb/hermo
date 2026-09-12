@@ -44,7 +44,11 @@ class MainActivity : ComponentActivity() {
     private val viewModel: AppViewModel by viewModels()
 
     private val cameraPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            // A denied permission must be visible: the manual fallback stays
+            // reachable, so this is a message, not a capability cut.
+            if (!granted) viewModel.onCameraPermissionDenied()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -86,7 +90,7 @@ fun AppScreen(viewModel: AppViewModel, onScanRequested: () -> Boolean) {
         is AppPhase.NeedsPassword -> PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
         is AppPhase.Connecting -> ConnectingScreen()
         is AppPhase.Ready -> ReadyScreen(viewModel, p.model)
-        is AppPhase.Offline -> OfflineScreen(reason = p.reason, onRetry = { /* relaunch path re-runs via repo */ })
+        is AppPhase.Offline -> OfflineScreen(reason = p.reason, onRetry = { viewModel.retryResume() })
     }
 }
 
