@@ -71,10 +71,3 @@ fun applyTranscriptChange(rows: List<String>, kind: String, index: Long, rowJson
         else -> rows // headerUpdated: no row change
     }
 }
-
-/**
- * Row text kept as the raw JSON (the UI layer parses it into [ChatRow]s for
- * rendering); this helper exists for tests and for the legacy plain-text
- * fallback.
- */
-fun rowIsEmpty(rowJson: String) = rowJson.isEmpty()

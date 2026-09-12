@@ -62,17 +62,15 @@ class TranscriptStateTest {
     }
 
     @Test
-    fun `reset clears but a replayed snapshot rebuilds - no empty transcript`() {
+    fun `reset honours the clear - the core redistributes the history`() {
         val snapshot = appends("""{"kind":"user","text":"q"}""", assistantJson)
-        // RESET honours the clear…
-        var rows = applyTranscriptChange(snapshot, "reset", Long.MAX_VALUE, "")
+        // RESET is clear-only: the app keeps no local snapshot. The core
+        // re-renders the resumed history right after (`reset_from_resume` emits
+        // one Reset, then the resume ingest redistributes the rows on the same
+        // stream), so a local replay here would duplicate the whole transcript
+        // (review #8, should 1).
+        val rows = applyTranscriptChange(snapshot, "reset", Long.MAX_VALUE, "")
         assertEquals(0, rows.size)
-        // …and the repository replays the snapshot back in (append path,
-        // idempotent on index) so the screen never collapses to one empty row.
-        snapshot.forEachIndexed { i, json ->
-            rows = applyTranscriptChange(rows, "rowAppended", i.toLong(), json)
-        }
-        assertEquals(snapshot, rows)
     }
 
     @Test

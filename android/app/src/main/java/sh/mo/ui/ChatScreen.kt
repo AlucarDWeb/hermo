@@ -31,14 +31,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import sh.mo.ChatRow
 import sh.mo.SessionUiState
@@ -63,11 +60,11 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
     val sessions by viewModel.sessions.collectAsState()
     val currentKey by viewModel.currentKey.collectAsState()
 
-    // The repository OWNS the screen's session. A second entry in the
-    // sessions map (a foreign key nobody opened) must never steal the view:
-    // render the repository's key, fall back to the map's own entry for it —
-    // never keys.firstOrNull() (the fidelity defect's suspect #2).
-    val key = currentKey ?: sessions.keys.firstOrNull()
+    // The repository OWNS the screen's session. A second entry in the sessions
+    // map (a foreign key nobody opened) must never steal the view, so there is
+    // no map-order fallback at all: no current key means no session to show.
+    // (Review #8, nit 2 — the old `keys.firstOrNull()` survived as a fallback.)
+    val key = currentKey
     val state: SessionUiState = key?.let { sessions[it] } ?: SessionUiState(key = "")
     val rows: List<ChatRow> = state.rows
         .filter { it.isNotEmpty() }
@@ -154,12 +151,7 @@ private fun TranscriptList(rows: List<ChatRow>, modifier: Modifier) {
         }
     }
     LaunchedEffect(rows.size) {
-        snapshotFlow { rows.size }
-            .distinctUntilChanged()
-            .filter { nearBottom }
-            .collect {
-                if (rows.isNotEmpty()) listState.animateScrollToItem(rows.size - 1)
-            }
+        if (rows.isNotEmpty() && nearBottom) listState.animateScrollToItem(rows.size - 1)
     }
 
     if (rows.isEmpty()) {

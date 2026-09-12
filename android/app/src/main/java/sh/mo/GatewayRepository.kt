@@ -113,18 +113,13 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             uniffi.hermes_core.TranscriptChangeKind.ROW_UPDATED ->
                 current.copy(rows = applyTranscriptChange(current.rows, "rowUpdated", change.index.toLong(), change.rowJson))
             uniffi.hermes_core.TranscriptChangeKind.RESET -> {
-                // FIDELITY FIX (suspect #1, the RESET path): a reset wipes the
-                // rows and the change stream is this app's ONLY transcript
-                // source (the desktop rebuilds from the resume RPC's own
-                // `messages`, which we never see). Honour the clear, then
-                // replay the last-known snapshot back in — idempotent on
-                // index — so a resume/reconnect can never collapse the
-                // transcript to nothing.
-                var rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson)
-                current.rows.forEachIndexed { i, json ->
-                    rows = applyTranscriptChange(rows, "rowAppended", i.toLong(), json)
-                }
-                current.copy(rows = rows)
+                // Honour the clear and keep NO local copy: the core redistributes
+                // the history itself (`hermes_core/src/transcript/reducer.rs` —
+                // `reset_from_resume` emits exactly one Reset, then the resume
+                // ingest re-renders the messages into rows on this same stream).
+                // Replaying a local snapshot here would duplicate the transcript
+                // the core is about to send (review #8, should 1).
+                current.copy(rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson))
             }
             uniffi.hermes_core.TranscriptChangeKind.HEADER_UPDATED -> {
                 // The DTO carries no header payload (`row_json` is empty for
