@@ -2,15 +2,18 @@
 //!
 //! Clean Architecture layering (Dependency Rule points inward):
 //!   framework/driver: tokio, reqwest, tokio-tungstenite, uniffi
-//!   adapter:          `json`, `rpc::frames` (wire DTOs and framing)
+//!   adapter:          `rpc::client` (WebSocket), `rpc::frames` (codec),
+//!                     `auth::client` (HTTP + cookie jar)
+//!   neutral:          `json` (serde_json helpers), `protocol` (DTOs)
 //!   use case:         `core` (T5, not started in this stream)
-//!   entity:           transcript model, session registry, endpoint (T2+)
+//!   entity:           `transcript` (model + reducer + markdown),
+//!                     `auth::endpoint`, `error`
 //!
-//! This stream builds the adapter layer (JSON helpers, frame codec, typed
-//! RPC wrappers) and the T2 transport driver: the WebSocket gateway client
-//! with heartbeat, sticky close reasons and replay seq watermarks, plus the
-//! desktop probe binary. The use-case/entity layers (transcript model,
-//! session registry) arrive with T4/T5.
+//! `json` and `protocol` are shared value-object/helper modules both the
+//! adapters and the entity import (PLAN §3: cross-boundary data is plain
+//! DTOs). They hold no I/O and no framework types, and `tests/layering_guard.rs`
+//! keeps them that way — as it keeps the entity from importing `rpc`/`auth::client`
+//! (review #4, should 1).
 
 pub mod json;
 pub mod protocol;

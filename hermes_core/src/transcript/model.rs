@@ -11,7 +11,7 @@
 //! | `approval.request`                      | [`RowKind::Approval`]  |
 //! | `clarify.request` (both shapes)         | [`RowKind::Clarify`]   |
 //! | `status.update`                         | [`RowKind::Status`]    |
-//! | `session.info`, `session.title`         | [`RowKind::Header`]    |
+//! | `session.info`, `session.title`         | `Transcript.header` (state, not a row) |
 //! | `error`                                 | [`RowKind::Error`]     |
 //!
 //! No `serde_json::Value` outside the fields that must stay untyped (`args`,
@@ -55,8 +55,6 @@ pub enum RowKind {
     Clarify(ClarifyCard),
     /// Status strip text (`status.update`).
     Status { kind: StatusKind, text: String },
-    /// Session header (`session.info` / `session.title`).
-    Header(SessionHeader),
     /// System error row (`error`).
     Error { message: String },
 }
@@ -191,7 +189,6 @@ impl Transcript {
             Some(RowKind::Approval(_)) => "approval",
             Some(RowKind::Clarify(_)) => "clarify",
             Some(RowKind::Status { .. }) => "status",
-            Some(RowKind::Header(_)) => "header",
             Some(RowKind::Error { .. }) => "error",
             None => "",
         }

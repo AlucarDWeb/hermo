@@ -1,4 +1,11 @@
-//! Tolerant serde_json accessors (adapter layer).
+//! Tolerant serde_json accessors — shared NEUTRAL helpers, not an adapter.
+//!
+//! These are pure functions over `serde_json::Value`: no I/O, no framework
+//! type, no policy. Both the codec (`rpc::frames`) and the entity
+//! (`transcript`) read payloads with them, so the module must stay on the
+//! neutral side of the Dependency Rule — calling it "adapter" while the
+//! entity imports it is exactly the inward edge PR #3 flagged (review #4,
+//! should 1). `tests/layering_guard.rs` enforces that it stays clean.
 //!
 //! The wire protocol is internal to Hermes and changes: readers must never
 //! panic on a missing, mistyped or unknown field. Every helper returns a

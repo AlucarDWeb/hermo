@@ -175,20 +175,28 @@ impl Reducer {
     fn on_message_interim(&mut self, payload: &Value) -> Vec<TranscriptChange> {
         // Verified wire shape (PLAN §4 T4): `{text, already_streamed}` — the
         // current streaming text is sealed as its own row and the streaming
-        // continues in a fresh row. `already_streamed` says the text was
-        // already delivered via deltas, so it is NOT appended again.
+        // continues in a fresh row.
+        //
+        // `already_streamed` decides what the sealed row holds (review #4,
+        // should 2): when TRUE the text already arrived as deltas, so it must
+        // NOT be applied again (appending would duplicate it). When FALSE the
+        // interim text never arrived as a delta, so it IS the row's text —
+        // discarding it would store an empty assistant row.
         let already_streamed = json::bool_at(payload, "already_streamed");
         let sealed = self.streaming.take();
         let mut changes = Vec::new();
         if let Some(index) = sealed {
             if let Some(row) = self.state.rows.get_mut(index) {
-                if let RowKind::Assistant { streaming, .. } = &mut row.kind {
+                if let RowKind::Assistant { text: slot, streaming, .. } = &mut row.kind {
                     *streaming = false;
+                    if !already_streamed {
+                        slot.clear();
+                        slot.push_str(json::str_at(payload, "text"));
+                    }
                 }
             }
             changes.push(TranscriptChange::RowUpdated { index });
         }
-        let _ = already_streamed;
         changes
     }
 
@@ -349,6 +357,13 @@ impl Reducer {
             return Vec::new();
         }
         let kind = StatusKind::parse(kind_str);
+        // `heartbeat` is a liveness ping with no user-facing text and the
+        // gateway emits it every few seconds: a row per ping would flood the
+        // transcript (review #4, nit). It stays parseable but is not a row.
+        // User-visible status text renders as a status strip (PLAN §1.4).
+        if kind == StatusKind::Heartbeat {
+            return Vec::new();
+        }
         let text = json::str_at(payload, "text").to_string();
         let index = self.state.rows.len();
         self.state.rows.push(Row { index, kind: RowKind::Status { kind, text } });
@@ -611,6 +626,28 @@ mod tests {
         }
     }
 
+    /// Rule pinned: an interim whose text did NOT arrive as deltas
+    /// (`already_streamed: false`) puts that text into the sealed row. The
+    /// pre-fix handler bound the field and dropped it, leaving an empty
+    /// assistant row (review #4, should 2). The T0 recording has no
+    /// `message.interim` frame at all, so only this unit test can catch it.
+    #[test]
+    fn message_interim_carries_text_when_not_already_streamed() {
+        let mut r = Reducer::new();
+        r.apply(&event("message.start", json!({})));
+        r.apply(&event(
+            "message.interim",
+            json!({"text": "partial answer", "already_streamed": false}),
+        ));
+        let t = r.transcript();
+        assert_eq!(t.rows.len(), 1, "the interim seals, it does not append a row");
+        assert_eq!(assistant_text(&t.rows[0]), "partial answer");
+        match &t.rows[0].kind {
+            RowKind::Assistant { streaming, .. } => assert!(!streaming, "sealed row is closed"),
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+    }
+
     /// Rule pinned: `tool.generating` → `start` → `complete` produces
     /// exactly ONE card for the tool id, updated in place; `complete` is the
     /// only step that sets the terminal state.
@@ -765,10 +802,8 @@ mod tests {
     #[test]
     fn status_kinds_cover_verified_set() {
         let mut r = Reducer::new();
-        for (i, kind) in ["status", "lifecycle", "compacting", "compacted", "heartbeat", "weird"]
-            .iter()
-            .enumerate()
-        {
+        let visible = ["status", "lifecycle", "compacting", "compacted", "weird"];
+        for (i, kind) in visible.iter().enumerate() {
             r.apply(&event("status.update", json!({"kind": kind, "text": "t"})));
             match &r.transcript().rows[i].kind {
                 RowKind::Status { kind: parsed, text } => {
@@ -777,7 +812,6 @@ mod tests {
                         "lifecycle" => StatusKind::Lifecycle,
                         "compacting" => StatusKind::Compacting,
                         "compacted" => StatusKind::Compacted,
-                        "heartbeat" => StatusKind::Heartbeat,
                         _ => StatusKind::Other("weird".to_string()),
                     };
                     assert_eq!(*parsed, expected, "kind {}", kind);
@@ -786,6 +820,20 @@ mod tests {
                 other => panic!("expected Status row, got {:?}", other),
             }
         }
+    }
+
+    /// Rule pinned: `heartbeat` stays parseable but is NEVER a transcript row.
+    /// A ping every few seconds would otherwise flood the transcript, and the
+    /// pre-fix handler appended one row per ping (review #4, nit).
+    #[test]
+    fn heartbeat_status_is_not_a_row() {
+        assert_eq!(StatusKind::parse("heartbeat"), StatusKind::Heartbeat, "still parseable");
+        let mut r = Reducer::new();
+        r.apply(&event("status.update", json!({"kind": "status", "text": "working"})));
+        let changes = r.apply(&event("status.update", json!({"kind": "heartbeat", "text": "ping"})));
+        assert!(changes.is_empty(), "heartbeat emits no change");
+        assert_eq!(r.transcript().rows.len(), 1, "heartbeat adds no row");
+        assert_eq!(r.transcript().rows[0].index, 0, "existing rows untouched");
     }
 
     /// Rule pinned: session.info and session.title merge into the session

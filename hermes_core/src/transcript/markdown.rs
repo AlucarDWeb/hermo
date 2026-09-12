@@ -41,11 +41,7 @@ pub fn split_blocks(text: &str) -> Vec<MarkdownBlock> {
                 } else {
                     fence_tildes = kind_len;
                 }
-                let language = if is_tick {
-                    trimmed[kind_len..].trim().to_string()
-                } else {
-                    String::new()
-                };
+                let language = trimmed[kind_len..].trim().to_string();
                 if let Some(block) = current.take() {
                     blocks.push(block);
                 }
@@ -102,8 +98,13 @@ fn fence_marker(line: &str) -> Option<(usize, bool)> {
         return None;
     }
     let tildes = line.chars().take_while(|&c| c == '~').count();
-    if tildes >= MIN_FENCE && tildes == line.chars().count() {
-        return Some((tildes, false));
+    if tildes >= MIN_FENCE {
+        // CommonMark allows an info string on a tilde fence too; an inner
+        // tilde run would make this an ordinary text line (review #4, nit).
+        let info = &line[tildes..];
+        if !info.contains('~') {
+            return Some((tildes, false));
+        }
     }
     None
 }
@@ -143,6 +144,18 @@ mod tests {
 
     /// Rule pinned: the fence CLOSES once the closing marker arrives — the
     /// same text fully streamed must end with `open: false`.
+    /// Rule pinned: a tilde fence carries its info string too (CommonMark);
+    /// the pre-fix `fence_marker` only accepted a bare tilde line and the
+    /// splitter forced the language to empty for tildes (review #4, nit).
+    #[test]
+    fn tilde_fence_carries_its_info_string() {
+        let blocks = split_blocks("~~~rust\nlet x = 1;\n~~~\n");
+        assert_eq!(blocks.len(), 1, "one closed block");
+        assert_eq!(blocks[0].language, "rust");
+        assert!(!blocks[0].open, "closed by the closing fence");
+        assert_eq!(blocks[0].text, "let x = 1;");
+    }
+
     #[test]
     fn terminated_fence_closes() {
         let full = "```json\n{\"k\": 1}\n```";

@@ -98,10 +98,13 @@ fn reset_from_resume_on_one_session_leaves_the_other_untouched() {
         other => panic!("expected Assistant in B, got {:?}", other),
     }
 
-    // Resetting an unknown key must not disturb either transcript.
+    // A reset call always wipes the instance it is called on and stamps the
+    // key it was given: there is no stored-key check, so a stray key is the
+    // caller's problem, not a silent no-op. Isolation between chats is "two
+    // reducers, one key per change", which is what this pins.
     let stray = a.reset_from_resume("sess-other");
     assert_eq!(stray[0].key, "sess-other");
-    assert!(b.transcript().rows.len() == 1);
+    assert!(b.transcript().rows.len() == 1, "B still untouched");
     a.apply(&ev("sess-A", "message.start", json!({})));
     assert_eq!(a.transcript().rows.len(), 1, "A reusable after reset");
 }
