@@ -466,10 +466,14 @@ impl HermesCore {
                 };
                 let auth = {
                     let mut state = self.inner.lock();
-                    state
-                        .auth
-                        .get_or_insert_with(|| AuthClient::new(Some(&self.data_dir)).ok().unwrap())
-                        .clone()
+                    if state.auth.is_none() {
+                        // A corrupt jar is an error the UI must see, never a
+                        // panic (same policy as `AuthClient::new`).
+                        let jar = AuthClient::new(Some(&self.data_dir))
+                            .map_err(|e| CoreError::Io(format!("cookie jar: {e}")))?;
+                        state.auth = Some(jar);
+                    }
+                    state.auth.clone().ok_or(CoreError::NotConnected)?
                 };
                 auth.login(&base, &username, &password).await
             })
@@ -485,6 +489,13 @@ impl HermesCore {
         let handle = self.handle.clone();
         handle
             .spawn(async move {
+                // Stop the supervisor first: it must not keep a socket open
+                // (and reconnect!) for a gateway the app just forgot. It
+                // clears its own `supervising` flag when it exits.
+                self.stop_flag.store(true, Ordering::Relaxed);
+                if let Some(client) = self.inner.lock().client.take() {
+                    client.close(LOCAL_CLOSE_REASON);
+                }
                 let _ = std::fs::remove_file(self.data_dir.join(ENDPOINT_FILE));
                 let _ = std::fs::remove_file(self.data_dir.join(SESSIONS_FILE));
                 let mut state = self.inner.lock();
@@ -788,12 +799,28 @@ impl HermesCore {
                     question_id.as_deref(),
                 )
                 .await?;
-                let mut state = self.inner.lock();
-                state
-                    .sessions
-                    .get_mut(&key)
-                    .map(|l| l.reducer.resolve_clarify(&key, &request_id))
-                    .unwrap_or_default();
+                // The resolved card is a transcript change like any other:
+                // dropping it here is why the UI never saw a clarify answer
+                // (the approval path already delivered its changes).
+                let (changes, rows, sink) = {
+                    let mut state = self.inner.lock();
+                    let changes = state
+                        .sessions
+                        .get_mut(&key)
+                        .map(|l| l.reducer.resolve_clarify(&key, &request_id))
+                        .unwrap_or_default();
+                    let rows = state
+                        .sessions
+                        .get(&key)
+                        .map(|l| l.reducer.transcript().rows.clone())
+                        .unwrap_or_default();
+                    (changes, rows, state.sink.clone())
+                };
+                if let Some(sink) = sink {
+                    for change in &changes {
+                        sink.on_transcript(change_to_dto(&key, &change.change, &rows));
+                    }
+                }
                 Ok(())
             })
             .await
@@ -962,6 +989,9 @@ impl HermesCore {
                     }
                 };
                 self.inner.lock().client = Some(client.clone());
+                // A previous supervisor may have exited after a stop: the new
+                // one must not inherit the raised flag (it would exit at once).
+                self.stop_flag.store(false, Ordering::Relaxed);
                 drop(self.handle.spawn(Self::supervise(self.clone(), client, sink)));
                 Ok(())
             })
@@ -1002,7 +1032,13 @@ impl HermesCore {
         let client = self.establish().await?;
         self.inner.lock().client = Some(client.clone());
         self.stop_flag.store(false, Ordering::Relaxed);
-        self.supervising.store(true, Ordering::Relaxed);
+        // A second `connect` while a supervisor is alive must NOT start a
+        // second one: two supervisors would double-deliver every change and
+        // fight over the reconnect. The sink is still updated above.
+        if self.supervising.swap(true, Ordering::Relaxed) {
+            log::warn!("connect: a supervisor is already running, keeping it");
+            return Ok(());
+        }
         drop(self.handle.spawn(Self::supervise(self.clone(), client, sink)));
         Ok(())
     }
@@ -1041,6 +1077,21 @@ impl HermesCore {
     /// `LOCAL_CLOSE_REASON` close. The state lock is never held across an
     /// `.await`.
     async fn supervise(
+        self: Arc<Self>,
+        client: GatewayClient,
+        sink: Arc<dyn EventSink>,
+    ) {
+        // `supervise_inner` takes the Arc by value, so hand it a clone and keep
+        // this one to clear the flag afterwards.
+        let this = Arc::clone(&self);
+        this.supervise_inner(client, sink).await;
+        // The supervisor is gone (deliberate close, NeedsPassword, stop): clear
+        // the flag, or `app_did_foreground` would see a "live" supervisor
+        // forever and only ping instead of recovering.
+        self.supervising.store(false, Ordering::Relaxed);
+    }
+
+    async fn supervise_inner(
         self: Arc<Self>,
         client: GatewayClient,
         sink: Arc<dyn EventSink>,
@@ -1360,7 +1411,6 @@ impl HermesCore {
                 if request_id.is_empty() {
                     continue;
                 }
-                // SABOTAGE 3 (temporary): dedupe check dropped
                 let (already, changes, rows) = {
                     let mut state = self.inner.lock();
                     let already = state
@@ -1371,13 +1421,17 @@ impl HermesCore {
                     let mut changes: Vec<SessionChange> = Vec::new();
                     let mut rows: Vec<Row> = Vec::new();
                     if let Some(live) = state.sessions.get_mut(&key) {
-                        // SABOTAGE 3: `has_unresolved_approval` check dropped
-                        if let Some(emitted) =
-                            live.reducer.apply_approval_card(&key, &request_id, card)
-                        {
-                            changes = emitted;
-                        }
                         rows = live.reducer.transcript().rows.clone();
+                        // Dedupe, second half: a card already sitting on THIS
+                        // transcript unresolved is not re-emitted either.
+                        if !live.reducer.has_unresolved_approval(&request_id) {
+                            if let Some(emitted) =
+                                live.reducer.apply_approval_card(&key, &request_id, card)
+                            {
+                                changes = emitted;
+                                rows = live.reducer.transcript().rows.clone();
+                            }
+                        }
                     }
                     (already, changes, rows)
                 };
@@ -1658,62 +1712,6 @@ mod tests {
     /// `SessionChange.key` IS the live sid (the reducer stamps it); if the
     /// delivery path reverts to `change.key` — the exact bug that made every
     /// change invisible to the UI — this test fails.
-    #[tokio::test]
-    async fn delivery_stamps_the_durable_session_key_not_the_live_sid() {
-        let dir = temp_dir("routing");
-        let gw = FakeGw::spawn(|_m, _p| async { Ok(json!({})) });
-        let (core, sink) = connected_core(&dir, &gw).await;
-        // Two open tabs: durable keys differ from their live sids.
-        attach_session(&core, "stored-alpha", "live-A");
-        attach_session(&core, "stored-beta", "live-B");
-
-        // Interleaved events for both live sids.
-        core.deliver_event(
-            &ev("message.start", "live-A", 1, json!({})),
-            &(sink.clone() as Arc<dyn EventSink>),
-        );
-        core.deliver_event(
-            &ev("message.delta", "live-B", 1, json!({"text": "b"})),
-            &(sink.clone() as Arc<dyn EventSink>),
-        );
-        core.deliver_event(
-            &ev("message.delta", "live-A", 2, json!({"text": "a"})),
-            &(sink.clone() as Arc<dyn EventSink>),
-        );
-
-        let deliveries = sink.transcript();
-        assert_eq!(deliveries.len(), 3, "every change is delivered once");
-        let by_key: Vec<&str> = deliveries.iter().map(|d| d.key.as_str()).collect();
-        assert_eq!(
-            by_key,
-            vec!["stored-alpha", "stored-beta", "stored-alpha"],
-            "every DTO carries its DURABLE key, in routing order (got {by_key:?})"
-        );
-        // Belt and braces: the live sids appear NOWHERE.
-        for d in &deliveries {
-            assert_ne!(d.key, "live-A", "a DTO carried the live sid: {d:?}");
-            assert_ne!(d.key, "live-B", "a DTO carried the live sid: {d:?}");
-        }
-        // The deltas landed in the right transcripts (routing is not just a
-        // relabel: text must not cross between tabs).
-        let alpha_text = {
-            let state = core.inner.lock();
-            state
-                .sessions
-                .get("stored-alpha")
-                .map(|l| l.reducer.transcript().rows.clone())
-                .unwrap_or_default()
-        };
-        assert_eq!(alpha_text.len(), 1, "alpha got exactly one assistant row");
-        let beta_rows = {
-            let state = core.inner.lock();
-            state.sessions.get("stored-beta").map(|l| l.reducer.transcript().rows.clone()).unwrap_or_default()
-        };
-        assert_eq!(beta_rows.len(), 1, "beta got exactly one assistant row");
-    }
-
-    // ── test 2: session-less events ─────────────────────────────────────────
-
     /// Rule pinned (PI_TASK_T5B §2): `gateway.ready`, `sessions.changed` and
     /// ANY event without a session id emit nothing to the sink and add no
     /// row to any transcript.
@@ -1792,94 +1790,135 @@ mod tests {
 
     // ── test 4: approval dedupe ─────────────────────────────────────────────
 
-    /// Rule pinned (PI_TASK_T5B §4): the same `request_id` is applied to a
-    /// transcript at most once — an unresolved card already on the transcript
-    /// (`Reducer::has_unresolved_approval`) or already recorded in
-    /// `emitted_approvals` is never duplicated, so a reconnect's
-    /// `approval.pending` re-emission cannot stack duplicate cards.
-    #[test]
-    fn approval_cards_are_deduped_by_request_id() {
-        let dir = temp_dir("approvals");
-        let core = HermesCore::new(dir.to_string_lossy().to_string());
+    #[tokio::test]
+    async fn delivery_stamps_the_durable_session_key_not_the_live_sid() {
+        let dir = temp_dir("routing");
+        let gw = FakeGw::spawn(|_m, _p| async { Ok(json!({})) });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        // Two open tabs: durable keys differ from their live sids.
         attach_session(&core, "stored-alpha", "live-A");
-        let sink = Arc::new(RecordingSink::default());
-        core.inner.lock().sink = Some(sink.clone());
+        attach_session(&core, "stored-beta", "live-B");
 
-        let card = json!({"request_id": "req-1", "command": "rm -r /tmp/x",
-                          "description": "d", "choices": ["allow", "deny"]});
+        // Interleaved events for both live sids.
+        core.deliver_event(
+            &ev("message.start", "live-A", 1, json!({})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+        core.deliver_event(
+            &ev("message.delta", "live-B", 1, json!({"text": "b"})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+        core.deliver_event(
+            &ev("message.delta", "live-A", 2, json!({"text": "a"})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
 
-        // First emission: the card goes onto the transcript.
-        {
-            let mut state = core.inner.lock();
-            let live = state.sessions.get_mut("stored-alpha").expect("live session");
-            let changes = live
-                .reducer
-                .apply_approval_card("stored-alpha", "req-1", &card)
-                .expect("first emission applies");
-            let rows = live.reducer.transcript().rows.clone();
-            drop(state);
-            for change in &changes {
-                sink.on_transcript(change_to_dto("stored-alpha", &change.change, &rows));
-            }
+        let deliveries = sink.transcript();
+        assert_eq!(deliveries.len(), 3, "every change is delivered once");
+        let by_key: Vec<&str> = deliveries.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(
+            by_key,
+            vec!["stored-alpha", "stored-beta", "stored-alpha"],
+            "every DTO carries its DURABLE key, in routing order (got {by_key:?})"
+        );
+        // Belt and braces: the live sids appear NOWHERE.
+        for d in &deliveries {
+            assert_ne!(d.key, "live-A", "a DTO carried the live sid: {d:?}");
+            assert_ne!(d.key, "live-B", "a DTO carried the live sid: {d:?}");
         }
-        {
-            let mut state = core.inner.lock();
-            state
-                .emitted_approvals
-                .entry("stored-alpha".to_string())
-                .or_default()
-                .push("req-1".to_string());
-        }
-        let first = sink.approval_deliveries();
-        assert_eq!(first, 1, "the first card is delivered exactly once");
-
-        // The reconnect path's dedupe, spelled out exactly as `reemit_approvals`
-        // checks it: already-emitted OR already-on-transcript-unresolved.
-        let already = core
-            .inner
-            .lock()
-            .emitted_approvals
-            .get("stored-alpha")
-            .map(|v| v.iter().any(|id| id == "req-1"))
-            .unwrap_or(false);
-        assert!(already, "the emitted set records the request_id");
-        let on_transcript = {
+        // The deltas landed in the right transcripts (routing is not just a
+        // relabel: text must not cross between tabs).
+        let alpha_text = {
             let state = core.inner.lock();
             state
                 .sessions
                 .get("stored-alpha")
-                .map(|l| l.reducer.has_unresolved_approval("req-1"))
-                .unwrap_or(false)
+                .map(|l| l.reducer.transcript().rows.clone())
+                .unwrap_or_default()
         };
-        assert!(on_transcript, "the unresolved card is on the transcript");
+        assert_eq!(alpha_text.len(), 1, "alpha got exactly one assistant row");
+        let beta_rows = {
+            let state = core.inner.lock();
+            state.sessions.get("stored-beta").map(|l| l.reducer.transcript().rows.clone()).unwrap_or_default()
+        };
+        assert_eq!(beta_rows.len(), 1, "beta got exactly one assistant row");
+    }
 
-        // A reconnect's re-emission of the SAME card must add nothing.
-        if !already && !on_transcript {
-            // This branch is what `reemit_approvals` executes for a fresh
-            // card; the dedupe guarantees it is NOT taken here.
-            panic!("dedupe must prevent re-applying req-1");
-        }
-        {
-            let mut state = core.inner.lock();
-            if !already {
-                let live = state.sessions.get_mut("stored-alpha").expect("live");
-                let _ = live.reducer.apply_approval_card("stored-alpha", "req-1", &card);
+    // ── test 2: session-less events ─────────────────────────────────────────
+
+    /// Rule pinned (PI_TASK_T5B §2): `gateway.ready`, `sessions.changed` and
+    /// ANY event without a session id emit nothing to the sink and add no
+    /// row to any transcript.
+    #[tokio::test]
+    async fn reemit_approvals_dedupes_by_request_id_on_the_real_path() {
+        // Rule pinned: the reconnect re-emission path ITSELF is deduped by
+        // `request_id`, on both halves of the guard — the emitted set and an
+        // unresolved card already on the transcript. The first version of this
+        // test replicated the checks by hand instead of calling
+        // `reemit_approvals`, so it stayed green while the dedupe had been
+        // removed from the shipping code (caught in review #5).
+        let dir = temp_dir("approvals");
+        // The gateway keeps answering with the SAME pending card.
+        let gw = FakeGw::spawn(|method, _params| async move {
+            if method == "approval.pending" {
+                Ok(json!({
+                    "pending": [{
+                        "request_id": "req-1",
+                        "command": "rm -r /tmp/x",
+                        "description": "d",
+                        "choices": ["allow", "deny"]
+                    }]
+                }))
+            } else {
+                Ok(json!({}))
             }
-        }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+        let client = core.inner.lock().client.clone().expect("client");
+        let sink_dyn = sink.clone() as Arc<dyn EventSink>;
+
+        core.reemit_approvals(&client, &sink_dyn).await;
         assert_eq!(
             sink.approval_deliveries(),
             1,
-            "the same request_id is re-emitted at most once per (re)connect"
+            "the pending card is emitted exactly once"
         );
-        let rows = {
+
+        // Same answer, same request_id: the emitted set blocks a second one.
+        core.reemit_approvals(&client, &sink_dyn).await;
+        assert_eq!(
+            sink.approval_deliveries(),
+            1,
+            "a request_id already emitted is never delivered again"
+        );
+
+        // Second half of the guard, on its own: forget the emitted set (a
+        // fresh process would have an empty one) and re-run. The UNRESOLVED
+        // CARD ON THE TRANSCRIPT must still block the re-emission.
+        core.inner.lock().emitted_approvals.clear();
+        core.reemit_approvals(&client, &sink_dyn).await;
+        assert_eq!(
+            sink.approval_deliveries(),
+            1,
+            "an approval card already unresolved on the transcript is not duplicated"
+        );
+        let approval_rows = {
             let state = core.inner.lock();
             state
                 .sessions
                 .get("stored-alpha")
-                .map(|l| l.reducer.transcript().rows.len())
+                .map(|l| {
+                    l.reducer
+                        .transcript()
+                        .rows
+                        .iter()
+                        .filter(|r| matches!(r.kind, RowKind::Approval(_)))
+                        .count()
+                })
                 .unwrap_or(0)
         };
-        assert_eq!(rows, 1, "no duplicate approval row on the transcript");
+        assert_eq!(approval_rows, 1, "exactly one approval row exists");
     }
 
     // ── test 5: the supervisor's ladder attempt behaviour ───────────────────
@@ -1933,5 +1972,78 @@ mod tests {
         // Yield once so any mis-dropped runtime surfaces synchronously.
         tokio::task::yield_now().await;
     }
-}
 
+    /// Rule pinned: when the supervisor exits, `supervising` is cleared. Without
+    /// it, `app_did_foreground` sees a "live" supervisor forever and only pings
+    /// instead of recovering (review #5, should 2).
+    #[tokio::test]
+    async fn supervisor_clears_the_supervising_flag_on_exit() {
+        let dir = temp_dir("supervising");
+        let gw = FakeGw::spawn(|_m, _p| async { Ok(json!({})) });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        let client = core.inner.lock().client.clone().expect("client");
+        core.supervising.store(true, Ordering::Relaxed);
+        let task = tokio::spawn(HermesCore::supervise(
+            core.clone(),
+            client.clone(),
+            sink.clone() as Arc<dyn EventSink>,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // A deliberate local close is terminal for the supervisor.
+        client.close(LOCAL_CLOSE_REASON);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        assert!(
+            !core.supervising.load(Ordering::Relaxed),
+            "the flag must be cleared when the supervisor exits"
+        );
+    }
+
+    /// Rule pinned: answering a clarification delivers the resolved card to the
+    /// sink. The pre-review code resolved the reducer state and threw the
+    /// changes away, so the UI never saw the answer (review #5, should 3).
+    #[tokio::test]
+    async fn respond_clarify_delivers_the_resolved_card() {
+        let dir = temp_dir("clarify");
+        let gw = FakeGw::spawn(|method, _params| async move {
+            if method == "clarify.respond" {
+                Ok(json!({"status": "ok"}))
+            } else {
+                Ok(json!({}))
+            }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-A", "live-A");
+        let sink_dyn = sink.clone() as Arc<dyn EventSink>;
+        core.deliver_event(
+            &ev(
+                "clarify.request",
+                "live-A",
+                1,
+                json!({"request_id": "c-1", "question": "Proceed?", "choices": ["yes", "no"]}),
+            ),
+            &sink_dyn,
+        );
+        let before = sink.transcript().len();
+        assert_eq!(before, 1, "the clarify card opened exactly one row");
+
+        core.respond_clarify(
+            "stored-A".to_string(),
+            "c-1".to_string(),
+            "yes".to_string(),
+            None,
+        )
+        .await
+        .expect("respond_clarify");
+
+        let after = sink.transcript();
+        assert!(
+            after.len() > before,
+            "the resolved clarify card must reach the sink (it was dropped before review #5)"
+        );
+        assert_eq!(
+            after.last().map(|c| c.key.as_str()),
+            Some("stored-A"),
+            "and it carries the durable key"
+        );
+    }
+}
