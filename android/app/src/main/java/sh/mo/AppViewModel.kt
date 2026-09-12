@@ -1,58 +1,78 @@
 package sh.mo
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 
 /**
- * App phases. Stream B adds NeedsPassword/Connecting/Ready/Offline and the
- * pairing logic; stream A ships only the real [Unpaired] phase — the state
- * the UI renders always comes from this view model, never a literal in the
- * composable.
+ * Root view model (PLAN §4 T6 item 5): every phase transition comes from the
+ * [GatewayRepository]'s flows — never inferred in the composable.
  */
-sealed interface AppPhase {
-    /** No gateway paired yet: show the "pair this device" call to action. */
-    data object Unpaired : AppPhase
-}
+class AppViewModel(app: Application) : AndroidViewModel(app) {
 
-/**
- * Root view model: owns the app phase. Stream B will source the phase from
- * the paired-endpoint store and the GatewayRepository; for now the phase
- * starts at [AppPhase.Unpaired] and the action is a no-op hook that stream B
- * replaces with the pairing flow.
- */
-class AppViewModel : ViewModel() {
+    val repo: GatewayRepository = GatewayRepository(HermesApp.core())
 
-    private val _phase = MutableStateFlow<AppPhase>(AppPhase.Unpaired)
+    val phase: StateFlow<AppPhase> = repo.phase
+    val sessions: StateFlow<Map<String, SessionUiState>> = repo.sessions
+    val errorText: StateFlow<String> = repo.errorText
 
-    /** The current app phase; observed by MainActivity's composable. */
-    val phase: StateFlow<AppPhase> = _phase.asStateFlow()
-
+    /** Text typed/pasted into the manual fallback field. */
     private val _pairingPayload = MutableStateFlow("")
+    val pairingPayload: StateFlow<String> = _pairingPayload
 
-    /**
-     * The pairing text the user entered (a `hermes://connect?...` payload,
-     * or a gateway URL + username). Stream B consumes it.
-     */
-    val pairingPayload: StateFlow<String> = _pairingPayload.asStateFlow()
+    init {
+        // Relaunch path (checklist: 1 h / 25 h later must not ask for the
+        // password): saved endpoint + cookie jar first.
+        viewModelScope.launch {
+            val cols = Cols.from(
+                (getApp().resources.displayMetrics.widthPixels),
+                getApp().resources.displayMetrics.density,
+            )
+            val resumed = repo.tryResume(cols)
+            if (!resumed) _phaseFallbackUnpaired()
+        }
+    }
 
-    /** Called by the Unpaired screen's text field. */
+    private fun getApp(): Application = getApplication()
+
+    private fun _phaseFallbackUnpaired() {
+        // tryResume returned false: no saved endpoint -> Unpaired.
+        // The repository already left phase at Unpaired; nothing to do.
+    }
+
     fun onPairingPayloadChanged(value: String) {
         _pairingPayload.value = value
     }
 
-    /**
-     * Called by the Unpaired screen's call-to-action button.
-     *
-     * NOT wired yet (stream B): [pairingEnabled] is false until the pairing
-     * flow exists, so the button is visibly disabled rather than a control
-     * that silently does nothing (review #6, nit). When it lands this calls
-     * HermesCore.pair / parse_qr_payload with the entered payload.
-     */
-    val pairingEnabled: Boolean = false
+    /** The manual fallback path: same payload the QR carries. */
+    fun pairFromFallback() {
+        val payload = _pairingPayload.value.trim()
+        if (payload.isEmpty()) return
+        viewModelScope.launch { repo.pair(payload) }
+    }
 
-    fun onPairRequested() {
-        // Reached only when pairingEnabled becomes true (stream B).
+    /** PasswordSheet submit. */
+    fun submitPassword(password: String) {
+        viewModelScope.launch {
+            val cols = Cols.from(
+                getApp().resources.displayMetrics.widthPixels,
+                getApp().resources.displayMetrics.density,
+            )
+            repo.loginAndConnect(password, cols)
+        }
+    }
+
+    /** Scan screen result: a decoded `hermes://connect?...` payload. */
+    fun onQrDecoded(payload: String) {
+        viewModelScope.launch { repo.pair(payload) }
+    }
+
+    /** Send a chat line from the Ready screen (T7 refines the composer). */
+    fun send(text: String) {
+        if (text.isBlank()) return
+        viewModelScope.launch { repo.send(text) }
     }
 }

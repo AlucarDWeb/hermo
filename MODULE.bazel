@@ -76,11 +76,20 @@ maven.install(
         "androidx.activity:activity-compose:1.8.2",
         "androidx.collection:collection:1.4.2",
 
-        # System QR scanner intentionally NOT included: the PoC pairs via
-        # manual text entry (paste `hermes://connect?...` or type URL +
-        # username — the core's parse_qr_payload handles the payload), so
-        # the scanner's dependency chain (which breaks coursier resolution)
-        # is not needed.
+        # QR scanning without Google Play Services (T6b): CameraX from
+        # AndroidX + com.google.zxing:core (Apache-2.0, plain Java lib —
+        # the groupId is historical). play-services-code-scanner stays OUT
+        # (GMS + runtime model download + the pom that broke coursier in
+        # T6a).
+        "androidx.camera:camera-core:1.4.2",
+        "androidx.camera:camera-camera2:1.4.2",
+        "androidx.camera:camera-lifecycle:1.4.2",
+        "androidx.camera:camera-view:1.4.2",
+        "com.google.zxing:core:3.5.3",
+
+        # JVM unit tests (kt_jvm_test): the pure phase machine / cols clamp /
+        # error mapping are tested without an emulator.
+        "junit:junit:4.13.2",
     ],
     known_contributing_modules = [
         "hermo",
