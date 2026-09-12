@@ -25,11 +25,16 @@ build --tool_java_runtime_version=remotejdk_21
 build --jobs=4
 build --worker_max_instances=2
 startup --host_jvm_args=-Xmx4g
+# KotlinCompile worker cap (JN guard).
+build --strategy=KotlinCompile=worker --worker_max_instances=KotlinCompile=1
 
-# Android packaging configs — DISABLED until T6: --android_platforms cannot
-# resolve against the minimal MODULE.bazel yet (Android rules arrive in T6).
-# build:device  --android_platforms=//platforms:android_arm64 --fat_apk_cpu=arm64-v8a
-# build:emulator --android_platforms=//platforms:android_x86_64 --fat_apk_cpu=x86_64
+# Android packaging configs (T6): rules_android 0.7 (starlark) ignores
+# --fat_apk_cpu for aar_import native-lib extraction; the per-target-platform
+# cc toolchain comes from rules_android_ndk and the ABI from
+# --android_platforms. Device = arm64, emulator = x86_64.
+build:device  --android_platforms=//platforms:android_arm64 --fat_apk_cpu=arm64-v8a
+build:emulator --android_platforms=//platforms:android_x86_64 --fat_apk_cpu=x86_64
 
 # Low-memory profile for the NDK-toolchain builds on this laptop.
 build:lowmem --jobs=2 --worker_max_instances=1
+build:lowmem --strategy=KotlinCompile=worker --worker_max_instances=KotlinCompile=1

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">hermo</string>
+    <!-- Unpaired phase: the app's first real screen. -->
+    <string name="unpaired_title">hermo</string>
+    <string name="unpaired_message">This device is not paired with a Hermes agent yet. Scan the QR shown by the gateway, or paste the pairing payload / gateway URL.</string>
+    <string name="unpaired_payload_label">Pairing payload or gateway URL</string>
+    <string name="unpaired_cta">Pair this device</string>
+    <!-- Shown while the pairing action is not wired yet (stream A): a disabled
+         button must say why, so run evidence cannot be read as a working flow. -->
+    <string name="pairing_not_wired">Pairing is not wired up yet in this build.</string>
+</resources>

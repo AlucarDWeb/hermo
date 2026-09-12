@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext HTTP is permitted process-wide, ON PURPOSE, for this PoC.
+
+  Why not a scoped rule: Android's network security config has no CIDR
+  support. `<domain>` entries are matched as hostname strings (an IP literal
+  matches exactly, `includeSubdomains` is DNS-label semantics), so a rule such
+  as `<domain>100.64.0.0</domain>` permits cleartext for that ONE literal host
+  and denies every real tailnet address (100.x.y.z). The earlier version of this
+  file claimed to scope the CGNAT range and did not (caught in review).
+
+  Why cleartext at all: the gateway is reached over the tailnet, where the
+  transport is already encrypted by WireGuard. A self-hosted Hermes gateway
+  serves plain HTTP on its tailnet address; requiring https:// would break the
+  intended pairing flow (the core validates the scheme of the payload and
+  accepts http/https).
+
+  Consequence, stated plainly: any http:// host is reachable from this app in
+  a build with this file. That is acceptable for the PoC and must be revisited
+  before any release (either an https reverse proxy in front of the gateway,
+  or a runtime allowlist of the paired host in the app's own HTTP layer).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

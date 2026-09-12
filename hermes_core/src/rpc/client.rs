@@ -100,8 +100,10 @@ impl ClientConfig {
 #[derive(Debug, Clone, Error)]
 pub enum ClientError {
     /// The RPC was answered with a JSON-RPC error object.
-    #[error("rpc error {code}: {message}")]
-    Rpc { code: i64, message: String },
+    // `detail` not `message`: see CoreError::Rpc (Throwable.message clash in
+    // the generated Kotlin).
+    #[error("rpc error {code}: {detail}")]
+    Rpc { code: i64, detail: String },
     /// No response within `call_timeout`.
     #[error("rpc timeout after {0:?}")]
     Timeout(Duration),
@@ -144,7 +146,7 @@ impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
 impl From<ClientError> for crate::error::CoreError {
     fn from(e: ClientError) -> Self {
         match e {
-            ClientError::Rpc { code, message } => crate::error::CoreError::Rpc { code, message },
+            ClientError::Rpc { code, detail } => crate::error::CoreError::Rpc { code, detail },
             ClientError::Timeout(_) => crate::error::CoreError::Timeout,
             ClientError::Closed(_) => crate::error::CoreError::NotConnected,
             ClientError::Transport(s) => crate::error::CoreError::Network(s),
@@ -598,7 +600,7 @@ fn spawn_reader(
                                 if let Some(tx) = shared.pending.lock().remove(&id) {
                                     let _ = tx.send(Err(ClientError::Rpc {
                                         code: error.code,
-                                        message: error.message,
+                                        detail: error.message,
                                     }));
                                 }
                             }
@@ -746,7 +748,7 @@ mod tests {
         assert!(matches!(transport, CoreError::Network(_)));
         let rpc: CoreError = ClientError::Rpc {
             code: 5000,
-            message: "boom".into(),
+            detail: "boom".into(),
         }
         .into();
         assert!(matches!(rpc, CoreError::Rpc { code: 5000, .. }));

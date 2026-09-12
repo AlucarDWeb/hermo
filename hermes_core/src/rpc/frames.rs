@@ -52,7 +52,7 @@ impl From<RpcError> for crate::error::CoreError {
     fn from(e: RpcError) -> Self {
         crate::error::CoreError::Rpc {
             code: e.code,
-            message: e.message,
+            detail: e.message,
         }
     }
 }
