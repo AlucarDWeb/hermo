@@ -202,6 +202,9 @@ TEST_CLASSES = [
     "ColsTest",
     "ErrorMessagesTest",
     "QrDecodeTest",
+    "TranscriptStateTest",
+    "MarkdownBlocksTest",
+    "SessionKeyResolutionTest",
 ]
 
 [
@@ -212,6 +215,7 @@ TEST_CLASSES = [
         deps = [
             "@maven//:junit_junit",
             "@maven//:com_google_zxing_core",
+            "@maven//:org_json_json",
             ":pure_lib",
         ],
     )
@@ -232,7 +236,11 @@ kt_jvm_library(
         "src/main/java/sh/mo/PhaseMachine.kt",
         "src/main/java/sh/mo/Cols.kt",
         "src/main/java/sh/mo/ErrorMessages.kt",
+        "src/main/java/sh/mo/TranscriptState.kt",
+        "src/main/java/sh/mo/ChatRow.kt",
+        "src/main/java/sh/mo/MarkdownBlocks.kt",
     ],
+    deps = ["@maven//:org_json_json"],
 )
 
 # Debug signing: a freshly generated debug-only keystore (keytool, alias

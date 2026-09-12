@@ -83,51 +83,12 @@ fun ConnectingScreen() {
 }
 
 /**
- * Ready: model name up top, transcript rows as plain text, minimal composer.
- * This is the T6b flow's terminal state — T7 replaces it with the real chat.
+ * Ready: the Desktop-shaped session window (T7a) — titlebar, transcript with
+ * markdown, composer. Kept as the phase-screen hook MainActivity renders.
  */
 @Composable
 fun ReadyScreen(viewModel: AppViewModel, model: String) {
-    val sessions by viewModel.sessions.collectAsState()
-    var draft by remember { mutableStateOf("") }
-    val key = sessions.keys.firstOrNull()
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-    ) {
-        Text(text = "Model: ${model.ifEmpty { "unknown" }}", style = MaterialTheme.typography.titleMedium)
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp),
-        ) {
-            val rows = sessions[key]?.rows ?: emptyList()
-            for (row in rows) {
-                Text(text = row)
-            }
-        }
-        OutlinedTextField(
-            value = draft,
-            onValueChange = { draft = it },
-            label = { Text("Message") },
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp),
-        )
-        Button(
-            onClick = {
-                if (draft.isNotEmpty() && key != null) {
-                    viewModel.send(draft)
-                    draft = ""
-                }
-            },
-            modifier = Modifier.padding(top = 4.dp),
-        ) {
-            Text("Send")
-        }
-    }
+    sh.mo.ui.ChatScreen(viewModel = viewModel, model = model)
 }
 
 /** Offline banner with retry (the retry re-runs the resume path). */

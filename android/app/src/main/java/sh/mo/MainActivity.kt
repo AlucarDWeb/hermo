@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         setContent {
-            MaterialTheme {
+            sh.mo.ui.HermoTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     AppScreen(
                         viewModel = viewModel(),

@@ -17,6 +17,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     val phase: StateFlow<AppPhase> = repo.phase
     val sessions: StateFlow<Map<String, SessionUiState>> = repo.sessions
+    val currentKey: StateFlow<String?> = repo.currentKey
     val errorText: StateFlow<String> = repo.errorText
 
     /** Text typed/pasted into the manual fallback field. */
