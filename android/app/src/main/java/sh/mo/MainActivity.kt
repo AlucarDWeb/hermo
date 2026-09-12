@@ -53,22 +53,27 @@ fun AppScreen(viewModel: AppViewModel) {
             pairingPayload = pairingPayload,
             onPairingPayloadChanged = viewModel::onPairingPayloadChanged,
             onPair = viewModel::onPairRequested,
+            pairEnabled = viewModel.pairingEnabled,
         )
     }
 }
 
 /**
- * The Unpaired phase: product name plus the pairing entry. The PoC pairs via
- * manual text entry — paste a `hermes://connect?...` payload or type the
- * gateway URL and username (the core's parse_qr_payload handles the payload;
- * stream B wires the action into the pairing flow). State comes from the
- * view model.
+ * The Unpaired phase: product name plus the pairing entry.
+ *
+ * Pairing has two paths: scanning the QR the host displays (the primary one —
+ * the scan screen lands in stream B with a no-GMS CameraX + ZXing decoder) and
+ * the manual fallback below (paste a `hermes://connect?...` payload or type the
+ * gateway URL + username, which the core's `parse_qr_payload` accepts). State
+ * comes from the view model; `pairEnabled` is false until stream B wires the
+ * action, so the button is visibly disabled instead of silently dead.
  */
 @Composable
 fun UnpairedScreen(
     pairingPayload: String,
     onPairingPayloadChanged: (String) -> Unit,
     onPair: () -> Unit,
+    pairEnabled: Boolean,
 ) {
     Column(
         modifier = Modifier
@@ -95,11 +100,19 @@ fun UnpairedScreen(
         )
         Button(
             onClick = onPair,
+            enabled = pairEnabled,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 16.dp),
         ) {
             Text(text = stringResource(R.string.unpaired_cta))
+        }
+        if (!pairEnabled) {
+            Text(
+                text = stringResource(R.string.pairing_not_wired),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 8.dp),
+            )
         }
     }
 }

@@ -10,6 +10,10 @@
 #   DEVICE=1 ...                            # arm64 device ABI; default x86_64 emulator
 #   LOWMEM=1 ...                            # --config=lowmem (jobs=2) anti-freeze profile
 #   AVD=MyAvd ./scripts/build_android.sh --run   # pick a specific AVD
+#
+# Machine-specific defaults below (this box: /opt/android-ndk, Android Studio's
+# JetBrains JDK); override ANDROID_NDK_HOME / JAVA_HOME / ANDROID_HOME for any
+# other setup. Nothing is hard-coded into the Bazel files themselves.
 #   NO_SHUTDOWN=1 ...                       # keep the bazel server alive after the build
 #
 # Exit codes: 0 = ok, non-zero = failure.

@@ -26,11 +26,6 @@
 # Local tooling
 .venv-tools/
 
-# Secrets: env files, keys, cookies / token jars
-.env
-.env.*
-*.pem
-
 # OS / editor
 .DS_Store
 *.swp

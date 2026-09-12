@@ -42,9 +42,17 @@ class AppViewModel : ViewModel() {
         _pairingPayload.value = value
     }
 
-    /** Called by the Unpaired screen's call-to-action button. */
+    /**
+     * Called by the Unpaired screen's call-to-action button.
+     *
+     * NOT wired yet (stream B): [pairingEnabled] is false until the pairing
+     * flow exists, so the button is visibly disabled rather than a control
+     * that silently does nothing (review #6, nit). When it lands this calls
+     * HermesCore.pair / parse_qr_payload with the entered payload.
+     */
+    val pairingEnabled: Boolean = false
+
     fun onPairRequested() {
-        // Stream B wires this into the pairing flow: HermesCore.pair /
-        // parse_qr_payload with the payload the user entered.
+        // Reached only when pairingEnabled becomes true (stream B).
     }
 }
