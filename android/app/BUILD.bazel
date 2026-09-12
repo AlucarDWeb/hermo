@@ -6,6 +6,7 @@
 
 load("@rules_kotlin//kotlin:android.bzl", "kt_android_library")
 load("@rules_kotlin//kotlin:core.bzl", "kt_compiler_plugin")
+load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_library", "kt_jvm_test")
 load("@rules_android//android:rules.bzl", "android_binary")
 load("@rules_android//android:rules.bzl", "aar_import")
 
@@ -180,12 +181,57 @@ kt_android_library(
         "@maven//:androidx_lifecycle_lifecycle_runtime_ktx",
         "@maven//:androidx_lifecycle_lifecycle_viewmodel_compose",
         "@maven//:androidx_activity_activity_compose",
+        "@maven//:androidx_camera_camera_core",
+        "@maven//:androidx_camera_camera_camera2",
+        "@maven//:androidx_camera_camera_lifecycle",
+        "@maven//:androidx_camera_camera_view",
+        "@maven//:com_google_zxing_core",
         "@maven//:androidx_compose_ui_ui",
         "@maven//:androidx_compose_ui_ui_graphics",
         "@maven//:androidx_compose_ui_ui_tooling_preview",
         "@maven//:androidx_compose_material3_material3",
         "@maven//:org_jetbrains_kotlinx_kotlinx_coroutines_core",
         "@maven//:org_jetbrains_kotlinx_kotlinx_coroutines_android",
+    ],
+)
+
+# ── JVM unit tests (pure pieces, no Android imports) ─────────────────
+# Each test class needs its own target: `kt_jvm_test` runs ONE class.
+TEST_CLASSES = [
+    "PhaseMachineTest",
+    "ColsTest",
+    "ErrorMessagesTest",
+    "QrDecodeTest",
+]
+
+[
+    kt_jvm_test(
+        name = "pure_tests_" + cls,
+        srcs = glob(["src/test/java/**/*.kt"]),
+        test_class = "sh.mo." + cls,
+        deps = [
+            "@maven//:junit_junit",
+            "@maven//:com_google_zxing_core",
+            ":pure_lib",
+        ],
+    )
+    for cls in TEST_CLASSES
+]
+
+test_suite(
+    name = "pure_test_suite",
+    tests = [":pure_tests_" + cls for cls in TEST_CLASSES],
+)
+
+# The pure main sources as a plain JVM library (no Android deps) so the
+# tests above can link them.
+kt_jvm_library(
+    name = "pure_lib",
+    srcs = [
+        "src/main/java/sh/mo/AppPhase.kt",
+        "src/main/java/sh/mo/PhaseMachine.kt",
+        "src/main/java/sh/mo/Cols.kt",
+        "src/main/java/sh/mo/ErrorMessages.kt",
     ],
 )
 

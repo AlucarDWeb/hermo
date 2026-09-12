@@ -4,6 +4,11 @@
 
     <!-- The app talks to the self-hosted Hermes gateway over the tailnet. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- QR pairing without Google Play Services: our own CameraX+ZXing scan
+         screen (T6b). Requested at runtime before the camera opens; a
+         denial shows a readable line, never a crash. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:name=".HermesApp"
