@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::json;
+pub use crate::protocol::EventParams;
 
 /// An outgoing client request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -32,20 +33,6 @@ pub enum Decoded {
     Event(EventParams),
     /// Valid JSON-RPC we do not understand — ignored, per the defensive rule.
     Ignored,
-}
-
-/// `params` of a server `event` frame.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EventParams {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    #[serde(default)]
-    pub session_id: String,
-    /// Present only on session-bound events.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seq: Option<i64>,
-    #[serde(default)]
-    pub payload: Value,
 }
 
 /// JSON-RPC error object.

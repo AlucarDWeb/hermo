@@ -13,8 +13,10 @@
 //! session registry) arrive with T4/T5.
 
 pub mod json;
+pub mod protocol;
 pub mod rpc;
 pub mod auth;
 pub mod error;
+pub mod transcript;
 
 uniffi::setup_scaffolding!();
