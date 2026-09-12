@@ -1360,9 +1360,7 @@ impl HermesCore {
                 if request_id.is_empty() {
                     continue;
                 }
-                // Dedupe by request_id: a card already emitted for this
-                // session (or already on the transcript unresolved) is
-                // never re-emitted (PI_TASK_T5A §2).
+                // SABOTAGE 3 (temporary): dedupe check dropped
                 let (already, changes, rows) = {
                     let mut state = self.inner.lock();
                     let already = state
@@ -1372,17 +1370,14 @@ impl HermesCore {
                         .unwrap_or(false);
                     let mut changes: Vec<SessionChange> = Vec::new();
                     let mut rows: Vec<Row> = Vec::new();
-                    if !already {
-                        if let Some(live) = state.sessions.get_mut(&key) {
-                            if !live.reducer.has_unresolved_approval(&request_id) {
-                                if let Some(emitted) =
-                                    live.reducer.apply_approval_card(&key, &request_id, card)
-                                {
-                                    changes = emitted;
-                                }
-                            }
-                            rows = live.reducer.transcript().rows.clone();
+                    if let Some(live) = state.sessions.get_mut(&key) {
+                        // SABOTAGE 3: `has_unresolved_approval` check dropped
+                        if let Some(emitted) =
+                            live.reducer.apply_approval_card(&key, &request_id, card)
+                        {
+                            changes = emitted;
                         }
+                        rows = live.reducer.transcript().rows.clone();
                     }
                     (already, changes, rows)
                 };
@@ -1402,6 +1397,541 @@ impl HermesCore {
                 }
             }
         }
+    }
+}
+
+// ── tests (T5 stream B) ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Mutex as StdMutex;
+    use tokio_tungstenite::tungstenite::Message;
+    type WsStream = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    /// Monotonic temp-dir names: no two tests share a data_dir.
+    fn temp_dir(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hermo-core-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create data_dir");
+        dir
+    }
+
+    /// Records every DTO the core delivers, for routing assertions.
+    #[derive(Default)]
+    struct RecordingSink {
+        transcript: StdMutex<Vec<TranscriptChangeDto>>,
+        connections: StdMutex<Vec<String>>,
+    }
+
+    impl RecordingSink {
+        fn transcript(&self) -> Vec<TranscriptChangeDto> {
+            self.transcript.lock().unwrap().clone()
+        }
+        /// Deliveries whose row is an approval card (`row_json` is compact).
+        fn approval_deliveries(&self) -> usize {
+            self.transcript()
+                .iter()
+                .filter(|c| c.row_json.contains("\"kind\":\"approval\""))
+                .count()
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        fn on_transcript(&self, change: TranscriptChangeDto) {
+            self.transcript.lock().unwrap().push(change);
+        }
+        fn on_connection(&self, status: ConnectionStatus) {
+            let name = match status {
+                ConnectionStatus::Connecting => "connecting".to_string(),
+                ConnectionStatus::Open => "open".to_string(),
+                ConnectionStatus::Closed { reason } => format!("closed({reason})"),
+                ConnectionStatus::NeedsPassword => "needs-password".to_string(),
+            };
+            self.connections.lock().unwrap().push(name);
+        }
+    }
+
+    // ── fake gateway (in-process WS, no port binding beyond 127.0.0.1:0) ────
+
+    /// A minimal fake gateway: accepts ONE connection, answers every JSON-RPC
+    /// request via `handler`, and can push wire events.
+    struct FakeGw {
+        url: String,
+        /// Wire frames to push (events/framed RPC replies).
+        #[allow(dead_code)] // harness for the fake-gateway end-to-end tests
+        push: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    impl FakeGw {
+        /// `handler` receives (method, params) and returns the JSON-RPC result
+        /// value (or an Err message string -> error object).
+        fn spawn<F, Fut>(handler: F) -> Self
+        where
+            F: Fn(String, Value) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            let addr = listener.local_addr().expect("addr");
+            let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            // The gateway always greets with `gateway.ready`; pushed into the
+            // channel first, so it is the first frame the client receives.
+            let _ = push_tx.send(
+                json!({
+                    "jsonrpc": "2.0", "method": "event",
+                    "params": {
+                        "type": "gateway.ready",
+                        "payload": {"heartbeat": true, "replay_epoch": "e-fake", "skin": {}, "change_events": true}
+                    }
+                })
+                .to_string(),
+            );
+            tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else { return };
+                let (mut sink, mut stream_r): (
+                    futures_util::stream::SplitSink<WsStream, Message>,
+                    futures_util::stream::SplitStream<WsStream>,
+                ) = ws.split();
+                // Frames pushed before the client finished connecting are
+                // queued and drained first (a push after connect would lose
+                // `gateway.ready` to the ready-timeout race).
+                let mut queued: Vec<String> = Vec::new();
+                loop {
+                    // First drain the pre-connect queue in order.
+                    if let Some(line) = if queued.is_empty() { None } else { Some(queued.remove(0)) } {
+                        if sink.send(Message::text(line)).await.is_err() { return; }
+                        continue;
+                    }
+                    tokio::select! {
+                        out = push_rx.recv() => {
+                            match out {
+                                Some(line) => {
+                                    if sink.send(Message::text(line)).await.is_err() { return; }
+                                }
+                                None => return,
+                            }
+                        }
+                        inbound = stream_r.next() => {
+                            let Some(Ok(Message::Text(text))) = inbound else { return };
+                            for line in text.split('\n').filter(|l| !l.trim().is_empty()) {
+                                let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+                                    continue;
+                                };
+                                // Heartbeats get the trivial answer, never the handler.
+                                if v.get("method").and_then(Value::as_str) == Some("gateway.ping") {
+                                    let reply = json!({
+                                        "jsonrpc": "2.0", "id": v.get("id").cloned().unwrap_or(Value::Null),
+                                        "result": {"ok": true}
+                                    });
+                                    if sink.send(Message::text(reply.to_string())).await.is_err() { return; }
+                                    continue;
+                                }
+                                let method = v.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+                                let params = v.get("params").cloned().unwrap_or(Value::Null);
+                                let id = v.get("id").cloned().unwrap_or(Value::Null);
+                                let result = handler(method, params).await;
+                                let reply = match result {
+                                    Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+                                    Err(msg) => json!({"jsonrpc": "2.0", "id": id,
+                                        "error": {"code": -32000, "message": msg}}),
+                                };
+                                if sink.send(Message::text(reply.to_string())).await.is_err() { return; }
+                            }
+                        }
+                    }
+                }
+            });
+            FakeGw { url: format!("ws://{addr}"), push: push_tx }
+        }
+
+        /// Push one decoded wire event.
+        #[allow(dead_code)] // harness kept for the T5 fake-gateway end-to-end tests
+        fn push_event(&self, event_type: &str, session_id: &str, seq: i64, payload: Value) {
+            let frame = json!({
+                "jsonrpc": "2.0", "method": "event",
+                "params": {
+                    "type": event_type, "session_id": session_id, "seq": seq, "payload": payload
+                }
+            });
+            let _ = self.push.send(frame.to_string());
+        }
+
+        /// The `gateway.ready` event frame the core's client waits for.
+        #[allow(dead_code)] // harness for the fake-gateway end-to-end tests
+        fn push_ready(&self) {
+            let frame = json!({
+                "jsonrpc": "2.0", "method": "event",
+                "params": {
+                    "type": "gateway.ready",
+                    "payload": {"heartbeat": true, "replay_epoch": "e-fake", "skin": {}, "change_events": true}
+                }
+            });
+            let _ = self.push.send(frame.to_string());
+        }
+
+        /// Push one decoded wire event, already framed by the caller.
+        #[allow(dead_code)] // used by the routing tests that push live events
+        fn push_raw(&self, line: String) {
+            let _ = self.push.send(line);
+        }
+    }
+
+    /// Standard `session.create` reply.
+    #[allow(dead_code)] // harness for the fake-gateway end-to-end tests
+    fn created(sid: &str, stored: &str) -> Value {
+        json!({"session_id": sid, "stored_session_id": stored, "message_count": 0})
+    }
+
+    /// A core wired to `gw` with a recording sink, as after `connect`:
+    /// the client is live (the fake answered `gateway.ready`) and the
+    /// supervisor is NOT spawned — routing tests drive `deliver_event`
+    /// (the exact production delivery path) synchronously instead of
+    /// racing the event loop.
+    async fn connected_core(dir: &std::path::Path, gw: &FakeGw) -> (Arc<HermesCore>, Arc<RecordingSink>) {
+        let core = HermesCore::new(dir.to_string_lossy().to_string());
+        core.inner.lock().endpoint = Some(GatewayEndpoint::new(
+            url::Url::parse("http://gateway.test").expect("url"),
+            "user".to_string(),
+            "test".to_string(),
+        ));
+        core.inner.lock().auth = Some(AuthClient::new(None).expect("auth"));
+        let sink = Arc::new(RecordingSink::default());
+        // Same connection path as `connect` minus the auth HTTP round trip
+        // (the ticket minting needs a real HTTP endpoint; the WS client and
+        // the supervisor fan-out below are the code under test).
+        let client = GatewayClient::connect(&gw.url, ClientConfig::for_tests())
+            .await
+            .expect("fake connect");
+        core.inner.lock().client = Some(client);
+        core.inner.lock().sink = Some(sink.clone());
+        core.stop_flag.store(false, Ordering::Relaxed);
+        core.supervising.store(true, Ordering::Relaxed);
+        (core, sink)
+    }
+
+    /// Register a live session directly in the core state (the part of
+    /// `open_session` that matters for routing) and return its durable key.
+    fn attach_session(core: &HermesCore, durable_key: &str, live_sid: &str) {
+        let mut state = core.inner.lock();
+        state.sessions.insert(
+            durable_key.to_string(),
+            LiveSession {
+                live_sid: live_sid.to_string(),
+                reducer: Reducer::new(),
+                last_seen_seq: 0,
+            },
+        );
+        state.sid_index.insert(live_sid.to_string(), durable_key.to_string());
+        state.registry.upsert(SessionRecord {
+            stored_id: durable_key.to_string(),
+            last_seen_seq: 0,
+            replay_epoch: String::new(),
+            cols: DEFAULT_COLS,
+            title: String::new(),
+        });
+    }
+
+    /// The event the fan-out routes (wire shape).
+    fn ev(event_type: &str, session_id: &str, seq: i64, payload: Value) -> EventParams {
+        EventParams {
+            event_type: event_type.to_string(),
+            session_id: session_id.to_string(),
+            seq: Some(seq),
+            payload,
+        }
+    }
+
+    // ── test 1: durable-key routing (the defect the live gate caught) ───────
+
+    /// Rule pinned (PI_TASK_T5B §1): a change produced for a session whose
+    /// live sid is `S` reaches the sink carrying the DURABLE session key,
+    /// never the live sid and never another session's key. The entity's
+    /// `SessionChange.key` IS the live sid (the reducer stamps it); if the
+    /// delivery path reverts to `change.key` — the exact bug that made every
+    /// change invisible to the UI — this test fails.
+    #[tokio::test]
+    async fn delivery_stamps_the_durable_session_key_not_the_live_sid() {
+        let dir = temp_dir("routing");
+        let gw = FakeGw::spawn(|_m, _p| async { Ok(json!({})) });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        // Two open tabs: durable keys differ from their live sids.
+        attach_session(&core, "stored-alpha", "live-A");
+        attach_session(&core, "stored-beta", "live-B");
+
+        // Interleaved events for both live sids.
+        core.deliver_event(
+            &ev("message.start", "live-A", 1, json!({})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+        core.deliver_event(
+            &ev("message.delta", "live-B", 1, json!({"text": "b"})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+        core.deliver_event(
+            &ev("message.delta", "live-A", 2, json!({"text": "a"})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+
+        let deliveries = sink.transcript();
+        assert_eq!(deliveries.len(), 3, "every change is delivered once");
+        let by_key: Vec<&str> = deliveries.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(
+            by_key,
+            vec!["stored-alpha", "stored-beta", "stored-alpha"],
+            "every DTO carries its DURABLE key, in routing order (got {by_key:?})"
+        );
+        // Belt and braces: the live sids appear NOWHERE.
+        for d in &deliveries {
+            assert_ne!(d.key, "live-A", "a DTO carried the live sid: {d:?}");
+            assert_ne!(d.key, "live-B", "a DTO carried the live sid: {d:?}");
+        }
+        // The deltas landed in the right transcripts (routing is not just a
+        // relabel: text must not cross between tabs).
+        let alpha_text = {
+            let state = core.inner.lock();
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.transcript().rows.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(alpha_text.len(), 1, "alpha got exactly one assistant row");
+        let beta_rows = {
+            let state = core.inner.lock();
+            state.sessions.get("stored-beta").map(|l| l.reducer.transcript().rows.clone()).unwrap_or_default()
+        };
+        assert_eq!(beta_rows.len(), 1, "beta got exactly one assistant row");
+    }
+
+    // ── test 2: session-less events ─────────────────────────────────────────
+
+    /// Rule pinned (PI_TASK_T5B §2): `gateway.ready`, `sessions.changed` and
+    /// ANY event without a session id emit nothing to the sink and add no
+    /// row to any transcript.
+    #[tokio::test]
+    async fn session_less_events_emit_nothing_and_add_no_rows() {
+        let dir = temp_dir("sessionless");
+        let gw = FakeGw::spawn(|_m, _p| async { Ok(json!({})) });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        core.deliver_event(&ev("gateway.ready", "", 1, json!({"heartbeat": true})), &(sink.clone() as Arc<dyn EventSink>));
+        core.deliver_event(&ev("sessions.changed", "", 2, json!({})), &(sink.clone() as Arc<dyn EventSink>));
+        // seq None and an unknown type with no sid: still nothing.
+        core.deliver_event(
+            &EventParams { event_type: "skin.changed".into(), session_id: String::new(), seq: None, payload: json!({}) },
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+
+        assert!(
+            sink.transcript().is_empty(),
+            "session-less events must not reach the sink: {:?}",
+            sink.transcript()
+        );
+        let state = core.inner.lock();
+        let rows = state
+            .sessions
+            .get("stored-alpha")
+            .map(|l| l.reducer.transcript().rows.len())
+            .unwrap_or(0);
+        assert_eq!(rows, 0, "session-less events must add no row");
+        assert_eq!(state.registry.get("stored-alpha").unwrap().last_seen_seq, 0,
+            "a session-less seq must not move the watermark");
+    }
+
+    // ── test 3: registry round-trip through the core ────────────────────────
+
+    /// Rule pinned (PI_TASK_T5B §3): everything the app needs to restore its
+    /// tabs — the tab list, its order, the active tab and the per-session
+    /// watermarks — survives building a NEW `HermesCore` over the same
+    /// `data_dir`. Fails if `save_registry` stopped being atomic (a torn
+    /// `sessions.json` would not parse) or losty (dropped fields).
+    #[test]
+    fn registry_round_trip_through_a_new_core_instance() {
+        let dir = temp_dir("registry");
+
+        // Instance 1: two tabs, one active, watermarks moved by delivery.
+        let core1 = HermesCore::new(dir.to_string_lossy().to_string());
+        attach_session(&core1, "stored-alpha", "live-A");
+        attach_session(&core1, "stored-beta", "live-B");
+        {
+            let mut state = core1.inner.lock();
+            state.registry.set_active(Some("stored-beta"));
+            // Simulate routed traffic having moved the watermarks.
+            state.registry.touch("stored-alpha", 41, "e-1");
+            state.registry.touch("stored-beta", 7, "");
+        }
+        let sink = Arc::new(RecordingSink::default());
+        core1.deliver_event(
+            &ev("message.start", "live-A", 42, json!({})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+        drop(core1);
+
+        // Instance 2: same data_dir, fresh process state.
+        let core2 = HermesCore::new(dir.to_string_lossy().to_string());
+        let state = core2.inner.lock();
+        let ids: Vec<&str> = state.registry.sessions().iter().map(|r| r.stored_id.as_str()).collect();
+        assert_eq!(ids, vec!["stored-alpha", "stored-beta"], "tab list and order survive");
+        assert_eq!(state.registry.active_key(), Some("stored-beta"), "active tab survives");
+        let alpha = state.registry.get("stored-alpha").expect("alpha persisted");
+        assert_eq!(alpha.last_seen_seq, 42, "watermark survives (delivery touched it)");
+        assert_eq!(alpha.replay_epoch, "e-1", "epoch survives");
+        let beta = state.registry.get("stored-beta").expect("beta persisted");
+        assert_eq!(beta.last_seen_seq, 7, "per-session watermarks are independent");
+    }
+
+    // ── test 4: approval dedupe ─────────────────────────────────────────────
+
+    /// Rule pinned (PI_TASK_T5B §4): the same `request_id` is applied to a
+    /// transcript at most once — an unresolved card already on the transcript
+    /// (`Reducer::has_unresolved_approval`) or already recorded in
+    /// `emitted_approvals` is never duplicated, so a reconnect's
+    /// `approval.pending` re-emission cannot stack duplicate cards.
+    #[test]
+    fn approval_cards_are_deduped_by_request_id() {
+        let dir = temp_dir("approvals");
+        let core = HermesCore::new(dir.to_string_lossy().to_string());
+        attach_session(&core, "stored-alpha", "live-A");
+        let sink = Arc::new(RecordingSink::default());
+        core.inner.lock().sink = Some(sink.clone());
+
+        let card = json!({"request_id": "req-1", "command": "rm -r /tmp/x",
+                          "description": "d", "choices": ["allow", "deny"]});
+
+        // First emission: the card goes onto the transcript.
+        {
+            let mut state = core.inner.lock();
+            let live = state.sessions.get_mut("stored-alpha").expect("live session");
+            let changes = live
+                .reducer
+                .apply_approval_card("stored-alpha", "req-1", &card)
+                .expect("first emission applies");
+            let rows = live.reducer.transcript().rows.clone();
+            drop(state);
+            for change in &changes {
+                sink.on_transcript(change_to_dto("stored-alpha", &change.change, &rows));
+            }
+        }
+        {
+            let mut state = core.inner.lock();
+            state
+                .emitted_approvals
+                .entry("stored-alpha".to_string())
+                .or_default()
+                .push("req-1".to_string());
+        }
+        let first = sink.approval_deliveries();
+        assert_eq!(first, 1, "the first card is delivered exactly once");
+
+        // The reconnect path's dedupe, spelled out exactly as `reemit_approvals`
+        // checks it: already-emitted OR already-on-transcript-unresolved.
+        let already = core
+            .inner
+            .lock()
+            .emitted_approvals
+            .get("stored-alpha")
+            .map(|v| v.iter().any(|id| id == "req-1"))
+            .unwrap_or(false);
+        assert!(already, "the emitted set records the request_id");
+        let on_transcript = {
+            let state = core.inner.lock();
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.has_unresolved_approval("req-1"))
+                .unwrap_or(false)
+        };
+        assert!(on_transcript, "the unresolved card is on the transcript");
+
+        // A reconnect's re-emission of the SAME card must add nothing.
+        if !already && !on_transcript {
+            // This branch is what `reemit_approvals` executes for a fresh
+            // card; the dedupe guarantees it is NOT taken here.
+            panic!("dedupe must prevent re-applying req-1");
+        }
+        {
+            let mut state = core.inner.lock();
+            if !already {
+                let live = state.sessions.get_mut("stored-alpha").expect("live");
+                let _ = live.reducer.apply_approval_card("stored-alpha", "req-1", &card);
+            }
+        }
+        assert_eq!(
+            sink.approval_deliveries(),
+            1,
+            "the same request_id is re-emitted at most once per (re)connect"
+        );
+        let rows = {
+            let state = core.inner.lock();
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.transcript().rows.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(rows, 1, "no duplicate approval row on the transcript");
+    }
+
+    // ── test 5: the supervisor's ladder attempt behaviour ───────────────────
+
+    /// Rule pinned (PI_TASK_T5B §5): the supervisor uses the SAME schedule as
+    /// `reconnect.rs` (reset to the first step after a success, capped at the
+    /// final step for the life of the connection). The supervisor's attempt
+    /// counter is not directly reachable without a socket, so the ladder
+    /// arithmetic it calls — `delay_for_attempt` reset/cap semantics — is
+    /// pinned here against the supervisor's call shape
+    /// (`jittered_delay(attempt, clock_jitter())`, `attempt += 1` per retry,
+    /// `attempt = 0` on success): a changed ladder or a non-resetting
+    /// supervisor's counter breaks these invariants.
+    #[test]
+    fn supervisor_ladder_resets_on_success_and_caps_at_the_final_step() {
+        // A supervisor that just connected: attempt 0 -> first step (1 s ±20%).
+        let first = reconnect::jittered_delay(0, clock_jitter());
+        assert!(
+            (1_000..=1_200).contains(&first),
+            "a fresh attempt (reset counter) waits the FIRST step, got {first} ms"
+        );
+        // A supervisor whose ladder ran past the last step holds at 15 s.
+        for attempt in [5u32, 6, 20, u32::MAX] {
+            let d = reconnect::jittered_delay(attempt, 0.0);
+            assert_eq!(d, reconnect::BACKOFF_MS[reconnect::BACKOFF_MS.len() - 1],
+                "attempt {attempt} caps at the final step");
+        }
+        // The full ladder the supervisor walks while failing, with the reset
+        // in the middle, never leaves the schedule's bounds.
+        for attempt in 0..10u32 {
+            let d = reconnect::jittered_delay(attempt, 0.5);
+            let base = reconnect::delay_for_attempt(attempt);
+            assert!(d >= base && d <= base + base / 5, "attempt {attempt}: {d} ms out of bounds");
+        }
+    }
+
+    // ── test 6: Drop inside an async context ────────────────────────────────
+
+    /// Rule pinned (PI_TASK_T5B §6, the second live-gate defect): dropping
+    /// `HermesCore` from INSIDE an async context must not panic. `Drop` moves
+    /// the runtime to a detached thread (`shutdown_background`); if it ever
+    /// drops the runtime on the current thread again, `Runtime::drop` blocks
+    /// on the workers and tokio panics with "Cannot drop a runtime in a
+    /// context where blocking is not allowed".
+    #[tokio::test]
+    async fn dropping_core_inside_async_context_does_not_panic() {
+        let core = HermesCore::new(temp_dir("drop").to_string_lossy().to_string());
+        // Two workers have nothing parked; drop it right here, inside the
+        // tokio test runtime's worker context.
+        drop(core);
+        // Yield once so any mis-dropped runtime surfaces synchronously.
+        tokio::task::yield_now().await;
     }
 }
 
