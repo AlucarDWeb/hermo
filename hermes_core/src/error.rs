@@ -16,7 +16,9 @@
 use thiserror::Error;
 
 /// Every error the core can surface to a foreign caller.
-#[derive(Debug, Clone, Error)]
+// `uniffi::Error`: the derive lands here because T5 is the first layer
+// where `CoreError` actually crosses the FFI boundary.
+#[derive(Debug, Clone, Error, uniffi::Error)]
 pub enum CoreError {
     /// The `hermes://connect` payload was malformed (wrong scheme,
     /// unknown version, missing url, bad url scheme).

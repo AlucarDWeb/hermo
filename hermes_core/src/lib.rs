@@ -21,5 +21,8 @@ pub mod rpc;
 pub mod auth;
 pub mod error;
 pub mod transcript;
+pub mod session_registry;
+pub mod reconnect;
+pub mod core;
 
 uniffi::setup_scaffolding!();

@@ -112,10 +112,27 @@ pub enum ClientError {
     /// Transport / protocol failure from the underlying WebSocket.
     #[error("transport error: {0}")]
     Transport(String),
+    /// The WebSocket handshake was rejected with an HTTP error status before
+    /// any WebSocket framing existed (PLAN §1.1: pre-accept rejections —
+    /// the gateway's auth/host/origin guard answers 403, the client never
+    /// sees a close frame). Distinct from [`ClientError::Transport`]: this
+    /// is a policy answer, not a socket failure, and must not be retried as
+    /// if the connection had merely dropped.
+    #[error("handshake rejected with http {0}")]
+    HandshakeRejected(u16),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
     fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        // Review #3 carry-over: `connect()` is the only place that sees the
+        // HTTP status of a failed upgrade. The handshake status is a policy
+        // answer, not a socket failure: it gets its own variant (403 — the
+        // pre-accept rejection per PLAN §1.1 — maps to
+        // `CoreError::UpgradeRejected` downstream, other statuses to
+        // `CoreError::Http`). No sniffing of `Transport(String)` for "403".
+        if let tokio_tungstenite::tungstenite::Error::Http(resp) = &e {
+            return ClientError::HandshakeRejected(resp.status().as_u16());
+        }
         ClientError::Transport(e.to_string())
     }
 }
@@ -131,6 +148,12 @@ impl From<ClientError> for crate::error::CoreError {
             ClientError::Timeout(_) => crate::error::CoreError::Timeout,
             ClientError::Closed(_) => crate::error::CoreError::NotConnected,
             ClientError::Transport(s) => crate::error::CoreError::Network(s),
+            // Review #3 carry-over: an HTTP 403 on the WS upgrade maps to
+            // the dedicated domain error (never `Network` — the app must
+            // not retry an auth/host guard rejection as if it were offline,
+            // PR #3 finding 4).
+            ClientError::HandshakeRejected(403) => crate::error::CoreError::UpgradeRejected,
+            ClientError::HandshakeRejected(code) => crate::error::CoreError::Http(code),
         }
     }
 }
@@ -727,5 +750,57 @@ mod tests {
         }
         .into();
         assert!(matches!(rpc, CoreError::Rpc { code: 5000, .. }));
+    }
+
+    /// Review #3 carry-over: a failed WS upgrade answers HTTP 403 — the
+    /// pre-accept rejection (PLAN §1.1) — and that must surface as the
+    /// dedicated domain error, NOT `Network` (the app must not retry an
+    /// auth/host guard as if it were offline), while every other transport
+    /// failure still maps to `Network`. The mapping lives in
+    /// `From<tungstenite::Error>`: a real `Error::Http(403)` produces
+    /// `HandshakeRejected(403)`, and the domain mapping turns it into
+    /// `UpgradeRejected`.
+    #[test]
+    fn handshake_403_maps_to_upgrade_rejected_and_reset_stays_network() {
+        use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+
+        // Build the exact wire error a 403 upgrade rejection produces.
+        let resp = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(None)
+            .expect("static response");
+        let wire: ClientError = tokio_tungstenite::tungstenite::Error::Http(resp).into();
+        assert!(
+            matches!(wire, ClientError::HandshakeRejected(403)),
+            "the producer must classify the 403 handshake, got {wire:?}"
+        );
+        let mapped: CoreError = wire.into();
+        assert!(
+            matches!(mapped, CoreError::UpgradeRejected),
+            "403 must map to UpgradeRejected, got {mapped:?}"
+        );
+
+        // A plain transport reset (no HTTP status at all) is NOT a rejection.
+        let reset: CoreError =
+            ClientError::from(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
+            ))
+            .into();
+        assert!(
+            matches!(reset, CoreError::Network(_)),
+            "a transport reset must stay Network, got {reset:?}"
+        );
+
+        // Another HTTP status is a distinct domain error, not UpgradeRejected.
+        let resp503 = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(None)
+            .expect("static response");
+        let mapped503: CoreError =
+            ClientError::from(tokio_tungstenite::tungstenite::Error::Http(resp503)).into();
+        assert!(
+            matches!(mapped503, CoreError::Http(503)),
+            "503 must map to Http(503), got {mapped503:?}"
+        );
     }
 }

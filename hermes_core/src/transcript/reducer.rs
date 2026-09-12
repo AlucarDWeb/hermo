@@ -68,6 +68,26 @@ impl Reducer {
         &self.state
     }
 
+    /// True while an assistant row is streaming (`message.start` seen, no
+    /// `message.complete`/`interim` yet) — the "running" flag of the open
+    /// tabs (PLAN §4 T5: `open_sessions()` carries running flags).
+    pub fn is_streaming(&self) -> bool {
+        self.streaming.is_some()
+    }
+
+    /// True when an unresolved approval card with this `request_id` is
+    /// already on the transcript. The use case uses it to de-duplicate
+    /// re-emitted `approval.pending` cards after a reconnect (PLAN §4 T5:
+    /// replays by `request_id`) without duplicating rows.
+    pub fn has_unresolved_approval(&self, request_id: &str) -> bool {
+        self.state.rows.iter().any(|row| {
+            matches!(
+                &row.kind,
+                RowKind::Approval(card) if card.request_id == request_id && !card.resolved
+            )
+        })
+    }
+
     /// Apply one decoded event; empty `session_id` (a session-less event
     /// such as `gateway.ready`) yields no change and no row. Unknown event
     /// types, missing fields and garbage payloads are ignored without
@@ -119,7 +139,7 @@ impl Reducer {
             }
             changes.push(TranscriptChange::RowUpdated { index });
         }
-        wrap(key, changes)
+        Self::wrap(key, changes)
     }
 
     /// Resolve the clarify card carrying `request_id` (after the local
@@ -137,7 +157,7 @@ impl Reducer {
             }
             changes.push(TranscriptChange::RowUpdated { index });
         }
-        wrap(key, changes)
+        Self::wrap(key, changes)
     }
 
     /// Reset the transcript of the session `key` on resume (PLAN §1.5: on a
@@ -149,6 +169,69 @@ impl Reducer {
         self.streaming = None;
         self.thinking = None;
         self.tools.clear();
+        vec![SessionChange { key: key.to_string(), change: TranscriptChange::Reset }]
+    }
+
+    /// Ingest the `messages: [Transcript]` array that `session.create` and
+    /// `session.resume` return (review #4 carry-over): a second input shape,
+    /// not an [`EventParams`]. Clears the transcript first (a resume
+    /// replaces history) and then renders the messages in list order, so a
+    /// resumed session shows its history without waiting for events.
+    ///
+    /// Assumed message shape (PLAN §1.3, from `tui_gateway/session_history.py`
+    /// `_history_to_messages` / `gatewayTypes.ts` `GatewayTranscriptMessage`):
+    /// `{role: "user"|"assistant"|"system"|"tool", text?, name?, context?,
+    /// display_kind?, display_metadata?}`. Tool entries may carry a `tool_id`
+    /// in `display_metadata` — tolerated, never required (PI_ROLE defensive
+    /// rule): missing/unknown fields degrade to defaults, never panic.
+    pub fn ingest_resume_messages(
+        &mut self,
+        key: &str,
+        messages: &[serde_json::Value],
+    ) -> Vec<SessionChange> {
+        self.state = Transcript::default();
+        self.streaming = None;
+        self.thinking = None;
+        self.tools.clear();
+        for msg in messages {
+            if !msg.is_object() {
+                continue;
+            }
+            let role = json::str_at(msg, "role");
+            let text = json::str_at(msg, "text").to_string();
+            let name = json::str_at(msg, "name").to_string();
+            let context = json::str_at(msg, "context").to_string();
+            let index = self.state.rows.len();
+            let row = match role {
+                "tool" => {
+                    let card = ToolCard {
+                        // A resumed tool message re-pairs by id when the
+                        // server carries one in display_metadata; absent ->
+                        // empty (never re-computed).
+                        tool_id: json::str_at(
+                            msg.get("display_metadata").unwrap_or(&Value::Null),
+                            "tool_id",
+                        )
+                        .to_string(),
+                        name,
+                        complete: true,
+                        context,
+                        args_json: String::new(),
+                        result_json: text,
+                        duration_s: 0.0,
+                    };
+                    if !card.tool_id.is_empty() {
+                        self.tools.insert(card.tool_id.clone(), index);
+                    }
+                    Row { index, kind: RowKind::Tool(card) }
+                }
+                "user" | "system" => Row { index, kind: RowKind::User { text } },
+                // "assistant" and anything unknown: degrade to an assistant
+                // row (defensive: the history must render, not vanish).
+                _ => Row { index, kind: RowKind::Assistant { text, streaming: false, usage_json: String::new(), warning: String::new() } },
+            };
+            self.state.rows.push(row);
+        }
         vec![SessionChange { key: key.to_string(), change: TranscriptChange::Reset }]
     }
 
@@ -512,13 +595,50 @@ impl Reducer {
         }
         vec![TranscriptChange::HeaderUpdated]
     }
-}
 
-fn wrap(key: &str, changes: Vec<TranscriptChange>) -> Vec<SessionChange> {
-    changes
-        .into_iter()
-        .map(|change| SessionChange { key: key.to_string(), change })
-        .collect()
+    /// Wrap changes with the session key (internal helper of the wrappers).
+    fn wrap(key: &str, changes: Vec<TranscriptChange>) -> Vec<SessionChange> {
+        changes
+            .into_iter()
+            .map(|change| SessionChange { key: key.to_string(), change })
+            .collect()
+    }
+
+    /// Apply one `approval.pending` card (a JSON object of the same shape
+    /// as the `approval.request` event payload) as an approval row. The use
+    /// case (`core.rs`) calls this when re-emitting unresolved cards after
+    /// a (re)connect; it has ALREADY deduped by `request_id`
+    /// (`has_unresolved_approval` + its own emitted set). Returns the
+    /// routable changes, or `None` when the card carried no usable
+    /// `request_id` (defensive: garbage never becomes a row).
+    pub fn apply_approval_card(
+        &mut self,
+        key: &str,
+        request_id: &str,
+        card: &serde_json::Value,
+    ) -> Option<Vec<SessionChange>> {
+        if request_id.is_empty() {
+            return None;
+        }
+        // The event handler reads `request_id` from the payload; inject it
+        // so both entry points share one row-building rule.
+        let mut payload = card.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("request_id".to_string(), serde_json::json!(request_id));
+        }
+        let ev = EventParams {
+            event_type: "approval.request".to_string(),
+            session_id: key.to_string(),
+            seq: None,
+            payload,
+        };
+        let changes = self.apply(&ev);
+        if changes.is_empty() {
+            None
+        } else {
+            Some(changes)
+        }
+    }
 }
 
 /// String list from a JSON value; non-string entries and non-arrays degrade
@@ -942,6 +1062,91 @@ mod tests {
         // The reducer is reusable after a reset.
         r.apply(&event("message.start", json!({})));
         assert_eq!(r.transcript().rows.len(), 1);
+    }
+
+    /// Review #4 carry-over rule pinned: `ingest_resume_messages` renders a
+    /// resumed session's history — the `messages: [Transcript]` array of
+    /// `session.resume` (PLAN §1.3 shape) — into rows, without any event.
+    /// Removing the constructor, or rebuilding history only from events,
+    /// leaves a resumed transcript empty and this test fails.
+    #[test]
+    fn resume_messages_ingest_renders_history_without_events() {
+        let mut r = Reducer::new();
+        // Pre-existing state must be replaced, not appended to.
+        r.apply(&event("message.complete", json!({"text": "stale"})));
+        let messages = vec![
+            json!({"role": "user", "text": "hi there"}),
+            json!({"role": "assistant", "text": "hello back"}),
+            json!({
+                "role": "tool",
+                "name": "terminal",
+                "context": "echo hi",
+                "text": "{\"output\": \"hi\"}",
+                "display_metadata": {"tool_id": "t9"}
+            }),
+            // Defensive shapes: a message with no role and a non-object entry
+            // must degrade, never panic.
+            json!({"role": "assistant"}),
+            json!("not an object"),
+        ];
+        let changes = r.ingest_resume_messages("s-resume", &messages);
+        // Exactly one Reset, carrying the session key.
+        assert_eq!(changes.len(), 1, "one Reset for the whole ingest");
+        assert_eq!(changes[0].key, "s-resume");
+        assert!(matches!(changes[0].change, TranscriptChange::Reset));
+        let t = r.transcript();
+        // Non-object entries are skipped, the four objects become rows in
+        // list order: user, assistant, tool, assistant.
+        assert_eq!(t.rows.len(), 4, "user+assistant+tool+assistant, garbage skipped");
+        assert_eq!(t.kind_at(0), "user");
+        match &t.rows[0].kind {
+            RowKind::User { text } => assert_eq!(text, "hi there"),
+            other => panic!("expected User, got {:?}", other),
+        }
+        match &t.rows[1].kind {
+            RowKind::Assistant { text, streaming, .. } => {
+                assert_eq!(text, "hello back");
+                assert!(!streaming, "history rows are not streaming");
+            }
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+        match &t.rows[2].kind {
+            RowKind::Tool(card) => {
+                assert_eq!(card.name, "terminal");
+                assert_eq!(card.tool_id, "t9", "tool_id from display_metadata");
+                assert_eq!(card.result_json, r#"{"output": "hi"}"#);
+                assert!(card.complete, "a resumed tool message is finished");
+            }
+            other => panic!("expected Tool, got {:?}", other),
+        }
+        match &t.rows[3].kind {
+            RowKind::Assistant { text, .. } => assert_eq!(text, "", "missing text degrades"),
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+        // The stale pre-resume rows are gone.
+        assert!(t.rows.iter().all(|row| match &row.kind {
+            RowKind::Assistant { text, .. } => text != "stale",
+            _ => true,
+        }));
+        // The reducer keeps working after the ingest: a new event applies on
+        // top of the rebuilt history.
+        let mut ev = event("message.start", json!({}));
+        ev.session_id = "s-resume".into();
+        r.apply(&ev);
+        assert_eq!(r.transcript().rows.len(), 5);
+    }
+
+    /// Rule pinned: an EMPTY resume messages array still resets (a resumed
+    /// session that legitimately has no history renders an empty transcript,
+    /// not the stale pre-resume rows).
+    #[test]
+    fn empty_resume_messages_still_resets() {
+        let mut r = Reducer::new();
+        r.apply(&event("message.complete", json!({"text": "old"})));
+        let changes = r.ingest_resume_messages("s1", &[]);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0].change, TranscriptChange::Reset));
+        assert!(r.transcript().rows.is_empty(), "history replaced, not merged");
     }
 
     /// Rule pinned: `thinking.delta` and `reasoning.delta` append into ONE
