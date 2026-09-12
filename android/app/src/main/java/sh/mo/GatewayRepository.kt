@@ -113,13 +113,22 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             uniffi.hermes_core.TranscriptChangeKind.ROW_UPDATED ->
                 current.copy(rows = applyTranscriptChange(current.rows, "rowUpdated", change.index.toLong(), change.rowJson))
             uniffi.hermes_core.TranscriptChangeKind.RESET -> {
-                // Honour the clear and keep NO local copy: the core redistributes
-                // the history itself (`hermes_core/src/transcript/reducer.rs` —
-                // `reset_from_resume` emits exactly one Reset, then the resume
-                // ingest re-renders the messages into rows on this same stream).
-                // Replaying a local snapshot here would duplicate the transcript
-                // the core is about to send (review #8, should 1).
-                current.copy(rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson))
+                // App-side mitigation, not a fidelity fix — and the only row
+                // source available today. After a resume/epoch rebuild the core
+                // clears its reducer state and emits this single Reset, but the
+                // rebuilt rows stay in reducer state (`reducer.rs:235` returns
+                // exactly one Reset; `core.rs::resume_all` forwards only that
+                // DTO) and the bridge exposes no rows pull (`SessionSummary`
+                // carries no rows). Clearing without replay would therefore show
+                // an EMPTY transcript on resume. Replay the last-known snapshot
+                // (append path, idempotent on index) to keep the history
+                // visible; the real fix is core-side — see PLAN
+                // "RESET/resume contract" (review #8 round 2, blocker 1).
+                var rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson)
+                current.rows.forEachIndexed { i, json ->
+                    rows = applyTranscriptChange(rows, "rowAppended", i.toLong(), json)
+                }
+                current.copy(rows = rows)
             }
             uniffi.hermes_core.TranscriptChangeKind.HEADER_UPDATED -> {
                 // The DTO carries no header payload (`row_json` is empty for

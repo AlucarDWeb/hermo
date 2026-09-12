@@ -9,9 +9,11 @@ import org.junit.Test
  *
  * The defect on the device: during a turn the transcript collapsed — tool/
  * assistant rows visible one moment, one row seconds later, while the
- * gateway held 39 messages. Root cause, app-side (the core never emits
- * `Reset` on resume — `reset_from_resume` has no call site outside
- * reducer.rs — and the change stream is the only transcript source):
+ * gateway held 39 messages. Root cause, app-side (the change stream is the
+ * app's only transcript source: the core emits `Reset` on the resume/epoch
+ * rebuild but does NOT publish the rebuilt rows — `reducer.rs:235` returns
+ * exactly one Reset, `core.rs::resume_all` forwards only that DTO, and the
+ * bridge exposes no rows pull):
  *
  * - ROW_UPDATED carrying an index the local list did not reach yet was
  *   DROPPED (GatewayRepository.onTranscriptChange's `if (idx in rows.indices)
@@ -62,15 +64,21 @@ class TranscriptStateTest {
     }
 
     @Test
-    fun `reset honours the clear - the core redistributes the history`() {
+    fun `reset clears the rows and the app replays its snapshot - empty is the alternative`() {
         val snapshot = appends("""{"kind":"user","text":"q"}""", assistantJson)
-        // RESET is clear-only: the app keeps no local snapshot. The core
-        // re-renders the resumed history right after (`reset_from_resume` emits
-        // one Reset, then the resume ingest redistributes the rows on the same
-        // stream), so a local replay here would duplicate the whole transcript
-        // (review #8, should 1).
-        val rows = applyTranscriptChange(snapshot, "reset", Long.MAX_VALUE, "")
+        // RESET honours the clear…
+        var rows = applyTranscriptChange(snapshot, "reset", Long.MAX_VALUE, "")
         assertEquals(0, rows.size)
+        // …and the repository replays its last-known snapshot back in, because
+        // the core emits this Reset WITHOUT the rebuilt rows (`reducer.rs:235`
+        // returns exactly one Reset and `core.rs::resume_all` forwards only that
+        // DTO; the bridge has no rows pull), so clearing alone would leave the
+        // resume path showing an empty transcript. This is a mitigation, not the
+        // fix: the fix is core-side (see PLAN "RESET/resume contract").
+        snapshot.forEachIndexed { i, json ->
+            rows = applyTranscriptChange(rows, "rowAppended", i.toLong(), json)
+        }
+        assertEquals(snapshot, rows)
     }
 
     @Test
