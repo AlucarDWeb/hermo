@@ -167,6 +167,12 @@ interface HermoTokens {
     val radius2xl: Float get() = 4.8f           // --radius-2xl
     val radius3xl: Float get() = 6.4f           // --radius-3xl (widget shell)
     val radius4xl: Float get() = 8f             // --radius-4xl
+
+    // Composer shell & controls (styles.css 492-497; model-pill.tsx:26 max-w-40).
+    val composerControlGapDp: Float get() = 4f       // --composer-control-gap: 0.25rem
+    val composerSurfacePadXDp: Float get() = 8f      // --composer-surface-pad-x: 0.5rem
+    val composerSurfacePadYDp: Float get() = 5f      // --composer-surface-pad-y: 0.3125rem
+    val composerPillMaxWidthDp: Float get() = 160f   // model-pill.tsx:26 'max-w-40' (10rem)
 }
 
 val LocalHermoTokens = staticCompositionLocalOf<HermoTokens> { LightTokens }
