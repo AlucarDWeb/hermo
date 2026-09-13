@@ -2,6 +2,9 @@ package sh.mo.ui
 
 import android.annotation.SuppressLint
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,10 +27,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -43,8 +45,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -60,11 +64,15 @@ import sh.mo.ui.hermoRadius
 
 /**
  * The shared session window (PI_TASK_T7A deliverable 2 + T8): the Ready phase
- * is the Desktop-shaped transcript — a panel titlebar (model + session title,
+ * is the Desktop-shaped transcript — a panel titlebar (the session title,
  * DESIGN.md "Panel titlebars"), the row list (user / assistant / thinking /
  * tool / status / error, DESIGN.md "Chat, tools & boot surfaces"), the
  * status strip (DESIGN.md "Feedback & empty/error/loading states") and the
  * composer.
+ *
+ * The model name lives in the composer's control row, not the titlebar —
+ * Desktop's ModelPill is "the relocated status-bar pill" (model-pill.tsx,
+ * controls.tsx:110) and the phone follows it.
  *
  * T7 divergences closed here:
  * 3. Titlebar insets — the titlebar now sits below the Android status bar
@@ -100,10 +108,11 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
                 .background(t.background)
                 .imePadding(),
         ) {
-            ChatTitlebar(model = model.ifEmpty { "unknown" }, title = state.title)
+            ChatTitlebar(title = state.title)
             TranscriptList(rows = rows, running = state.running, modifier = Modifier.weight(1f))
             StatusStrip(state = state, rows = rows)
             Composer(
+                model = model.ifEmpty { "unknown" },
                 running = state.running,
                 onSend = { text -> viewModel.send(text) },
                 onStop = { key?.let { viewModel.interrupt(it) } },
@@ -113,13 +122,17 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
 }
 
 /**
- * Panel titlebar: one hairline under the model + session title. The row sits
+ * Panel titlebar: one hairline under the session title. The row sits
  * BELOW the Android status bar — Desktop's titlebar clears the window chrome,
  * the phone's equivalent is the system-bar inset (T7 divergence 3; the badge
  * previously drew under the status bar).
+ *
+ * The model chip used to draw here; it moved into the composer as the
+ * Desktop's control-row pill (model-pill.tsx 25-28, controls.tsx:110) —
+ * Desktop itself calls it "the relocated status-bar pill".
  */
 @Composable
-private fun ChatTitlebar(model: String, title: String) {
+private fun ChatTitlebar(title: String) {
     val t = LocalHermoTokens.current
     val statusBarPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     Column {
@@ -131,22 +144,6 @@ private fun ChatTitlebar(model: String, title: String) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Box(
-                modifier = Modifier
-                    .clip(hermoRadius(t.radiusSm))
-                    .background(t.primarySolid)
-                    .padding(horizontal = 6.dp, vertical = 2.dp),
-            ) {
-                Text(
-                    text = model,
-                    style = androidx.compose.ui.text.TextStyle(
-                        fontFamily = LocalFonts.current.sans,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium,
-                    ),
-                    color = t.onPrimary,
-                )
-            }
             if (title.isNotBlank()) {
                 Text(
                     text = title,
@@ -310,9 +307,9 @@ private fun StatusStrip(state: SessionUiState, rows: List<ChatRow>) {
 }
 
 /**
- * The composer: Desktop's composer shell — full-width rounded field in
- * --radius-lg, the send action in --theme-primary — with Desktop's
- * behaviours (T8 scope 1):
+ * The composer: Desktop's composer shell — one rounded box (border in
+ * --radius-lg, index.tsx composer-surface) holding the input row and the
+ * send action in --theme-primary — with Desktop's behaviours (T8 scope 1):
  *
  * - multi-line input that GROWS to a cap (min 1 line, max --composer-input-
  *   max-height 9.375rem ≈ 7 lines; below that the field grows in place);
@@ -321,6 +318,12 @@ private fun StatusStrip(state: SessionUiState, rows: List<ChatRow>) {
  * - the placeholder pool is Desktop's composer copy, re-rolled per session;
  * - the aui_composer-clearance bottom spacing above is the transcript's
  *   counterpart so the composer never covers the last message.
+ *
+ * The shell grid is Desktop's `menu | input | controls` (index.tsx ~1386:
+ * grid-template-areas "menu_input_controls", controls `justify-end`): on the
+ * phone there is no `menu` yet, so the row is `[input] [pill] [Send/Stop]`
+ * — the model pill is the FIRST control of the cluster (controls.tsx:110),
+ * the relocated status-bar pill (model-pill.tsx).
  */
 private val PLACEHOLDERS = listOf(
     "What are we building?",
@@ -339,6 +342,7 @@ private fun successDot(t: sh.mo.ui.HermoTokens): Color = Color(0xFF2AA17C)
 
 @Composable
 private fun Composer(
+    model: String,
     running: Boolean,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
@@ -348,50 +352,112 @@ private fun Composer(
     // Desktop re-rolls the placeholder per conversation, not per keystroke —
     // one pick per composer composition here (the phone has one session view).
     val placeholder = remember { PLACEHOLDERS.random() }
-    Row(
+    // Border color follows focus exactly as the previous OutlinedTextField
+    // colors did (focused = --theme-midground, rest = --ui-stroke-tertiary);
+    // the hand-drawn shell needs the interaction source for that.
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val borderColor = if (focused) t.midground else t.strokeTertiary
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(12.dp),
-        verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+            .padding(12.dp)
+            .clip(hermoRadius(t.radiusLg))
+            .background(t.surface)
+            .border(1.dp, borderColor, hermoRadius(t.radiusLg))
+            .padding(
+                horizontal = t.composerSurfacePadXDp.dp,
+                vertical = t.composerSurfacePadYDp.dp,
+            ),
     ) {
-        OutlinedTextField(
-            value = draft,
-            onValueChange = { draft = it },
-            modifier = Modifier
-                .weight(1f)
-                .clip(hermoRadius(t.radiusLg)),
-            placeholder = { Text(placeholder, style = androidx.compose.ui.text.TextStyle(fontSize = t.convFontSize.sp)) },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = t.midground,
-                unfocusedBorderColor = t.strokeTertiary,
-                cursorColor = t.midground,
-            ),
-            minLines = 1,
-            // Desktop's --composer-input-max-height: 9.375rem ≈ 7 lines of
-            // --conversation-line-height (18sp) — the growth cap.
-            maxLines = 7,
-        )
-        Button(
-            onClick = {
-                if (running) {
-                    onStop()
-                } else if (draft.isNotBlank()) {
-                    onSend(draft)
-                    draft = ""
-                }
-            },
-            enabled = running || draft.isNotBlank(),
-            shape = hermoRadius(t.radiusLg),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = t.primary,
-                contentColor = t.onPrimary,
-                disabledContainerColor = t.softFill,
-                disabledContentColor = t.textTertiary,
-            ),
-            modifier = Modifier.padding(bottom = 4.dp),
+        Row(
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(t.composerControlGapDp.dp),
         ) {
-            Text(if (running) "Stop" else "Send")
+            BasicTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                modifier = Modifier.weight(1f),
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    fontFamily = LocalFonts.current.sans,
+                    fontSize = t.convFontSize.sp,
+                    lineHeight = t.convLineHeight.sp,
+                    color = t.text,
+                ),
+                cursorBrush = SolidColor(t.midground),
+                interactionSource = interaction,
+                // Desktop's --composer-input-max-height: 9.375rem ≈ 7 lines of
+                // --conversation-line-height (18sp) — the growth cap.
+                maxLines = 7,
+                decorationBox = { inner ->
+                    Box {
+                        if (draft.isEmpty()) {
+                            Text(
+                                text = placeholder,
+                                style = androidx.compose.ui.text.TextStyle(
+                                    fontFamily = LocalFonts.current.sans,
+                                    fontSize = t.convFontSize.sp,
+                                    lineHeight = t.convLineHeight.sp,
+                                ),
+                                color = t.textTertiary,
+                            )
+                        }
+                        inner()
+                    }
+                },
+            )
+            ModelPill(model = model)
+            Button(
+                onClick = {
+                    if (running) {
+                        onStop()
+                    } else if (draft.isNotBlank()) {
+                        onSend(draft)
+                        draft = ""
+                    }
+                },
+                enabled = running || draft.isNotBlank(),
+                shape = hermoRadius(t.radiusLg),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = t.primary,
+                    contentColor = t.onPrimary,
+                    disabledContainerColor = t.softFill,
+                    disabledContentColor = t.textTertiary,
+                ),
+                modifier = Modifier.padding(bottom = 4.dp),
+            ) {
+                Text(if (running) "Stop" else "Send")
+            }
         }
     }
+}
+
+/**
+ * Desktop's ModelPill, relocated (model-pill.tsx 25-28): ghost styling,
+ * --ui-text-tertiary, `text-xs` (11sp here), ONE truncating line at
+ * `max-w-40` — "the one control in the row that can give width back".
+ *
+ * Divergence, stated: the Desktop pill is the dropdown trigger for the live
+ * `model.options` menu; the phone has no model picker yet (a later phase:
+ * `model.options` + `config.set`), so there is NO chevron and NO press
+ * affordance — a control that opens nothing would be a dead affordance.
+ * This is a static label until the picker lands.
+ */
+@Composable
+private fun ModelPill(model: String) {
+    val t = LocalHermoTokens.current
+    Text(
+        text = model,
+        style = androidx.compose.ui.text.TextStyle(
+            fontFamily = LocalFonts.current.sans,
+            fontSize = t.convToolFontSize.sp, // text-xs ≈ --conversation-tool-font-size
+            fontWeight = FontWeight.Normal,
+        ),
+        color = t.textTertiary,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .widthIn(max = t.composerPillMaxWidthDp.dp)
+            .padding(horizontal = 8.dp, vertical = 4.dp), // px-2, h-(--composer-control-size)
+    )
 }
