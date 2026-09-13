@@ -164,6 +164,14 @@ impl Reducer {
     /// truncated replay or changed epoch the transcript is rebuilt from the
     /// resume `messages`). Takes the key it belongs to; emits exactly one
     /// [`TranscriptChange::Reset`] for that key.
+    ///
+    /// NOTE (PR #10 nit): this method has NO production caller — the shipping
+    /// rebuild path is [`Reducer::ingest_resume_messages`], which emits one
+    /// Reset plus one `RowAppended` per rebuilt row (the change stream is the
+    /// single source of rows). The single-`Reset` contract here is still
+    /// coherent for a wipe-WITHOUT-rebuild site (clear the transcript and let
+    /// the following events repaint it); do not "fix" it into the ingest
+    /// shape.
     pub fn reset_from_resume(&mut self, key: &str) -> Vec<SessionChange> {
         self.state = Transcript::default();
         self.streaming = None;
@@ -177,6 +185,13 @@ impl Reducer {
     /// not an [`EventParams`]. Clears the transcript first (a resume
     /// replaces history) and then renders the messages in list order, so a
     /// resumed session shows its history without waiting for events.
+    ///
+    /// Emit contract (T7c): [`TranscriptChange::Reset`] FIRST (the authority
+    /// that the history was replaced), then one
+    /// [`TranscriptChange::RowAppended` { index }] per rebuilt row, in list
+    /// order, at the same index stamped on each `Row` — the change stream is
+    /// the single source of rows, so the app renders the rebuilt history
+    /// from the stream and needs no local snapshot.
     ///
     /// Assumed message shape (PLAN §1.3, from `tui_gateway/session_history.py`
     /// `_history_to_messages` / `gatewayTypes.ts` `GatewayTranscriptMessage`):
@@ -193,6 +208,8 @@ impl Reducer {
         self.streaming = None;
         self.thinking = None;
         self.tools.clear();
+        let mut changes =
+            vec![SessionChange { key: key.to_string(), change: TranscriptChange::Reset }];
         for msg in messages {
             if !msg.is_object() {
                 continue;
@@ -231,8 +248,28 @@ impl Reducer {
                 _ => Row { index, kind: RowKind::Assistant { text, streaming: false, usage_json: String::new(), warning: String::new() } },
             };
             self.state.rows.push(row);
+            changes.push(SessionChange {
+                key: key.to_string(),
+                change: TranscriptChange::RowAppended { index },
+            });
         }
-        vec![SessionChange { key: key.to_string(), change: TranscriptChange::Reset }]
+        changes
+    }
+
+    /// Append the user's own row for a submitted prompt (T7c): pushes a
+    /// [`RowKind::User`] at `rows.len()` and returns one
+    /// [`TranscriptChange::RowAppended` { index }] for it. No other state is
+    /// touched — no streaming latch, no tools map, no turn bookkeeping: the
+    /// turn's own rows remain the wire events' business. The use case
+    /// (`core.rs::send`) calls this after a successful `prompt.submit`,
+    /// because the server never emits a row event for the user's message and
+    /// the change stream is the single source of rows.
+    pub fn append_user_row(&mut self, key: &str, text: &str) -> Vec<SessionChange> {
+        let index = self.state.rows.len();
+        self.state
+            .rows
+            .push(Row { index, kind: RowKind::User { text: text.to_string() } });
+        Self::wrap(key, vec![TranscriptChange::RowAppended { index }])
     }
 
     // ── handlers ───────────────────────────────────────────────────────
@@ -1090,10 +1127,52 @@ mod tests {
             json!("not an object"),
         ];
         let changes = r.ingest_resume_messages("s-resume", &messages);
-        // Exactly one Reset, carrying the session key.
-        assert_eq!(changes.len(), 1, "one Reset for the whole ingest");
+        // T7c contract: the Reset is the authority that the history was
+        // replaced, and the rebuilt rows FOLLOW it as one `RowAppended` per
+        // row, in list order — the change stream is the single source of
+        // rows, so the app must receive the rebuilt history through it.
+        // Pre-fix this returned EXACTLY ONE Reset and the rebuilt rows were
+        // visible to no one (the app replayed a stale local snapshot).
         assert_eq!(changes[0].key, "s-resume");
-        assert!(matches!(changes[0].change, TranscriptChange::Reset));
+        assert!(matches!(changes[0].change, TranscriptChange::Reset), "Reset comes FIRST");
+        let kinds: Vec<String> = changes
+            .iter()
+            .map(|c| match c.change {
+                TranscriptChange::Reset => "reset".to_string(),
+                TranscriptChange::RowAppended { index } => format!("row@{index}"),
+                ref other => format!("other:{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            changes.len(),
+            5,
+            "one Reset + one RowAppended per rebuilt row (4 objects, garbage skipped): {kinds:?}"
+        );
+        assert_eq!(kinds, vec!["reset", "row@0", "row@1", "row@2", "row@3"], "in list order");
+        for (i, change) in changes[1..].iter().enumerate() {
+            assert_eq!(change.key, "s-resume", "every change carries the session key");
+            assert!(
+                matches!(change.change, TranscriptChange::RowAppended { index } if index == i),
+                "index {} matches the rebuilt row's index (stamped on each Row)",
+                i
+            );
+        }
+        // The FFI mapping the resume path uses (`change_to_dto`) renders each
+        // appended row: a delivered RowAppended must carry its row_json (the
+        // app decodes the row from it — an empty row_json is an empty row).
+        let rebuilt = r.transcript().rows.clone();
+        for (i, change) in changes[1..].iter().enumerate() {
+            let dto = crate::core::change_to_dto("s-resume", &change.change, &rebuilt);
+            assert_eq!(dto.index as usize, i);
+            assert!(!dto.row_json.is_empty(), "row {} must render its row_json", i);
+        }
+        // Expected-JSON assertion on the FIRST rebuilt row (PR #10 nit: the
+        // previous assertion compared `change_to_dto` against ITSELF at the
+        // same index and could only pass). Row 0 of the rebuilt history is
+        // the user message "hi there"; its delivered payload must be exactly
+        // the serialized user row — nothing else can pass.
+        let first = crate::core::change_to_dto("s-resume", &changes[1].change, &rebuilt);
+        assert_eq!(first.row_json, r#"{"kind":"user","text":"hi there"}"#);
         let t = r.transcript();
         // Non-object entries are skipped, the four objects become rows in
         // list order: user, assistant, tool, assistant.
@@ -1138,13 +1217,16 @@ mod tests {
 
     /// Rule pinned: an EMPTY resume messages array still resets (a resumed
     /// session that legitimately has no history renders an empty transcript,
-    /// not the stale pre-resume rows).
+    /// not the stale pre-resume rows). T7c contract, N=0 case: the emit is
+    /// Reset + one RowAppended per rebuilt row — an empty history is Reset
+    /// with ZERO appends, never a Reset plus a phantom row.
     #[test]
     fn empty_resume_messages_still_resets() {
         let mut r = Reducer::new();
         r.apply(&event("message.complete", json!({"text": "old"})));
         let changes = r.ingest_resume_messages("s1", &[]);
-        assert_eq!(changes.len(), 1);
+        assert_eq!(changes.len(), 1, "Reset with zero RowAppended for an empty history");
+        assert_eq!(changes[0].key, "s1");
         assert!(matches!(changes[0].change, TranscriptChange::Reset));
         assert!(r.transcript().rows.is_empty(), "history replaced, not merged");
     }

@@ -113,22 +113,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             uniffi.hermes_core.TranscriptChangeKind.ROW_UPDATED ->
                 current.copy(rows = applyTranscriptChange(current.rows, "rowUpdated", change.index.toLong(), change.rowJson))
             uniffi.hermes_core.TranscriptChangeKind.RESET -> {
-                // App-side mitigation, not a fidelity fix — and the only row
-                // source available today. After a resume/epoch rebuild the core
-                // clears its reducer state and emits this single Reset, but the
-                // rebuilt rows stay in reducer state (`reducer.rs:235` returns
-                // exactly one Reset; `core.rs::resume_all` forwards only that
-                // DTO) and the bridge exposes no rows pull (`SessionSummary`
-                // carries no rows). Clearing without replay would therefore show
-                // an EMPTY transcript on resume. Replay the last-known snapshot
-                // (append path, idempotent on index) to keep the history
-                // visible; the real fix is core-side — see PLAN
-                // "RESET/resume contract" (review #8 round 2, blocker 1).
-                var rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson)
-                current.rows.forEachIndexed { i, json ->
-                    rows = applyTranscriptChange(rows, "rowAppended", i.toLong(), json)
-                }
-                current.copy(rows = rows)
+                // The Reset clears the transcript; the rebuilt rows follow
+                // immediately as one RowAppended each (T7c: the core emits
+                // `Reset` first, then the rows of the resumed history, and the
+                // stream is the single source of rows — no app-side snapshot
+                // replay; it would duplicate the core's rows).
+                current.copy(rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson))
             }
             uniffi.hermes_core.TranscriptChangeKind.HEADER_UPDATED -> {
                 // The DTO carries no header payload (`row_json` is empty for
@@ -245,9 +235,11 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
      * repository owns it, so a caller can never pass an absent key and no-op
      * silently — the defect the device acceptance run exposed).
      *
-     * The core deliberately does not create the local user row (`send` doc:
-     * the wire replay drives the transcript), so the echo is added to the UI
-     * rows; a resumed history replaces it after a RESET.
+     * No optimistic echo here (T7c): after a successful `prompt.submit` the
+     * core appends the user's row and delivers it through the sink like any
+     * other transcript change — the stream is the single source of rows, and
+     * a local echo would land on the same index as the core's row (duplicating
+     * it) or race it.
      */
     suspend fun send(text: String): Boolean {
         val key: String = _currentKey.value ?: run {
@@ -256,12 +248,6 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         }
         return try {
             core.send(key, text)
-            val s = _sessions.value[key] ?: SessionUiState(key = key)
-            // Optimistic local echo as a user row (raw JSON — the stream
-            // replaces it when the replay confirms the turn).
-            val echo = org.json.JSONObject(mapOf("kind" to "user", "text" to text)).toString()
-            _sessions.value = _sessions.value +
-                (key to s.copy(rows = applyTranscriptChange(s.rows, "rowAppended", s.rows.size.toLong(), echo)))
             _errorText.value = ""
             true
         } catch (t: Throwable) {
