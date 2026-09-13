@@ -31,7 +31,7 @@ use crate::error::CoreError;
 use crate::json;
 use crate::protocol::EventParams;
 use crate::reconnect;
-use crate::rpc::api;
+use crate::rpc::api::{self, SubmitStatus};
 use crate::rpc::client::{ClientConfig, ConnectionState, GatewayClient, GatewayEvent};
 use crate::session_registry::{SessionRecord, SessionRegistry};
 use crate::transcript::markdown::split_blocks;
@@ -653,9 +653,17 @@ impl HermesCore {
             .unwrap_or_default()
     }
 
-    /// Submit a prompt to the session `key`. The user row is NOT created
-    /// here: the wire replay (`message.*` events) drives the transcript, so
-    /// the same code path serves send, resume and reconnect.
+    /// Submit a prompt to the session `key` (T7c contract). On a SUCCESSFUL
+    /// submit the core appends the user's own row to the transcript and
+    /// delivers it through the same sink fan-out the wire events use — the
+    /// server never emits a row event for the user's message, and the change
+    /// stream is the single source of rows (no optimistic echo anywhere
+    /// else). Both `status:"streaming"` and the busy `status:"redirected"`
+    /// count as a successful submit: `redirected` is an ordinary result, not
+    /// an error (verified live on v0.21.1, PLAN §1.3) — the sent text became
+    /// part of the conversation in both cases, so the row is published for
+    /// both, and NEVER for a failed RPC. An unknown `status` publishes
+    /// nothing (defensive: it is not evidence the turn started).
     pub async fn send(self: Arc<Self>, key: String, text: String) -> Result<(), CoreError> {
         // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
         // borrows `self` for the whole call while the future moves it (E0505).
@@ -674,10 +682,35 @@ impl HermesCore {
                         .map(|l| l.live_sid.clone())
                         .ok_or(CoreError::NotConnected)?
                 };
-                api::submit(&client, &live_sid, &text)
-                    .await
-                    .map(|_| ())
-                    .map_err(CoreError::from)
+                let status = api::submit(&client, &live_sid, &text).await?;
+                if !matches!(status, SubmitStatus::Streaming | SubmitStatus::Redirected) {
+                    return Ok(());
+                }
+                // The user row is a transcript change like any other: through
+                // the reducer, out of the state lock, then to the sink (never
+                // a foreign callback under the lock).
+                let (changes, rows, sink) = {
+                    let mut state = self.inner.lock();
+                    let changes = state
+                        .sessions
+                        .get_mut(&key)
+                        .map(|l| l.reducer.append_user_row(&key, &text))
+                        .unwrap_or_default();
+                    let rows = state
+                        .sessions
+                        .get(&key)
+                        .map(|l| l.reducer.transcript().rows.clone())
+                        .unwrap_or_default();
+                    (changes, rows, state.sink.clone())
+                };
+                if let Some(sink) = sink {
+                    for change in &changes {
+                        // Durable key (see deliver_event): the reducer stamps
+                        // the key it was given, the UI routes on the tab key.
+                        sink.on_transcript(change_to_dto(&key, &change.change, &rows));
+                    }
+                }
+                Ok(())
             })
             .await
             .map_err(|e| CoreError::Io(format!("join: {e}")))?
@@ -2045,5 +2078,128 @@ mod tests {
             Some("stored-A"),
             "and it carries the durable key"
         );
+    }
+
+    // ── test 7: the user row at submit (T7c defect B) ────────────────────
+
+    /// Rule pinned (T7c): after a SUCCESSFUL `prompt.submit` (`status:
+    /// "streaming"`) the core appends the user's own row to the transcript
+    /// and delivers it through the same sink fan-out as every wire event —
+    /// the stream is the single source of rows. Pre-fix the core created no
+    /// row at submit and the app placed an optimistic echo at `rows.size`,
+    /// which the turn's first `ROW_UPDATED` then overwrote (same index,
+    /// different meaning): the sent text never appeared as its own row.
+    #[tokio::test]
+    async fn send_publishes_the_user_row_through_the_sink() {
+        let dir = temp_dir("send-user-row");
+        let gw = FakeGw::spawn(|method, _params| async move {
+            match method.as_str() {
+                "prompt.submit" => Ok(json!({"status": "streaming"})),
+                _ => Ok(json!({})),
+            }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        core.clone().send("stored-alpha".to_string(), "log a meal".to_string())
+            .await
+            .expect("send");
+
+        let deliveries = sink.transcript();
+        let user_rows: Vec<&TranscriptChangeDto> = deliveries
+            .iter()
+            .filter(|c| {
+                c.row_json.contains("\"kind\":\"user\"") && c.row_json.contains("log a meal")
+            })
+            .collect();
+        assert_eq!(
+            user_rows.len(),
+            1,
+            "the user row is delivered exactly once: {:?}",
+            deliveries
+        );
+        assert_eq!(user_rows[0].key, "stored-alpha", "it carries the durable key");
+        assert!(
+            matches!(user_rows[0].kind, TranscriptChangeKind::RowAppended),
+            "delivered as RowAppended, not RowUpdated"
+        );
+        // It IS the transcript state: the row sits in the reducer (the app
+        // sees the same row it would after a resume of this session).
+        let rows = {
+            let state = core.inner.lock();
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.transcript().rows.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(rows.len(), 1, "no other row is created by send");
+        assert_eq!(rows[0].index, 0);
+        assert!(
+            matches!(&rows[0].kind, RowKind::User { text } if text == "log a meal"),
+            "the reducer holds a User row with the sent text"
+        );
+    }
+
+    /// Rule pinned (T7c): a `redirected` submit is an ordinary successful
+    /// result (verified live on v0.21.1, PLAN §1.3 — the server answers it
+    /// when a turn was already running) and the sent message is still part
+    /// of the conversation: the user row is published for it too.
+    #[tokio::test]
+    async fn send_publishes_the_user_row_even_when_redirected() {
+        let dir = temp_dir("send-user-row-redirected");
+        let gw = FakeGw::spawn(|method, _params| async move {
+            match method.as_str() {
+                "prompt.submit" => Ok(json!({"status": "redirected"})),
+                _ => Ok(json!({})),
+            }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        core.clone().send("stored-alpha".to_string(), "second text".to_string())
+            .await
+            .expect("send");
+
+        assert!(
+            sink.transcript()
+                .iter()
+                .any(|c| c.row_json.contains("\"kind\":\"user\"")
+                    && c.row_json.contains("second text")),
+            "a redirected submit still publishes the user row: {:?}",
+            sink.transcript()
+        );
+    }
+
+    /// Rule pinned (T7c): a FAILED submit (RPC error) publishes NO user row —
+    /// the sent text never became part of the conversation.
+    #[tokio::test]
+    async fn send_publishes_no_user_row_on_a_failed_submit() {
+        let dir = temp_dir("send-user-row-error");
+        let gw = FakeGw::spawn(|method, _params| async move {
+            match method.as_str() {
+                "prompt.submit" => Err("gateway down".to_string()),
+                _ => Ok(json!({})),
+            }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let result = core.clone().send("stored-alpha".to_string(), "lost".to_string()).await;
+        assert!(result.is_err(), "the submit error must surface");
+        assert!(
+            sink.transcript().is_empty(),
+            "no user row after a failed submit: {:?}",
+            sink.transcript()
+        );
+        let rows = {
+            let state = core.inner.lock();
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.transcript().rows.clone())
+                .unwrap_or_default()
+        };
+        assert!(rows.is_empty(), "the reducer holds no row after a failed submit");
     }
 }

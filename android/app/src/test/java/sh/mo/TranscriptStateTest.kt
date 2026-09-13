@@ -64,21 +64,20 @@ class TranscriptStateTest {
     }
 
     @Test
-    fun `reset clears the rows and the app replays its snapshot - empty is the alternative`() {
-        val snapshot = appends("""{"kind":"user","text":"q"}""", assistantJson)
+    fun `reset clears the rows and the core's RowAppendeds rebuild them`() {
+        val coreRows = listOf("""{"kind":"user","text":"q"}""", assistantJson)
         // RESET honours the clear…
-        var rows = applyTranscriptChange(snapshot, "reset", Long.MAX_VALUE, "")
+        var rows = applyTranscriptChange(coreRows, "reset", Long.MAX_VALUE, "")
         assertEquals(0, rows.size)
-        // …and the repository replays its last-known snapshot back in, because
-        // the core emits this Reset WITHOUT the rebuilt rows (`reducer.rs:235`
-        // returns exactly one Reset and `core.rs::resume_all` forwards only that
-        // DTO; the bridge has no rows pull), so clearing alone would leave the
-        // resume path showing an empty transcript. This is a mitigation, not the
-        // fix: the fix is core-side (see PLAN "RESET/resume contract").
-        snapshot.forEachIndexed { i, json ->
+        // …and T7c: the rebuilt rows arrive right after as one RowAppended
+        // each FROM THE CORE (`ingest_resume_messages` emits Reset first, then
+        // a RowAppended per row). No app-side snapshot replay — the app used
+        // to replay its own last-known rows here, which duplicated whatever
+        // the core now delivers. Rebuild from the core's row JSON only.
+        coreRows.forEachIndexed { i, json ->
             rows = applyTranscriptChange(rows, "rowAppended", i.toLong(), json)
         }
-        assertEquals(snapshot, rows)
+        assertEquals(coreRows, rows)
     }
 
     @Test

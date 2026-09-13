@@ -63,11 +63,10 @@ fun applyTranscriptChange(rows: List<String>, kind: String, index: Long, rowJson
             out
         }
         "reset" -> {
-            // THE DEFECT'S SECOND HALF: the old code returned emptyList() and
-            // nothing rebuilt the transcript. The repository replays its last
-            // known snapshot back in AFTER the clear (see GatewayRepository),
-            // so the reset is honoured (no stale rows survive) without
-            // collapsing the transcript to nothing.
+            // T7c: the Reset clears the transcript and nothing app-side
+            // replays a snapshot — the rebuilt rows arrive right after as
+            // RowAppended changes from the core (the stream is the single
+            // source of rows).
             emptyList()
         }
         else -> rows // headerUpdated: no row change
