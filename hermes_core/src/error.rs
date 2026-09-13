@@ -66,6 +66,14 @@ pub enum CoreError {
     /// 404 on `password-login` — unknown auth provider.
     #[error("unknown auth provider")]
     UnknownProvider,
+    /// A successful RPC answered with an unknown/missing discriminator —
+    /// specifically `prompt.submit` answering without a recognized `status`:
+    /// whether the turn started is unknown, so the user's message was NOT
+    /// published and the caller must surface the failure (PR #10 finding 1:
+    /// a silent `Ok(())` would swallow the sent text — no row anywhere,
+    /// no error). Display text is user-visible: short and stable.
+    #[error("unexpected submit status")]
+    UnexpectedStatus,
     /// Any other non-success HTTP status.
     #[error("http status {0}")]
     Http(u16),
@@ -92,5 +100,8 @@ mod tests {
         // this pins the display strings the FFI boundary will show.
         assert_eq!(CoreError::InvalidQr.to_string(), "invalid QR payload");
         assert_eq!(CoreError::SessionExpired.to_string(), "session expired — re-login required");
+        // PR #10 finding 1: the new variant's Display is part of the FFI
+        // contract (the app classifies on these stable messages).
+        assert_eq!(CoreError::UnexpectedStatus.to_string(), "unexpected submit status");
     }
 }

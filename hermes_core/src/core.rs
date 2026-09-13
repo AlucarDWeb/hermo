@@ -150,6 +150,14 @@ struct LiveSession {
     reducer: Reducer,
     /// Highest seq applied (the watermark `events.since` resumes from).
     last_seen_seq: i64,
+    /// Snapshot of [`CoreState::history_epoch`] taken at THIS session's last
+    /// transcript rebuild (every `LiveSession` insert and every
+    /// `rebuild_session`). `send` captures it before awaiting the submit RPC
+    /// and re-checks it under the lock, so a rebuild that re-ingested the
+    /// session in between skips the user-row append (the server-rebuilt
+    /// history already contains the message) — the submit/resume race,
+    /// PR #10 finding 2.
+    history_epoch: u64,
 }
 
 /// Convert an entity [`TranscriptChange`] into its FFI DTO, stamping the
@@ -268,6 +276,13 @@ struct CoreState {
     /// and connection state goes out through it; the core never calls a
     /// foreign callback while holding the state lock.
     sink: Option<Arc<dyn EventSink>>,
+    /// Monotonic counter bumped on EVERY transcript rebuild — a new
+    /// `LiveSession` (`open_session`) or a `rebuild_session` from
+    /// `resume_all`. Live sessions snapshot it; see
+    /// [`LiveSession::history_epoch`]. Global (never reset per session) so a
+    /// session closed and reopened under the same durable key can never
+    /// alias an in-flight `send` snapshot.
+    history_epoch: u64,
 }
 
 impl HermesCore {
@@ -390,6 +405,7 @@ impl HermesCore {
                 registry,
                 emitted_approvals: HashMap::new(),
                 sink: None,
+                history_epoch: 0,
             }),
             stop_flag: Arc::new(AtomicBool::new(false)),
             supervising: Arc::new(AtomicBool::new(false)),
@@ -557,10 +573,15 @@ impl HermesCore {
             }
         };
         let mut state = self.inner.lock();
+        // A fresh LiveSession is a rebuild: bump the epoch so an in-flight
+        // `send` that snapshotted the PREVIOUS session under this key can
+        // never mistake the new transcript for the one it submitted into.
+        state.history_epoch += 1;
         let mut live = LiveSession {
             live_sid: live_sid.clone(),
             reducer: Reducer::new(),
             last_seen_seq: 0,
+            history_epoch: state.history_epoch,
         };
         if !messages.is_empty() {
             changes.extend(live.reducer.ingest_resume_messages(&key, &messages));
@@ -662,40 +683,58 @@ impl HermesCore {
     /// count as a successful submit: `redirected` is an ordinary result, not
     /// an error (verified live on v0.21.1, PLAN §1.3) — the sent text became
     /// part of the conversation in both cases, so the row is published for
-    /// both, and NEVER for a failed RPC. An unknown `status` publishes
-    /// nothing (defensive: it is not evidence the turn started).
+    /// both, and NEVER for a failed RPC. An unknown `status` on a successful
+    /// RPC is [`CoreError::UnexpectedStatus`] and publishes NO row (the
+    /// turn's state is unknown; the caller surfaces the error instead of
+    /// silently swallowing the message — PR #10 finding 1). The append is
+    /// guarded against the submit/resume race (PR #10 finding 2): the submit
+    /// RPC is awaited OUTSIDE the lock, so if `resume_all` re-ingested this
+    /// session in between (truncated replay / changed epoch), the rebuilt
+    /// history already contains the message and the append is skipped — the
+    /// per-session history epoch is captured before the await and re-checked
+    /// under the lock.
     pub async fn send(self: Arc<Self>, key: String, text: String) -> Result<(), CoreError> {
         // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
         // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
         handle
             .spawn(async move {
-                let client = {
+                // One lock for all three: client, live sid and the history
+                // epoch snapshot used by the post-submit race re-check.
+                let (client, live_sid, history_epoch) = {
                     let state = self.inner.lock();
-                    state.client.clone().ok_or(CoreError::NotConnected)?
-                };
-                let live_sid = {
-                    let state = self.inner.lock();
-                    state
+                    let client = state.client.clone().ok_or(CoreError::NotConnected)?;
+                    let live = state
                         .sessions
                         .get(&key)
-                        .map(|l| l.live_sid.clone())
-                        .ok_or(CoreError::NotConnected)?
+                        .ok_or(CoreError::NotConnected)?;
+                    (client, live.live_sid.clone(), live.history_epoch)
                 };
                 let status = api::submit(&client, &live_sid, &text).await?;
                 if !matches!(status, SubmitStatus::Streaming | SubmitStatus::Redirected) {
-                    return Ok(());
+                    // A successful RPC with an unknown/missing `status`
+                    // leaves the turn's state unknown: publish NO row (the
+                    // rebuild path owns the truth) and return a stable error
+                    // so the caller surfaces the failure instead of silently
+                    // swallowing the user's message (PR #10 finding 1).
+                    return Err(CoreError::UnexpectedStatus);
                 }
                 // The user row is a transcript change like any other: through
                 // the reducer, out of the state lock, then to the sink (never
                 // a foreign callback under the lock).
                 let (changes, rows, sink) = {
                     let mut state = self.inner.lock();
-                    let changes = state
-                        .sessions
-                        .get_mut(&key)
-                        .map(|l| l.reducer.append_user_row(&key, &text))
-                        .unwrap_or_default();
+                    let changes = match state.sessions.get_mut(&key) {
+                        // A rebuild re-ingested this session while the submit
+                        // RPC was in flight: the server-rebuilt history
+                        // already contains the user's message — appending
+                        // would duplicate the row (PR #10 finding 2). The
+                        // submit still succeeded; skip the append.
+                        Some(live) if live.history_epoch == history_epoch => {
+                            live.reducer.append_user_row(&key, &text)
+                        }
+                        _ => Vec::new(),
+                    };
                     let rows = state
                         .sessions
                         .get(&key)
@@ -1311,32 +1350,14 @@ impl HermesCore {
                 !replay.epoch.is_empty() && !record.replay_epoch.is_empty()
                     && replay.epoch != record.replay_epoch;
             if replay.truncated || stored_epoch_changed || replay_epoch_changed {
-                // Rebuild ONLY this session from the resume messages.
-                let changes = {
-                    let mut state = self.inner.lock();
-                    let Some(live) = state.sessions.get_mut(&key) else {
-                        continue;
-                    };
-                    let changes = live.reducer.ingest_resume_messages(&key, &resumed.messages);
-                    live.last_seen_seq = 0;
-                    let rows = live.reducer.transcript().rows.clone();
-                    drop(state);
-                    // Registry write in its own scope (the live borrow is gone).
-                    {
-                        let mut state = self.inner.lock();
-                        if let Some(rec) = state.registry.get_mut(&key) {
-                            rec.last_seen_seq = 0;
-                            if !replay.epoch.is_empty() {
-                                rec.replay_epoch = replay.epoch.clone();
-                            }
-                        }
-                    }
-                    changes
-                        .into_iter()
-                        // Durable key, not `c.key` (see deliver_event).
-                        .map(|c| change_to_dto(&key, &c.change, &rows))
-                        .collect::<Vec<_>>()
-                };
+                // Rebuild ONLY this session from the resume messages (the
+                // single rebuild path, shared with the submit/resume race
+                // guard in `send`).
+                let changes = self.rebuild_session(
+                    &key,
+                    &resumed.messages,
+                    Some(replay.epoch.as_str()).filter(|e| !e.is_empty()),
+                );
                 for change in changes {
                     sink.on_transcript(change);
                 }
@@ -1358,6 +1379,43 @@ impl HermesCore {
             }
         }
         self.reemit_approvals(client, sink).await;
+    }
+
+    /// Rebuild ONE session's transcript from resume history — the single
+    /// rebuild path (PR #10 finding 2): `ingest_resume_messages` (Reset +
+    /// one `RowAppended` per rebuilt row), a bumped per-session history
+    /// epoch (the re-check `send` uses to skip its append when a rebuild
+    /// raced the submit), the watermark reset and the registry refresh.
+    /// Returns the DTOs the sink must receive; the caller delivers them
+    /// (never a foreign callback under the lock). `replay_epoch` (when
+    /// present) is recorded so the next reconnect's epoch comparison sees it.
+    fn rebuild_session(
+        &self,
+        key: &str,
+        messages: &[Value],
+        replay_epoch: Option<&str>,
+    ) -> Vec<TranscriptChangeDto> {
+        let mut state = self.inner.lock();
+        state.history_epoch += 1;
+        let epoch = state.history_epoch;
+        let Some(live) = state.sessions.get_mut(key) else {
+            return Vec::new();
+        };
+        live.history_epoch = epoch;
+        let changes = live.reducer.ingest_resume_messages(key, messages);
+        live.last_seen_seq = 0;
+        let rows = live.reducer.transcript().rows.clone();
+        if let Some(rec) = state.registry.get_mut(key) {
+            rec.last_seen_seq = 0;
+            if let Some(epoch) = replay_epoch {
+                rec.replay_epoch = epoch.to_string();
+            }
+        }
+        changes
+            .into_iter()
+            // Durable key, not `c.key` (see deliver_event).
+            .map(|c| change_to_dto(key, &c.change, &rows))
+            .collect()
     }
 
     /// Re-point a session's live sid after a resume (the sid_index is what
@@ -1709,12 +1767,15 @@ mod tests {
     /// `open_session` that matters for routing) and return its durable key.
     fn attach_session(core: &HermesCore, durable_key: &str, live_sid: &str) {
         let mut state = core.inner.lock();
+        state.history_epoch += 1;
+        let epoch = state.history_epoch;
         state.sessions.insert(
             durable_key.to_string(),
             LiveSession {
                 live_sid: live_sid.to_string(),
                 reducer: Reducer::new(),
                 last_seen_seq: 0,
+                history_epoch: epoch,
             },
         );
         state.sid_index.insert(live_sid.to_string(), durable_key.to_string());
@@ -2201,5 +2262,157 @@ mod tests {
                 .unwrap_or_default()
         };
         assert!(rows.is_empty(), "the reducer holds no row after a failed submit");
+    }
+
+    /// Rule pinned (PR #10 blocking 1): a SUCCESSFUL `prompt.submit` whose
+    /// `status` is unknown or missing must surface as an error, not a silent
+    /// `Ok(())` — with the app-side echo removed, silence swallows the user's
+    /// message (no row anywhere, no error surface). Both halves are pinned on
+    /// the WIRE (the fake gateway answers the real RPC): the call fails AND
+    /// no row is published (the turn's state is unknown, so no row may be
+    /// invented). The parser test in `api.rs` only proves `{}`/`5` parse to
+    /// `Other`; it says nothing about what `send` does with it.
+    #[tokio::test]
+    async fn send_errors_and_publishes_no_row_on_an_unknown_submit_status() {
+        for (tag, reply) in [
+            ("missing", json!({})),
+            ("unknown", json!({"status": "from-the-future"})),
+        ] {
+            let dir = temp_dir(&format!("send-unknown-status-{tag}"));
+            let reply = reply.clone();
+            let gw = FakeGw::spawn(move |method, _params| {
+                let reply = reply.clone();
+                async move {
+                    match method.as_str() {
+                        "prompt.submit" => Ok(reply),
+                        _ => Ok(json!({})),
+                    }
+                }
+            });
+            let (core, sink) = connected_core(&dir, &gw).await;
+            attach_session(&core, "stored-alpha", "live-A");
+
+            let result = core
+                .clone()
+                .send("stored-alpha".to_string(), "swallowed".to_string())
+                .await;
+            assert!(
+                matches!(result, Err(CoreError::UnexpectedStatus)),
+                "[{tag}] an unknown submit status must surface as UnexpectedStatus, got {result:?}"
+            );
+            assert!(
+                sink.transcript().is_empty(),
+                "[{tag}] no row is published for an unknown status: {:?}",
+                sink.transcript()
+            );
+            let rows = {
+                let state = core.inner.lock();
+                state
+                    .sessions
+                    .get("stored-alpha")
+                    .map(|l| l.reducer.transcript().rows.clone())
+                    .unwrap_or_default()
+            };
+            assert!(
+                rows.is_empty(),
+                "[{tag}] the reducer holds no row for an unknown status"
+            );
+        }
+    }
+
+    /// Rule pinned (PR #10 blocking 2): a resume rebuild that lands between
+    /// the successful `prompt.submit` and the state-lock acquisition must NOT
+    /// duplicate the user's row. The window is real: the submit RPC is
+    /// awaited OUTSIDE the lock, and `resume_all` re-ingests the session
+    /// (truncated replay / changed epoch) over the SAME connection — so the
+    /// server-rebuilt history already contains the submitted text, and a
+    /// blind `append_user_row` would add it a second time (this layer exists
+    /// because of a row duplicate; close the class here).
+    ///
+    /// The fake gateway's `prompt.submit` handler performs the rebuild —
+    /// through the exact primitive `resume_all`'s rebuild branch uses — while
+    /// `send` is awaiting that very reply, then answers `streaming`. That is
+    /// a true interleaving of the race window (the rebuild strictly between
+    /// the submit wire round trip and the post-submit lock acquisition), not
+    /// a re-creation of it.
+    #[tokio::test]
+    async fn send_does_not_duplicate_the_user_row_when_a_rebuild_races_the_submit() {
+        let dir = temp_dir("send-rebuild-race");
+        // The core does not exist when the gateway is spawned; the handler
+        // picks it up from this cell once `connected_core` has built it (the
+        // handler only runs for a `prompt.submit`, long after that). Shared
+        // through an `Arc`: `OnceLock::clone` would hand the handler an
+        // empty COPY of the cell, not the same one.
+        let core_cell: Arc<std::sync::OnceLock<Arc<HermesCore>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let gw = {
+            let cell = Arc::clone(&core_cell);
+            FakeGw::spawn(move |method, _params| {
+                let cell = cell.clone();
+                async move {
+                    match method.as_str() {
+                        "prompt.submit" => {
+                            // The interleaving under test: while `send` is
+                            // awaiting THIS reply, the resume path rebuilds
+                            // the session from the server history — which
+                            // already contains the submitted message. The
+                            // rebuild goes through the PRODUCTION path
+                            // (`rebuild_session`, the helper `resume_all`'s
+                            // rebuild branch uses), so the guard is
+                            // exercised against the shipping code, not a
+                            // re-creation of it.
+                            if let Some(core) = cell.get().cloned() {
+                                let messages =
+                                    vec![json!({"role": "user", "text": "raced text"})];
+                                let sink = core.inner.lock().sink.clone();
+                                let dtos = core.rebuild_session("stored-alpha", &messages, None);
+                                if let Some(sink) = sink {
+                                    for dto in dtos {
+                                        sink.on_transcript(dto);
+                                    }
+                                }
+                            }
+                            Ok(json!({"status": "streaming"}))
+                        }
+                        _ => Ok(json!({})),
+                    }
+                }
+            })
+        };
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+        core_cell.set(core.clone()).ok().expect("core registered once");
+        core.clone()
+            .send("stored-alpha".to_string(), "raced text".to_string())
+            .await
+            .expect("the submit itself succeeded");
+
+        // Exactly ONE user row survives: the rebuild's. The pre-fix code
+        // appended a second one after the rebuilt history already carried
+        // the message — the duplicate this test exists to kill.
+        let rows = {
+            let state = core.inner.lock();
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.transcript().rows.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "the raced rebuild must not duplicate the user row: {:?}",
+            rows
+        );
+        let user_deliveries = sink
+            .transcript()
+            .iter()
+            .filter(|c| c.row_json.contains("\"kind\":\"user\""))
+            .count();
+        assert_eq!(
+            user_deliveries, 1,
+            "the user text is delivered exactly once across the race: {:?}",
+            sink.transcript()
+        );
     }
 }

@@ -164,6 +164,14 @@ impl Reducer {
     /// truncated replay or changed epoch the transcript is rebuilt from the
     /// resume `messages`). Takes the key it belongs to; emits exactly one
     /// [`TranscriptChange::Reset`] for that key.
+    ///
+    /// NOTE (PR #10 nit): this method has NO production caller — the shipping
+    /// rebuild path is [`Reducer::ingest_resume_messages`], which emits one
+    /// Reset plus one `RowAppended` per rebuilt row (the change stream is the
+    /// single source of rows). The single-`Reset` contract here is still
+    /// coherent for a wipe-WITHOUT-rebuild site (clear the transcript and let
+    /// the following events repaint it); do not "fix" it into the ingest
+    /// shape.
     pub fn reset_from_resume(&mut self, key: &str) -> Vec<SessionChange> {
         self.state = Transcript::default();
         self.streaming = None;
@@ -1157,12 +1165,14 @@ mod tests {
             let dto = crate::core::change_to_dto("s-resume", &change.change, &rebuilt);
             assert_eq!(dto.index as usize, i);
             assert!(!dto.row_json.is_empty(), "row {} must render its row_json", i);
-            assert_eq!(
-                dto.row_json,
-                crate::core::change_to_dto("s-resume", &TranscriptChange::RowAppended { index: i }, &rebuilt).row_json,
-                "row_json renders the rebuilt row at the same index"
-            );
         }
+        // Expected-JSON assertion on the FIRST rebuilt row (PR #10 nit: the
+        // previous assertion compared `change_to_dto` against ITSELF at the
+        // same index and could only pass). Row 0 of the rebuilt history is
+        // the user message "hi there"; its delivered payload must be exactly
+        // the serialized user row — nothing else can pass.
+        let first = crate::core::change_to_dto("s-resume", &changes[1].change, &rebuilt);
+        assert_eq!(first.row_json, r#"{"kind":"user","text":"hi there"}"#);
         let t = r.transcript();
         // Non-object entries are skipped, the four objects become rows in
         // list order: user, assistant, tool, assistant.
