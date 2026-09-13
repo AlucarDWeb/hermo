@@ -87,4 +87,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (text.isBlank()) return
         viewModelScope.launch { repo.send(text) }
     }
+
+    /** The composer's Stop (Desktop parity): interrupt the running turn. */
+    fun interrupt(key: String) {
+        viewModelScope.launch { repo.interrupt(key) }
+    }
 }

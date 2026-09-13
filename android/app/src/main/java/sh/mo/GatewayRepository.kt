@@ -214,7 +214,8 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         if (summary != null) {
             val model = headerModelOf(summary.headerJson) ?: ""
             val s = _sessions.value[key] ?: SessionUiState(key = key)
-            _sessions.value = _sessions.value + (key to s.copy(title = summary.title, model = model))
+            _sessions.value = _sessions.value +
+                (key to s.copy(title = summary.title, model = model, running = summary.running))
             if (_currentKey.value == null) _currentKey.value = key
             // A header that lands after Ready must reach the screen.
             if (model.isNotEmpty()) {
@@ -267,6 +268,15 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             applyError(t)
             false
         }
+    }
+
+    /** Interrupt the session's running turn (the composer's Stop). */
+    suspend fun interrupt(key: String): Boolean = try {
+        core.interrupt(key)
+        true
+    } catch (t: Throwable) {
+        applyError(t)
+        false
     }
 
     suspend fun appDidForeground() {

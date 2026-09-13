@@ -29,6 +29,8 @@ data class SessionUiState(
     val title: String = "",
     val model: String = "",
     val rows: List<String> = emptyList(),
+    /** True while the session's turn is streaming (SessionSummary.running). */
+    val running: Boolean = false,
 ) {
     fun withRows(rows: List<String>) = copy(rows = rows)
 }

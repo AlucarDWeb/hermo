@@ -21,14 +21,26 @@ sealed interface ChatRow {
         val text: String,
         val streaming: Boolean = false,
         val warning: String = "",
+        /** Compact JSON `usage` of `message.complete` (untyped, PLAN §3). */
+        val usageJson: String = "",
     ) : ChatRow
     data class Thinking(override val id: Int, val text: String) : ChatRow
+
+    /**
+     * Tool card (T8): `args`/`result` cross as compact JSON strings (PLAN §3),
+     * so the pretty-printing and the inline-diff extraction stay APP-side —
+     * the UI is the formatter, never the core.
+     */
     data class Tool(
         override val id: Int,
         val name: String,
         val complete: Boolean,
         val context: String,
-        val durationS: Double,
+        val argsJson: String = "",
+        val resultJson: String = "",
+        val inlineDiff: String = "",
+        val durationS: Double = 0.0,
+        val exitCode: Int? = null,
     ) : ChatRow
     data class Approval(
         override val id: Int,
@@ -65,6 +77,7 @@ fun parseChatRow(id: Int, rowJson: String): ChatRow {
             obj.optString("text"),
             streaming = obj.optBoolean("streaming"),
             warning = obj.optString("warning"),
+            usageJson = obj.optStringOrNull("usage") ?: "",
         )
         "thinking" -> ChatRow.Thinking(id, obj.optString("text"))
         "tool" -> ChatRow.Tool(
@@ -72,7 +85,11 @@ fun parseChatRow(id: Int, rowJson: String): ChatRow {
             name = obj.optString("name"),
             complete = obj.optBoolean("complete"),
             context = obj.optString("context"),
+            argsJson = obj.optString("args"),
+            resultJson = obj.optString("result"),
+            inlineDiff = inlineDiffOf(obj),
             durationS = obj.optDouble("duration_s", 0.0),
+            exitCode = obj.optInt("exit_code", 0).takeIf { obj.has("exit_code") && it != 0 },
         )
         "approval" -> ChatRow.Approval(
             id,
@@ -93,3 +110,22 @@ fun parseChatRow(id: Int, rowJson: String): ChatRow {
         else -> ChatRow.Status(id, obj.optString("kind"), "")
     }
 }
+
+/**
+ * Desktop's `inlineDiffFromResult` (tool/fallback-model/index.ts): the diff
+ * hides under `inline_diff` or `diff`, either at the top level or inside the
+ * result object — take the first non-empty string. Never throws.
+ */
+private fun inlineDiffOf(obj: org.json.JSONObject): String {
+    val result = obj.optJSONObject("result")
+    val sources = listOfNotNull(
+        obj.optStringOrNull("inline_diff"),
+        obj.optStringOrNull("diff"),
+        result?.optStringOrNull("inline_diff"),
+        result?.optStringOrNull("diff"),
+    )
+    return sources.firstOrNull { it.isNotBlank() } ?: ""
+}
+
+private fun org.json.JSONObject.optStringOrNull(key: String): String? =
+    if (has(key) && !isNull(key)) optString(key) else null
