@@ -205,6 +205,7 @@ TEST_CLASSES = [
     "TranscriptStateTest",
     "MarkdownBlocksTest",
     "SessionKeyResolutionTest",
+    "ToolCardModelTest",
 ]
 
 [
@@ -239,6 +240,7 @@ kt_jvm_library(
         "src/main/java/sh/mo/TranscriptState.kt",
         "src/main/java/sh/mo/ChatRow.kt",
         "src/main/java/sh/mo/MarkdownBlocks.kt",
+        "src/main/java/sh/mo/ToolCardModel.kt",
     ],
     deps = ["@maven//:org_json_json"],
 )

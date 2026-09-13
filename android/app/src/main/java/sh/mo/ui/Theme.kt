@@ -6,6 +6,7 @@ import androidx.compose.material3.Typography
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
@@ -19,101 +20,150 @@ import androidx.compose.ui.unit.sp
  * DESIGN.md "Stroke & color tokens" / "Surfaces & elevation" / "Chat, tools &
  * boot surfaces"), mirrored into Compose with the DESKTOP TOKEN NAMES KEPT so
  * the mapping is auditable line by line. No colour, radius or spacing here is
- * invented: every value is the Desktop token's resolved light-theme value
- * (`--dt-*` / `--ui-*` / `--theme-*`), with the alpha-carrying text and stroke
- * tokens expressed as Colour(alpha=…) over the same base the CSS mixes over.
+ * invented: every value is a Desktop token's resolved value (`--dt-*` /
+ * `--ui-*` / `--theme-*`), computed from the same `color-mix()` chains the CSS
+ * runs (T7 divergence 1: BOTH modes now exist).
  *
- * Not reproducible on the phone (stated, not silently dropped): the desktop's
- * translucent "window glass" chrome (backdrop blur), hover-only fills
- * (`--chrome-action-hover`), and theme skins — the phone port pins the
- * default light theme's resolved values (dark-theme mirrors land with the
- * desktop dark review; `isSystemInDarkTheme` currently maps to the same
- * tokens, as the desktop's default install does until a skin is chosen).
+ * Light set — the default `:root` values (T7a's, unchanged):
+ *   nous skin light seeds: bg #ffffff, fg #1f2328, card #f6f8fa, popover #fff,
+ *   primary #0053fd … over neutral-chrome #f3f3f3 / neutral-card #fcfcfc.
+ * Dark set — the `:root.dark` chain over the nous skin's darkColors
+ *   (themes/presets.ts `nousTheme.darkColors`: bg #0d1117, fg #e6edf3,
+ *   card #010409, popover #161b22, primary #4a84fe, …, neutral-chrome
+ *   #0d0d0e, neutral-card #161618):
+ *   chrome      = mix(bg 74%, neutral-chrome)            #0d1015
+ *   editor      = mix(card 38%, neutral-card)            #0e0f12
+ *   elevated    = mix(popover 46%, neutral-card)         #16181d
+ *   widget      = mix(editor 88%, #000)  (the .dark override)
+ *   tertiary    = accent 8% + base 5% over chrome        #1c2332
+ *   quaternary  = accent 5% + base 4% over chrome        #191e29
+ *   strokeSec   = accent 16% + base 7% over chrome       #232f48
+ *   strokeTert  = accent 10% + base 5% over chrome       #1d2636
+ *   strokeQuat  = accent 6% + base 3% over chrome        #171e2a
+ *   secondary   = accent 7% over chrome                  #111825
+ *   accentSoft  = accent 10% over chrome                 #131c2c
+ *   destructive #f85149 (darkColors), onPrimary/primary-foreground #161616
+ *     and the LOUD primary: `ensureContrast(primary, #fcfcfc, 4.5)` → #2369fe.
+ *
+ * Which mode paints: Desktop resolves light/dark from the user's choice with
+ * `system` as the default — the phone's equivalent is `isSystemInDarkTheme()`
+ * (T7 divergence 1). Not reproducible on the phone (stated, not silently
+ * dropped): the translucent "window glass" chrome (backdrop blur), hover-only
+ * fills (`--chrome-action-hover`), and theme skins — the phone pins the
+ * default `nous` skin's resolved values for the mode it paints.
  */
 
-// ── theme seeds (styles.css :root, lines 174-199) ────────────────────────
-// --theme-primary: #0053fd; --theme-foreground: #17171a;
-// --theme-neutral-chrome: #f3f3f3; --theme-background-seed: #f8faff;
-// --theme-neutral-card: #fcfcfc; --theme-card-seed: #ffffff.
-private val Accent = Color(0xFF0053FD)          // --theme-primary
-private val Base = Color(0xFF17171A)            // --theme-foreground (mix base)
-private val White = Color(0xFFFFFFFF)
+// ── light seeds (styles.css :root lines 172-200; nous light, presets 178-204) ─
+private object LightTokens : HermoTokens {
+    override val background = Color(0xFFF8F9FE)      // --ui-bg-chrome (bg 92% / #f3f3f3)
+    override val surface = Color(0xFFFDFDFD)         // --ui-bg-editor (card 22% / #fcfcfc)
+    override val elevated = Color(0xFFFDFDFD)        // --ui-bg-elevated (popover 28% / #fcfcfc)
+    override val widgetSurface = surface             // --ui-widget-surface-background (light)
+    override val midground = Color(0xFF0053FD)       // --theme-midground / --ui-accent
+    override val primary = Color(0xFF0053FD)         // --theme-primary / --dt-primary
+    override val primarySolid = Color(0xFF0053FD)    // accent deep enough for #fcfcfc already
+    override val onPrimary = Color(0xFFFCFCFC)       // --dt-primary-foreground
+    override val secondary = Color(0xFFEDF3FF)       // --theme-secondary (accent 7% over surface)
+    override val onSecondary = Color(0xFF2B2F37)
+    override val accent = Color(0xFFE6EEFF)          // --theme-accent-soft (accent 10% over surface)
+    override val softFill = Color(0xFFEAEFF6)        // --ui-bg-quaternary (accent 5% + base 4%)
+    override val muted = Color(0xFFE0E6F5)           // --ui-bg-tertiary (accent 8% + base 5%)
+    override val border = Color(0xFFC9D6F1)          // --ui-stroke-secondary / --dt-border
+    override val strokeTertiary = Color(0xFFDBE3F5)  // --ui-stroke-tertiary
+    override val strokeQuaternary = Color(0xFFE9EEF8)
+    override val text = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.94f) } // --ui-text-primary
+    override val textSecondary = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.74f) }
+    override val textTertiary = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.54f) }
+    override val scaffoldText = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.64f) } // --conversation-scaffold-text
+    override val scaffoldMeta = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.44f) } // --conversation-scaffold-meta
+    override val destructive = Color(0xFFCF2D56)     // --dt-destructive (--ui-red)
+    override val onDestructive = Color(0xFFFFFFFF)
+    override val monoFont: FontFamily = FontFamily.Monospace
+}
 
-// Resolved mixes (the CSS `color-mix(in srgb, seed X%, neutral)` values,
-// computed, not eyeballed):
-private val SurfaceChrome = Color(0xFFF8F9FE)   // --ui-bg-chrome / --color-background
-private val CardEditor = Color(0xFFFDFDFD)      // --ui-bg-editor / --color-card / surface
-private val BgElevated = Color(0xFFFDFDFD)      // --ui-bg-elevated
-private val BgTertiary = Color(0xFFDFE6F3)      // --ui-bg-tertiary / --color-muted
-private val BgQuaternary = Color(0xFFE9EDF6)    // --ui-bg-quaternary (soft control fill)
-
-// --ui-text-* : color-mix(ui-base N%, transparent) → alpha over the surface.
-private val TextPrimary = Base.copy(alpha = 0.94f)    // --ui-text-primary
-private val TextSecondary = Base.copy(alpha = 0.74f)  // --ui-text-secondary
-private val TextTertiary = Base.copy(alpha = 0.54f)   // --ui-text-tertiary
-private val ScaffoldText = Base.copy(alpha = 0.64f)   // --conversation-scaffold-text
-private val ScaffoldMeta = Base.copy(alpha = 0.44f)   // --conversation-scaffold-meta
-
-// --ui-stroke-* : accent X% + ui-base Y% + transparent → resolved over white.
-private val StrokePrimary = Color(0xFFABBFE8)   // --ui-stroke-primary
-private val StrokeSecondary = Color(0xFFC6D3EF) // --ui-stroke-secondary (--dt-border)
-private val StrokeTertiary = Color(0xFFDAE2F3)  // --ui-stroke-tertiary (transcript hairlines)
-private val StrokeQuaternary = Color(0xFFE9EEF8)
-
-private val Destructive = Color(0xFFCF2D56)     // --dt-destructive
-private val DestructiveForeground = Color(0xFFFFFFFF)
-private val PrimaryForeground = Color(0xFFFCFCFC) // --dt-primary-foreground
-private val Secondary = Color(0xFFEDF3FF)       // --theme-secondary (accent 7% white)
-private val SecondaryForeground = TextSecondary
-private val AccentSoft = Color(0xFFE6EEFF)      // --theme-accent-soft (accent 10% white)
-private val WidgetSurface = CardEditor          // --ui-widget-surface-background
+// ── dark seeds (styles.css :root.dark lines 550-580; nous dark, presets 206-237) ─
+private object DarkTokens : HermoTokens {
+    override val background = Color(0xFF0D1015)      // --ui-bg-chrome (bg 74% / #0d0d0e)
+    override val surface = Color(0xFF0E0F12)         // --ui-bg-editor (card 38% / #161618)
+    override val elevated = Color(0xFF16181D)        // --ui-bg-elevated (popover 46% / #161618)
+    override val widgetSurface = Color(0xFF0C0D10)   // .dark: editor 88% / #000
+    override val midground = Color(0xFF4A84FE)       // darkColors.midground / --ui-accent
+    override val primary = Color(0xFF4A84FE)
+    override val primarySolid = Color(0xFF2369FE)    // ensureContrast(primary, #fcfcfc, 4.5)
+    override val onPrimary = Color(0xFF161616)       // darkColors.primaryForeground
+    override val secondary = Color(0xFF111825)       // accent 7% over chrome (darkColors.secondary at rest)
+    override val onSecondary = Color(0xFFE6EDF3)
+    override val accent = Color(0xFF131C2C)          // accent 10% over chrome
+    override val softFill = Color(0xFF191E29)        // --ui-bg-quaternary (accent 5% + base 4%)
+    override val muted = Color(0xFF1C2332)           // --ui-bg-tertiary (accent 8% + base 5%)
+    override val border = Color(0xFF232F48)          // --ui-stroke-secondary / --dt-border
+    override val strokeTertiary = Color(0xFF1D2636)  // --ui-stroke-tertiary
+    override val strokeQuaternary = Color(0xFF171E2A)
+    override val text = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.94f) }
+    override val textSecondary = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.74f) }
+    override val textTertiary = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.54f) }
+    override val scaffoldText = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.64f) }
+    override val scaffoldMeta = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.44f) }
+    override val destructive = Color(0xFFF85149)     // darkColors.destructive (--ui-red dark)
+    override val onDestructive = Color(0xFFFFFFFF)
+    override val monoFont: FontFamily = FontFamily.Monospace
+}
 
 /**
  * The Desktop token surface, under its own names. Compose code reads
  * `HermoTheme.tokens` and never a bare Material color, so a Desktop token
- * greps to exactly one definition here.
+ * greps to exactly one definition here. An interface over two sealed
+ * objects keeps both token sets TOTAL and immutable.
  */
-data class HermoTokens(
+interface HermoTokens {
     // Stroke & color tokens (DESIGN.md table, verbatim names).
-    val surface: Color = CardEditor,          // --ui-bg-editor: the chat surface
-    val background: Color = SurfaceChrome,    // --ui-bg-chrome
-    val elevated: Color = BgElevated,         // --ui-bg-elevated
-    val midground: Color = Accent,            // --theme-midground / --ui-accent
-    val border: Color = StrokeSecondary,      // --dt-border
-    val strokeTertiary: Color = StrokeTertiary, // transcript hairlines/fences
-    val strokeQuaternary: Color = StrokeQuaternary,
-    val text: Color = TextPrimary,            // --ui-text-primary
-    val textSecondary: Color = TextSecondary, // --ui-text-secondary
-    val textTertiary: Color = TextTertiary,   // --ui-text-tertiary
-    val scaffoldText: Color = ScaffoldText,   // --conversation-scaffold-text
-    val scaffoldMeta: Color = ScaffoldMeta,   // --conversation-scaffold-meta
-    val primary: Color = Accent,              // --theme-primary / --dt-primary
-    val onPrimary: Color = PrimaryForeground, // --dt-primary-foreground
-    val softFill: Color = BgQuaternary,       // --ui-bg-quaternary (secondary button)
-    val widgetSurface: Color = WidgetSurface, // --ui-widget-surface-background
-    val secondary: Color = Secondary,         // --theme-secondary
-    val onSecondary: Color = SecondaryForeground,
-    val accent: Color = AccentSoft,           // --theme-accent-soft
-    val destructive: Color = Destructive,     // --dt-destructive
-    val onDestructive: Color = DestructiveForeground,
-    // Conversation typography/spacing knobs (styles.css 474-496).
-    val convFontSize: Float = 13f,            // --conversation-text-font-size: 0.8125rem
-    val convToolFontSize: Float = 11f,        // --conversation-tool-font-size: 0.6875rem
-    val convLineHeight: Float = 18f,          // --conversation-line-height: 1.125rem
-    val turnGapDp: Float = 6f,                // --conversation-turn-gap: 0.375rem
-    val turnBlockGapDp: Float = 12f,          // --turn-block-gap: 0.75rem
-    val paragraphGapDp: Float = 11.2f,        // --paragraph-gap: 0.7rem
-    val messageIndentDp: Float = 12f,         // --message-text-indent: 0.75rem
-    val radiusSm: Float = 1.6f,               // --radius-sm  (scalar 0.2 × rem×16)
-    val radiusMd: Float = 2f,                 // --radius-md
-    val radiusLg: Float = 2.4f,               // --radius-lg (the composer shell)
-    val radiusXl: Float = 3.2f,               // --radius-xl
-    val radius2xl: Float = 4.8f,              // --radius-2xl
-    val radius3xl: Float = 6.4f,              // --radius-3xl (widget shell)
-    val radius4xl: Float = 8f,                // --radius-4xl
-)
+    val surface: Color          // --ui-bg-editor: the chat surface
+    val background: Color       // --ui-bg-chrome
+    val elevated: Color         // --ui-bg-elevated
+    val widgetSurface: Color    // --ui-widget-surface-background
+    val midground: Color        // --theme-midground / --ui-accent
+    val primary: Color          // --theme-primary / --dt-primary
+    val primarySolid: Color     // --dt-primary-solid (the loud fill)
+    val onPrimary: Color        // --dt-primary-foreground
+    val secondary: Color        // --theme-secondary
+    val onSecondary: Color
+    val accent: Color           // --theme-accent-soft
+    val softFill: Color         // --ui-bg-quaternary (secondary button)
+    val muted: Color            // --ui-bg-tertiary / --color-muted
+    val border: Color           // --ui-stroke-secondary / --dt-border
+    val strokeTertiary: Color   // transcript hairlines/fences
+    val strokeQuaternary: Color
+    val text: Color             // --ui-text-primary
+    val textSecondary: Color    // --ui-text-secondary
+    val textTertiary: Color     // --ui-text-tertiary
+    val scaffoldText: Color     // --conversation-scaffold-text
+    val scaffoldMeta: Color     // --conversation-scaffold-meta
+    val destructive: Color      // --dt-destructive
+    val onDestructive: Color
 
-val LocalHermoTokens = staticCompositionLocalOf { HermoTokens() }
+    /** The chat surface's `--font-mono` (T7 divergence 2: mirrored, not
+     *  hardcoded — the platform's mono face stands in for Menlo/Monaco/SF Mono). */
+    val monoFont: FontFamily
+
+    // Conversation typography/spacing knobs (styles.css 474-496).
+    val convFontSize: Float get() = 13f         // --conversation-text-font-size: 0.8125rem
+    val convToolFontSize: Float get() = 11f     // --conversation-tool-font-size: 0.6875rem
+    val convLineHeight: Float get() = 18f       // --conversation-line-height: 1.125rem
+    val turnGapDp: Float get() = 6f             // --conversation-turn-gap: 0.375rem
+    val turnBlockGapDp: Float get() = 12f       // --turn-block-gap: 0.75rem
+    val scaffoldBlockGapDp: Float get() = 4f    // --scaffold-block-gap: turn-block-gap/3
+    val paragraphGapDp: Float get() = 11.2f     // --paragraph-gap: 0.7rem
+    val messageIndentDp: Float get() = 12f      // --message-text-indent: 0.75rem
+    val radiusSm: Float get() = 1.6f            // --radius-sm  (scalar 0.2 × rem×16)
+    val radiusMd: Float get() = 2f              // --radius-md
+    val radiusLg: Float get() = 2.4f            // --radius-lg (the composer shell)
+    val radiusXl: Float get() = 3.2f            // --radius-xl
+    val radius2xl: Float get() = 4.8f           // --radius-2xl
+    val radius3xl: Float get() = 6.4f           // --radius-3xl (widget shell)
+    val radius4xl: Float get() = 8f             // --radius-4xl
+}
+
+val LocalHermoTokens = staticCompositionLocalOf<HermoTokens> { LightTokens }
 
 /** --font-sans / --font-mono resolved to platform families (system faces). */
 val LocalFonts = staticCompositionLocalOf { Fonts(sans = FontFamily.SansSerif, mono = FontFamily.Monospace) }
@@ -139,26 +189,29 @@ private fun hermoColorScheme(t: HermoTokens): ColorScheme =
         onBackground = t.text,
         surface = t.surface,
         onSurface = t.text,
-        surfaceVariant = BgTertiary,
+        surfaceVariant = t.muted,
         onSurfaceVariant = t.textSecondary,
         surfaceTint = t.surface,
-        inverseSurface = Base,
-        inverseOnSurface = White,
+        inverseSurface = t.text,
+        inverseOnSurface = t.surface,
         error = t.destructive,
         onError = t.onDestructive,
         errorContainer = t.destructive.copy(alpha = 0.12f),
         onErrorContainer = t.destructive,
         outline = t.border,
         outlineVariant = t.strokeTertiary,
-        scrim = Base.copy(alpha = 0.5f),
+        scrim = Color.Black.copy(alpha = 0.5f),
         surfaceBright = t.elevated,
         surfaceDim = t.background,
         surfaceContainer = t.elevated,
         surfaceContainerHigh = t.elevated,
         surfaceContainerHighest = t.elevated,
         surfaceContainerLow = t.surface,
-        surfaceContainerLowest = White,
+        surfaceContainerLowest = if (t.background.luminanceCompat() > 0.5f) Color.White else t.surface,
     )
+
+private fun Color.luminanceCompat(): Float =
+    0.2126f * red + 0.7152f * green + 0.0722f * blue
 
 /** --dt-base-size 1rem / --dt-line-height 1.5; conversation sizes per token. */
 private fun hermoTypography(t: HermoTokens, fonts: Fonts): Typography = Typography(
@@ -170,10 +223,11 @@ private fun hermoTypography(t: HermoTokens, fonts: Fonts): Typography = Typograp
 
 @Composable
 fun HermoTheme(content: @Composable () -> Unit) {
-    // Dark: the desktop's own default is light until a skin/theme is chosen;
-    // the tokens are pinned to that default (stated divergence, see header).
-    val tokens = HermoTokens()
-    val fonts = Fonts(sans = FontFamily.SansSerif, mono = FontFamily.Monospace)
+    // Desktop resolves light/dark from the user's choice, defaulting to
+    // `system` (themes/context.tsx resolveMode) — the phone equivalent is the
+    // system dark setting (T7 divergence 1).
+    val tokens = if (isSystemInDarkTheme()) DarkTokens else LightTokens
+    val fonts = Fonts(sans = FontFamily.SansSerif, mono = tokens.monoFont)
     CompositionLocalProvider(LocalHermoTokens provides tokens, LocalFonts provides fonts) {
         MaterialTheme(
             colorScheme = hermoColorScheme(tokens),
