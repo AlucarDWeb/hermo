@@ -71,13 +71,15 @@ private object LightTokens : HermoTokens {
     override val border = Color(0xFFC9D6F1)          // --ui-stroke-secondary / --dt-border
     override val strokeTertiary = Color(0xFFDBE3F5)  // --ui-stroke-tertiary
     override val strokeQuaternary = Color(0xFFE9EEF8)
-    override val text = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.94f) } // --ui-text-primary
-    override val textSecondary = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.74f) }
-    override val textTertiary = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.54f) }
-    override val scaffoldText = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.64f) } // --conversation-scaffold-text
-    override val scaffoldMeta = Color(0xFF17171A).let { Color(it.red, it.green, it.blue, 0.44f) } // --conversation-scaffold-meta
+    override val text = Color(0xFF17171A).copy(alpha = 0.94f)      // --ui-text-primary
+    override val textSecondary = Color(0xFF17171A).copy(alpha = 0.74f)
+    override val textTertiary = Color(0xFF17171A).copy(alpha = 0.54f)
+    override val scaffoldText = Color(0xFF17171A).copy(alpha = 0.64f) // --conversation-scaffold-text
+    override val scaffoldMeta = Color(0xFF17171A).copy(alpha = 0.44f) // --conversation-scaffold-meta
     override val destructive = Color(0xFFCF2D56)     // --dt-destructive (--ui-red)
     override val onDestructive = Color(0xFFFFFFFF)
+    override val userBubble = Color(0xFFDAE7FD)       // presets.ts:203 nousTheme.lightColors.userBubble
+    override val userBubbleBorder = Color(0xFFD0D7DE) // presets.ts:204 nousTheme.lightColors.userBubbleBorder
     override val monoFont: FontFamily = FontFamily.Monospace
 }
 
@@ -99,13 +101,15 @@ private object DarkTokens : HermoTokens {
     override val border = Color(0xFF232F48)          // --ui-stroke-secondary / --dt-border
     override val strokeTertiary = Color(0xFF1D2636)  // --ui-stroke-tertiary
     override val strokeQuaternary = Color(0xFF171E2A)
-    override val text = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.94f) }
-    override val textSecondary = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.74f) }
-    override val textTertiary = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.54f) }
-    override val scaffoldText = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.64f) }
-    override val scaffoldMeta = Color(0xFFE6EDF3).let { Color(it.red, it.green, it.blue, 0.44f) }
+    override val text = Color(0xFFE6EDF3).copy(alpha = 0.94f)
+    override val textSecondary = Color(0xFFE6EDF3).copy(alpha = 0.74f)
+    override val textTertiary = Color(0xFFE6EDF3).copy(alpha = 0.54f)
+    override val scaffoldText = Color(0xFFE6EDF3).copy(alpha = 0.64f)
+    override val scaffoldMeta = Color(0xFFE6EDF3).copy(alpha = 0.44f)
     override val destructive = Color(0xFFF85149)     // darkColors.destructive (--ui-red dark)
     override val onDestructive = Color(0xFFFFFFFF)
+    override val userBubble = Color(0xFF07162C)       // presets.ts:231 nousTheme.darkColors.userBubble
+    override val userBubbleBorder = Color(0xFF30363D) // presets.ts:232 nousTheme.darkColors.userBubbleBorder
     override val monoFont: FontFamily = FontFamily.Monospace
 }
 
@@ -140,6 +144,8 @@ interface HermoTokens {
     val scaffoldMeta: Color     // --conversation-scaffold-meta
     val destructive: Color      // --dt-destructive
     val onDestructive: Color
+    val userBubble: Color       // presets.ts userBubble (nousTheme light/dark)
+    val userBubbleBorder: Color // presets.ts userBubbleBorder (nousTheme light/dark)
 
     /** The chat surface's `--font-mono` (T7 divergence 2: mirrored, not
      *  hardcoded — the platform's mono face stands in for Menlo/Monaco/SF Mono). */

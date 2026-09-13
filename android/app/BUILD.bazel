@@ -206,6 +206,7 @@ TEST_CLASSES = [
     "MarkdownBlocksTest",
     "SessionKeyResolutionTest",
     "ToolCardModelTest",
+    "ThinkingLabelTest",
 ]
 
 [

@@ -36,11 +36,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.os.SystemClock
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.delay
 import sh.mo.ChatRow
 import sh.mo.MarkdownBlock
 import sh.mo.MarkdownBlocks
+import sh.mo.clampForDisplay
+import sh.mo.formatElapsed
 import sh.mo.formatToolDuration
 import sh.mo.technicalTrace
+import sh.mo.stripInlineDiffChrome
 import sh.mo.toolGlyph
 import sh.mo.toolTitle
 import sh.mo.ui.hermoRadius
@@ -214,25 +220,59 @@ internal fun ScaffoldGlyph(glyph: String? = null, tint: androidx.compose.ui.grap
 }
 
 /**
- * Desktop's ThinkingDisclosure (T7 divergence 4): collapsed by default once
- * settled, chevron to the RIGHT of the label, `Thinking` → `Thought` when
- * the block completes, live body with the character count while streaming.
- * The live→settled transition keeps the body mounted (Desktop's latch): a
- * body the reader expanded stays open — nothing jumps when the turn settles.
+ * Desktop's ThinkingDisclosure (message-parts.tsx:130-235): live body while
+ * the block streams, chevron to the RIGHT of the label, and Desktop's
+ * three-way settled label — `Thought` when no duration was measured,
+ * `Thought briefly` when the whole seconds round to 0, `Thought for Xs`
+ * otherwise (message-parts.tsx:165-175, activity-timer.ts formatElapsed).
+ * The live character count is a DECLARED phone-native divergence (the T7b
+ * brief asked for it; Desktop shows a timestamp there, no count) — the
+ * header here names it instead of passing it off as parity.
+ *
+ * Desktop's latch (message-parts.tsx:144-157): once a live preview has been
+ * shown, `sawLivePreview` stays true — the body remains mounted after the
+ * block settles, so nothing jumps when the turn completes. The old phone
+ * code recomputed `wasLive && live` instead of latching, which snapped the
+ * body shut at settle (reviewed on PR #9). Blocks that mount already
+ * complete never latch and stay collapsed, like Desktop's.
  */
 @Composable
 private fun ThinkingRow(text: String) {
     val t = LocalHermoTokens.current
     var userToggledOpen by rememberSaveable(rowIdKey(text)) { mutableStateOf<Boolean?>(null) }
-    // The phone's `pending` signal: the core re-delivers the thinking row as
-    // its text grows; a settled thought never changes again. Character count
-    // is the live marker — pinned at "streamed to completion" once the turn
-    // moves on (the next row arriving is Desktop's `completedAt`).
-    var wasLive by remember { mutableStateOf(false) }
+    // Desktop's `sawLivePreview` latch: set on the first live recomposition,
+    // never cleared — a body seen live stays open after the turn settles.
+    var sawLive by rememberSaveable(rowIdKey(text)) { mutableStateOf(false) }
     val live = rowStreaming
-    if (live) wasLive = true
-    val open = userToggledOpen ?: (wasLive && live)
-    val label = if (live) "Thinking" else "Thought"
+    if (live) sawLive = true
+    // Desktop's showPreview without the collapsed-by-default opt-out
+    // (message-parts.tsx:156): `pending || sawLivePreview` — the latch alone
+    // holds the body open at settle, which `sawLive && live` (the reviewed
+    // bug) never did: the AND re-collapsed the body the moment `live` fell.
+    val open = userToggledOpen ?: (live || sawLive)
+    // The block's measured duration (Desktop's useMeasuredDuration): the core
+    // re-delivers the thinking row as its text grows and the turn's running
+    // flag flips off at settle, so "watched live and now settled" is the
+    // moment the phone can compute its own measured duration — the elapsed
+    // counter from the first live frame to the settle, held for the label.
+    var measuredS by rememberSaveable(rowIdKey(text)) { mutableStateOf<Long?>(null) }
+    if (live) {
+        var firstLiveAt by remember { mutableStateOf<Long?>(null) }
+        val now = SystemClock.elapsedRealtime() / 1000
+        if (firstLiveAt == null) firstLiveAt = now
+        LaunchedEffect(rowIdKey(text)) {
+            while (true) {
+                delay(1000)
+                firstLiveAt?.let { measuredS = SystemClock.elapsedRealtime() / 1000 - it }
+            }
+        }
+    }
+    val label = when {
+        live -> "Thinking"
+        measuredS == null -> "Thought"                       // never watched: Desktop's `thought`
+        measuredS!! < 1 -> "Thought briefly"                 // rounds to 0s: Desktop's `thoughtBriefly`
+        else -> "Thought for ${formatElapsed(measuredS!!)}"  // Desktop's `thoughtFor(formatElapsed(…))`
+    }
 
     Column(
         modifier = Modifier
@@ -242,7 +282,7 @@ private fun ThinkingRow(text: String) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { userToggledOpen = !(userToggledOpen ?: wasLive) }
+                .clickable { userToggledOpen = !(userToggledOpen ?: (live || sawLive)) }
                 .padding(vertical = 1.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -261,8 +301,11 @@ private fun ThinkingRow(text: String) {
             // --disclosure-caret-rest: 0.4 × scaffold fade).
             Chevron(open = open, tint = t.scaffoldMeta.copy(alpha = t.scaffoldMeta.alpha * 0.8f))
             if (live) {
-                // Live character count, Desktop-parity (the brief's "keeping
-                // the live character count").
+                // Live character count — DECLARED phone-native divergence,
+                // not parity: Desktop's trailing slot is TimelineTimestamp +
+                // ActivityTimerText (message-parts.tsx:228-232), no count.
+                // The T7b brief asked for the live count, so the phone keeps
+                // it and this comment says so.
                 Text(
                     text = "${text.length} chars",
                     style = androidx.compose.ui.text.TextStyle(
@@ -393,17 +436,24 @@ private fun ToolCard(row: ChatRow.Tool) {
                     .padding(8.dp),
             ) {
                 if (hasDiff) {
-                    // The inline diff renders verbatim, monospace (Desktop's
-                    // FileDiffPanel without the shiki theme — stated: no
-                    // syntax highlighting on the phone).
+                    // Desktop's FileDiffPanel without the shiki theme —
+                    // stated: no syntax highlighting on the phone. The raw
+                    // diff first goes through Desktop's stripInlineDiffChrome
+                    // (ANSI + the `┊ review diff` header line), so the phone
+                    // never paints chrome the Desktop never shows.
                     Text(
-                        text = row.inlineDiff,
+                        text = stripInlineDiffChrome(row.inlineDiff),
                         style = monoPayload(t),
                         color = t.textSecondary,
                         modifier = Modifier.fillMaxWidth(),
                     )
                 } else {
-                    val trace = technicalTrace(row.argsJson, row.resultJson)
+                    // Desktop clamps the expanded payload with
+                    // clampForDisplay(…, 20 000) (fallback.tsx:185) because
+                    // stacked unclamped tool rows froze its renderer — the
+                    // phone clamps for the same reason (tool results are
+                    // server-capped at ~100 KB each).
+                    val trace = clampForDisplay(technicalTrace(row.argsJson, row.resultJson))
                     if (trace.isNotBlank()) {
                         Text(
                             text = trace,

@@ -234,9 +234,16 @@ private fun StatusStrip(state: SessionUiState, rows: List<ChatRow>) {
     if (state.key.isEmpty()) return
 
     // Elapsed timer: counts while the turn runs, holds the final read once it
-    // settles (Desktop's ActivityTimerText from the turn's origin).
+    // settles (Desktop's ActivityTimerText from the turn's origin). The reset
+    // keys on the session too (review #9 nit): re-keying the LaunchedEffect on
+    // state.key alone cancels the old counter loop on a session switch even
+    // while the new session's turn is not running yet — the old code keyed on
+    // `running` first and the stale count survived the switch.
     var elapsed by remember { mutableStateOf(0L) }
-    LaunchedEffect(state.running, state.key) {
+    LaunchedEffect(state.key) {
+        elapsed = 0
+    }
+    LaunchedEffect(state.key, state.running) {
         if (state.running) {
             elapsed = 0
             while (true) {

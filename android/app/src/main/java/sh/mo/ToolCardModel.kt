@@ -9,7 +9,9 @@ import java.util.Locale
  * here is the Desktop formatter restated, not an invention:
  *
  * - `formatDurationSeconds` (fallback-model/format.ts): <1s → ms, <60s →
- *   `0.5s`/`12s` (one decimal only below 10), then `Xm Ys`/`Xm`.
+ *   `0.5s`/`12s` (one decimal only below 10), then `Xm Ys`/`Xm`, then the
+ *   hours branch `Xh Ym`/`Xh` (format.ts:141-152 — was missing, reviewed on
+ *   PR #9).
  * - `prettyTechnicalValue` + `technicalTrace` (fallback.tsx): a JSON-looking
  *   string is re-printed pretty (`JSON.stringify(…, null, 2)`), everything
  *   else passes through; the trace is `Arguments:\n…\n\nResult:\n…`.
@@ -20,6 +22,13 @@ import java.util.Locale
  * - `usageLabel` (lib/statusbar.tsx usageContextLabel): `~12.3k/200k` with
  *   the `~` only when `context_estimated`, or `N tok` when no context max.
  * - `formatElapsed` (activity-timer.ts): `42s`, then `m:ss`.
+ * - `clampForDisplay` (fallback-model/format.ts): the expanded payload is
+ *   clamped to `MAX_TOOL_RENDER_CHARS` (20 000) with a trailing line saying
+ *   how many characters were omitted — stacked unclamped tool rows froze
+ *   the Desktop renderer, so the phone clamps for the same reason (PR #9).
+ * - `stripInlineDiffChrome` (fallback-model/index.ts): strips ANSI escape
+ *   sequences and the leading `┊ review diff` header line from the raw
+ *   inline diff — the Desktop never shows that chrome (PR #9).
  * - `compactNumber` (lib/format.ts): k/M promotion just under the boundary.
  */
 
@@ -36,7 +45,13 @@ fun formatToolDuration(seconds: Double): String {
     val whole = Math.round(seconds).toInt()
     val minutes = whole / 60
     val rem = whole % 60
-    return if (rem != 0) "${minutes}m ${rem}s" else "${minutes}m"
+    if (minutes < 60) {
+        return if (rem != 0) "${minutes}m ${rem}s" else "${minutes}m"
+    }
+    // format.ts:141-152's hours branch, restated: `1h`, `1h 2m`.
+    val hours = minutes / 60
+    val remMinutes = minutes % 60
+    return if (remMinutes != 0) "${hours}h ${remMinutes}m" else "${hours}h"
 }
 
 /** Desktop's `formatElapsed` — the live turn timer (`42s`, then `1:05`). */
@@ -144,3 +159,31 @@ fun toolTitle(name: String): String =
  * row simply reads as done) and only error/warning get a glyph.
  */
 fun toolStatus(complete: Boolean): String = if (complete) "done" else "running"
+
+/** Desktop's `MAX_TOOL_RENDER_CHARS` (fallback-model/format.ts:70). */
+const val MAX_TOOL_RENDER_CHARS = 20_000
+
+/**
+ * Desktop's `clampForDisplay` (fallback-model/format.ts:72-80): over the cap
+ * the payload is cut to exactly `max` characters and a continuation line
+ * states the omitted count (locale-independent digits — the Desktop uses
+ * `toLocaleString()`, the phone's own display locale is English-only UI).
+ */
+fun clampForDisplay(value: String, max: Int = MAX_TOOL_RENDER_CHARS): String {
+    if (value.length <= max) return value
+    val omitted = value.length - max
+    return "${value.take(max)}\n\n… $omitted more characters truncated — use Copy for the full output."
+}
+
+/**
+ * Desktop's `stripInlineDiffChrome` (fallback-model/index.ts:771-781): the
+ * core's inline diff crosses raw, so the phone strips what Desktop strips —
+ * the ANSI SGR sequences (`ESC [ … m`) and the leading `┊ review diff`
+ * header line (case-insensitive, leading blanks tolerated).
+ */
+fun stripInlineDiffChrome(value: String): String {
+    if (value.isEmpty()) return ""
+    val noAnsi = value.replace(Regex("\u001B\\[[0-9;]*m"), "")
+    val noHeader = noAnsi.replace(Regex("^\\s*┊\\s*review diff\\s*\\n", RegexOption.IGNORE_CASE), "")
+    return noHeader.trim()
+}
