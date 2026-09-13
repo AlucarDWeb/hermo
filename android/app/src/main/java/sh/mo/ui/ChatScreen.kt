@@ -112,7 +112,7 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
             TranscriptList(rows = rows, running = state.running, modifier = Modifier.weight(1f))
             StatusStrip(state = state, rows = rows)
             Composer(
-                model = model.ifEmpty { "unknown" },
+                model = model,
                 running = state.running,
                 onSend = { text -> viewModel.send(text) },
                 onStop = { key?.let { viewModel.interrupt(it) } },
@@ -324,6 +324,14 @@ private fun StatusStrip(state: SessionUiState, rows: List<ChatRow>) {
  * phone there is no `menu` yet, so the row is `[input] [pill] [Send/Stop]`
  * — the model pill is the FIRST control of the cluster (controls.tsx:110),
  * the relocated status-bar pill (model-pill.tsx).
+ *
+ * Width under pressure follows Desktop's stated intent (model-pill.tsx:22-28:
+ * the pill is "the one control in the row that can give width back", over an
+ * `auto_1fr_auto` grid whose `1fr` is the input): the input is weighted 3f
+ * and always fills its three quarters, the pill takes the remaining flexible
+ * quarter (`weight(1f, fill = false)`) clamped to its `max-w-40` cap — so a
+ * long model label ellipsises BEFORE the input is squeezed and the typed
+ * draft keeps the majority of the row.
  */
 private val PLACEHOLDERS = listOf(
     "What are we building?",
@@ -377,7 +385,10 @@ private fun Composer(
             BasicTextField(
                 value = draft,
                 onValueChange = { draft = it },
-                modifier = Modifier.weight(1f),
+                // Desktop's `1fr` input column (index.tsx:1381): weighted so it
+                // keeps the majority of the row; the pill (weighted 1f against
+                // this 3f) is the one that gives width back, not this field.
+                modifier = Modifier.weight(3f),
                 textStyle = androidx.compose.ui.text.TextStyle(
                     fontFamily = LocalFonts.current.sans,
                     fontSize = t.convFontSize.sp,
@@ -406,7 +417,18 @@ private fun Composer(
                     }
                 },
             )
-            ModelPill(model = model)
+            // Desktop shows a quiet spinner until the model resolves
+            // (model-pill.tsx:95-107); the phone has no picker yet, so until
+            // the model lands nothing renders — never invented "unknown" copy.
+            if (model.isNotBlank()) {
+                // weight(1f, fill = false) against the input's 3f: the pill's
+                // flexible quarter is the width it gives back under pressure
+                // (model-pill.tsx:22-28), applied here where the Row scope is.
+                ModelPill(
+                    model = model,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+            }
             Button(
                 onClick = {
                     if (running) {
@@ -436,6 +458,8 @@ private fun Composer(
  * Desktop's ModelPill, relocated (model-pill.tsx 25-28): ghost styling,
  * --ui-text-tertiary, `text-xs` (11sp here), ONE truncating line at
  * `max-w-40` — "the one control in the row that can give width back".
+ * The truncation is real: the pill is weighted against the input (Composer),
+ * so under pressure it ellipsises below the 160dp cap instead of holding it.
  *
  * Divergence, stated: the Desktop pill is the dropdown trigger for the live
  * `model.options` menu; the phone has no model picker yet (a later phase:
@@ -444,7 +468,7 @@ private fun Composer(
  * This is a static label until the picker lands.
  */
 @Composable
-private fun ModelPill(model: String) {
+private fun ModelPill(model: String, modifier: Modifier = Modifier) {
     val t = LocalHermoTokens.current
     Text(
         text = model,
@@ -456,8 +480,10 @@ private fun ModelPill(model: String) {
         color = t.textTertiary,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
-        modifier = Modifier
+        modifier = modifier
+            // The Desktop cap clamps the flexible quota the caller granted:
+            // the pill never exceeds min(its Row share, max-w-40).
             .widthIn(max = t.composerPillMaxWidthDp.dp)
-            .padding(horizontal = 8.dp, vertical = 4.dp), // px-2, h-(--composer-control-size)
+            .padding(horizontal = 8.dp, vertical = 4.dp), // px-2; 4dp vertical ≈ h-(--composer-control-size) on text-xs
     )
 }
