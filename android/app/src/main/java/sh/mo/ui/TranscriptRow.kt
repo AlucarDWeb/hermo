@@ -129,9 +129,9 @@ private fun UserBubble(text: String) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = t.paragraphGapDp.dp)
-            .drawBorder(hermoRadius(t.radiusXl), t.strokeTertiary)
+            .drawBorder(hermoRadius(t.radiusXl), t.userBubbleBorder)
             .clip(hermoRadius(t.radiusXl))
-            .background(t.accent)
+            .background(t.userBubble)
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Text(
