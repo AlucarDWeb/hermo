@@ -36,6 +36,24 @@ data class SessionUiState(
 }
 
 /**
+ * One row of the T11 session picker (the phone sheet over `session.list`):
+ * `RemoteSessionDto` flattened into a pure value the sheet renders. Pure
+ * Kotlin so the JVM suite can pin the title/preview fallbacks.
+ */
+data class RemoteSessionRow(
+    val id: String,
+    val title: String,
+    val preview: String,
+    val messageCount: Long,
+) {
+    /** Titlebar copy: the session's title, or "New session" when unnamed. */
+    val displayTitle: String get() = title.ifBlank { "New session" }
+
+    /** The one-line preview, blank when the session has no text yet. */
+    val displayPreview: String get() = preview.trim()
+}
+
+/**
  * Apply one transcript change to `rows`. `rowJson` is the core's row JSON
  * (empty for RESET). Returns the new list — a pure function, trivially
  * testable.

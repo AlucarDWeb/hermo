@@ -1,26 +1,28 @@
 package sh.mo
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,8 +30,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -38,6 +38,15 @@ import androidx.lifecycle.viewmodel.compose.viewModel
  * Single-activity host (T6b): renders the screen for the current [AppPhase].
  * The phase comes from the view model's flows — the composable never infers
  * a transition. The `hermes://` VIEW intent payload is consumed as pairing.
+ *
+ * T11 lifecycle (decision 3): `onStart` → `repo.appDidForeground()` (the
+ * core's probe ping + reconnect when the socket died in background);
+ * `onStop` is deliberately EMPTY — the server parks the socket 20 s and a
+ * disconnect here would drop a live turn.
+ *
+ * T11 decision 4: while Offline, the network coming back retries the resume
+ * path — one shot per network transition (ConnectivityManager callback), no
+ * polling loop.
  */
 class MainActivity : ComponentActivity() {
 
@@ -49,6 +58,20 @@ class MainActivity : ComponentActivity() {
             // reachable, so this is a message, not a capability cut.
             if (!granted) viewModel.onCameraPermissionDenied()
         }
+
+    /**
+     * Decision 4's reconnect trigger: "the network is usable again" is a
+     * network with a VALIDATED INTERNET capability (mere link-up without it
+     * is a captive portal or a dead Wi-Fi). The guard in the view model
+     * ignores the signal unless the phase is Offline.
+     */
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                runOnUiThread { viewModel.onNetworkAvailable() }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,6 +102,39 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        // T11 decision 3: foreground → probe ping (+ reconnect when the
+        // socket died in background). ON_STOP stays empty by design.
+        viewModel.onAppForeground()
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        cm.registerDefaultNetworkCallback(networkCallback)
+    }
+
+    override fun onStop() {
+        // No disconnect (T11 decision 3): the server parks the socket 20 s.
+        // Unregister the network callback here so onStart does not stack a
+        // second one every foreground.
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(networkCallback)
+        } catch (_: IllegalArgumentException) {
+            // Never registered.
+        }
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(networkCallback)
+        } catch (_: IllegalArgumentException) {
+            // Never registered (a failed onCreate) — teardown guard, not a
+            // behaviour branch.
+        }
+        super.onDestroy()
+    }
 }
 
 @Composable
@@ -87,7 +143,20 @@ fun AppScreen(viewModel: AppViewModel, onScanRequested: () -> Boolean) {
     val errorText by viewModel.errorText.collectAsState()
     when (val p = phase) {
         is AppPhase.Unpaired -> PairingScreen(viewModel, errorText, onScanRequested)
-        is AppPhase.NeedsPassword -> PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
+        is AppPhase.NeedsPassword ->
+            if (p.overlay) {
+                // T11 decision 2: the ask arrived mid-session (cookie expiry,
+                // 401, session kill) — the sheet opens OVER the existing
+                // transcript, which stays mounted and live underneath.
+                Box(modifier = Modifier.fillMaxSize()) {
+                    ReadyScreen(viewModel, viewModel.lastReadyModel)
+                    PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
+                }
+            } else {
+                // First pair (Unpaired → NeedsPassword): the sheet is the
+                // screen — there is no transcript under it.
+                PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
+            }
         is AppPhase.Connecting -> ConnectingScreen()
         is AppPhase.Ready -> ReadyScreen(viewModel, p.model)
         is AppPhase.Offline -> OfflineScreen(reason = p.reason, onRetry = { viewModel.retryResume() })
