@@ -173,6 +173,10 @@ interface HermoTokens {
     val composerSurfacePadXDp: Float get() = 8f      // --composer-surface-pad-x: 0.5rem
     val composerSurfacePadYDp: Float get() = 5f      // --composer-surface-pad-y: 0.3125rem
     val composerPillMaxWidthDp: Float get() = 160f   // model-pill.tsx:26 'max-w-40' (10rem)
+    // The height of the control cluster: a Material3 Button's 40dp minimum
+    // plus the 4dp it is nudged up by. The input matches it so a single
+    // line fills the shell instead of leaving dead bordered box above it.
+    val composerControlRowHeightDp: Float get() = 44f
 }
 
 val LocalHermoTokens = staticCompositionLocalOf<HermoTokens> { LightTokens }

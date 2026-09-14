@@ -151,10 +151,7 @@ impl SessionRegistry {
                     stored_id,
                     last_seen_seq: json::i64_at(item, "last_seen_seq"),
                     replay_epoch: json::str_at(item, "replay_epoch").to_string(),
-                    cols: {
-                        let cols = json::i64_at(item, "cols");
-                        if cols == 0 { 0 } else { cols }
-                    },
+                    cols: json::i64_at(item, "cols"),
                     title: json::str_at(item, "title").to_string(),
                 });
             }

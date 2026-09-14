@@ -3,6 +3,7 @@ package sh.mo.ui
 import android.annotation.SuppressLint
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -16,17 +17,16 @@ import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -39,24 +39,23 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import sh.mo.ChatRow
 import sh.mo.SessionUiState
+import sh.mo.TranscriptRows
 import sh.mo.formatElapsed
-import sh.mo.parseChatRow
 import sh.mo.ui.LocalFonts
 import sh.mo.ui.LocalHermoTokens
 import sh.mo.ui.LocalTurnRunning
@@ -97,9 +96,10 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
     // (Review #8, nit 2 — the old `keys.firstOrNull()` survived as a fallback.)
     val key = currentKey
     val state: SessionUiState = key?.let { sessions[it] } ?: SessionUiState(key = "")
-    val rows: List<ChatRow> = state.rows
-        .filter { it.isNotEmpty() }
-        .mapIndexed { i, json -> parseChatRow(i, json) }
+    // Rows keep their TRANSCRIPT index as id and are parsed incrementally —
+    // see [TranscriptRows] for why both matter.
+    val rowCache = remember { TranscriptRows() }
+    val rows: List<ChatRow> = rowCache.of(state.rows)
 
     CompositionLocalProvider(LocalTurnRunning provides state.running) {
         Column(
@@ -144,17 +144,20 @@ private fun ChatTitlebar(title: String) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (title.isNotBlank()) {
-                Text(
-                    text = title,
-                    style = androidx.compose.ui.text.TextStyle(
-                        fontFamily = LocalFonts.current.sans,
-                        fontSize = t.convFontSize.sp,
-                    ),
-                    color = t.textSecondary,
-                    maxLines = 1,
-                )
-            }
+            // `session.title` commonly lands after `open_session`, and a brand
+            // new session has none at all, so the bar had nothing in it and
+            // rendered as a bare strip plus a hairline. Name the session
+            // rather than leaving the header empty.
+            Text(
+                text = title.ifBlank { "New session" },
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = LocalFonts.current.sans,
+                    fontSize = t.convFontSize.sp,
+                ),
+                color = if (title.isBlank()) t.textTertiary else t.textSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
         Box(
             Modifier
@@ -169,7 +172,6 @@ private fun ChatTitlebar(title: String) {
 private fun TranscriptList(rows: List<ChatRow>, running: Boolean, modifier: Modifier) {
     val t = LocalHermoTokens.current
     val listState = rememberLazyListState()
-    val scope = rememberCoroutineScope()
 
     // Stick-to-bottom only when already there (Desktop's following rule):
     // nearBottom is derived, the jump fires only while the reader parked at
@@ -327,11 +329,12 @@ private fun StatusStrip(state: SessionUiState, rows: List<ChatRow>) {
  *
  * Width under pressure follows Desktop's stated intent (model-pill.tsx:22-28:
  * the pill is "the one control in the row that can give width back", over an
- * `auto_1fr_auto` grid whose `1fr` is the input): the input is weighted 3f
- * and always fills its three quarters, the pill takes the remaining flexible
- * quarter (`weight(1f, fill = false)`) clamped to its `max-w-40` cap — so a
- * long model label ellipsises BEFORE the input is squeezed and the typed
- * draft keeps the majority of the row.
+ * `auto_1fr_auto` grid whose `1fr` is the input): the pill and the button are
+ * the `auto` columns, sized to their content, and the input is the only
+ * weighted child, so it absorbs the rest. The pill gives width back through
+ * its `max-w-40` cap and its own ellipsis, never through a share of the
+ * flexible space — a weighted pill was capped at a quarter of that space,
+ * which on a phone is narrower than the cap it was meant to honour.
  */
 private val PLACEHOLDERS = listOf(
     "What are we building?",
@@ -364,6 +367,10 @@ private fun Composer(
     // colors did (focused = --theme-midground, rest = --ui-stroke-tertiary);
     // the hand-drawn shell needs the interaction source for that.
     val interaction = remember { MutableInteractionSource() }
+    val focusRequester = remember { FocusRequester() }
+    // Separate from `interaction`: the field's own source drives the focus
+    // border, and a tap on the shell must not light that up by itself.
+    val shellTaps = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
     val borderColor = if (focused) t.midground else t.strokeTertiary
     Box(
@@ -372,6 +379,13 @@ private fun Composer(
             .padding(12.dp)
             .clip(hermoRadius(t.radiusLg))
             .background(t.surface)
+            // The whole bordered box reads as the input, so the whole bordered
+            // box focuses it. Without this a tap outside the field's own
+            // bounds did nothing and the keyboard never came up.
+            .clickable(
+                interactionSource = shellTaps,
+                indication = null,
+            ) { focusRequester.requestFocus() }
             .border(1.dp, borderColor, hermoRadius(t.radiusLg))
             .padding(
                 horizontal = t.composerSurfacePadXDp.dp,
@@ -379,16 +393,25 @@ private fun Composer(
             ),
     ) {
         Row(
+            // Desktop's control cluster is `justify-end`: without this the Row
+            // measures to its children and the Send button drifts inward by a
+            // gap that changes width with the model name.
+            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(t.composerControlGapDp.dp),
         ) {
             BasicTextField(
                 value = draft,
                 onValueChange = { draft = it },
-                // Desktop's `1fr` input column (index.tsx:1381): weighted so it
-                // keeps the majority of the row; the pill (weighted 1f against
-                // this 3f) is the one that gives width back, not this field.
-                modifier = Modifier.weight(3f),
+                // Desktop's `1fr` input column (index.tsx:1381): the only
+                // weighted child, so it absorbs whatever the `auto` pill and
+                // button leave. The min height matches the control cluster, so
+                // a single line fills the shell rather than sitting at the
+                // bottom of it under a dead strip of bordered box.
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = t.composerControlRowHeightDp.dp)
+                    .focusRequester(focusRequester),
                 textStyle = androidx.compose.ui.text.TextStyle(
                     fontFamily = LocalFonts.current.sans,
                     fontSize = t.convFontSize.sp,
@@ -401,7 +424,9 @@ private fun Composer(
                 // --conversation-line-height (18sp) — the growth cap.
                 maxLines = 7,
                 decorationBox = { inner ->
-                    Box {
+                    // Centered: the field now owns the full control-row height,
+                    // so a single line must sit in the middle of it.
+                    Box(contentAlignment = Alignment.CenterStart) {
                         if (draft.isEmpty()) {
                             Text(
                                 text = placeholder,
@@ -421,13 +446,14 @@ private fun Composer(
             // (model-pill.tsx:95-107); the phone has no picker yet, so until
             // the model lands nothing renders — never invented "unknown" copy.
             if (model.isNotBlank()) {
-                // weight(1f, fill = false) against the input's 3f: the pill's
-                // flexible quarter is the width it gives back under pressure
-                // (model-pill.tsx:22-28), applied here where the Row scope is.
-                ModelPill(
-                    model = model,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
+                // No weight: Desktop's grid is `auto 1fr auto`, so the pill is
+                // an `auto` column at its natural width under the max-w-40 cap
+                // and the input is the `1fr` that absorbs the rest. Weighting
+                // it against the input capped it at a quarter of the flexible
+                // space — about 42dp of text on a 360dp phone, so every
+                // realistic model name ellipsised to "claude-…" while the cap
+                // it was supposed to honour could never be reached.
+                ModelPill(model = model)
             }
             Button(
                 onClick = {
@@ -458,8 +484,8 @@ private fun Composer(
  * Desktop's ModelPill, relocated (model-pill.tsx 25-28): ghost styling,
  * --ui-text-tertiary, `text-xs` (11sp here), ONE truncating line at
  * `max-w-40` — "the one control in the row that can give width back".
- * The truncation is real: the pill is weighted against the input (Composer),
- * so under pressure it ellipsises below the 160dp cap instead of holding it.
+ * The pill sits at its natural width up to the 160dp cap and ellipsises there;
+ * the input is the weighted column that absorbs the rest of the row.
  *
  * Divergence, stated: the Desktop pill is the dropdown trigger for the live
  * `model.options` menu; the phone has no model picker yet (a later phase:

@@ -89,7 +89,7 @@ fun parseChatRow(id: Int, rowJson: String): ChatRow {
             resultJson = obj.optString("result"),
             inlineDiff = inlineDiffOf(obj),
             durationS = obj.optDouble("duration_s", 0.0),
-            exitCode = obj.optInt("exit_code", 0).takeIf { obj.has("exit_code") && it != 0 },
+            exitCode = exitCodeOf(obj),
         )
         "approval" -> ChatRow.Approval(
             id,
@@ -115,9 +115,21 @@ fun parseChatRow(id: Int, rowJson: String): ChatRow {
  * Desktop's `inlineDiffFromResult` (tool/fallback-model/index.ts): the diff
  * hides under `inline_diff` or `diff`, either at the top level or inside the
  * result object — take the first non-empty string. Never throws.
+ *
+ * `result` crosses the FFI as a compact JSON STRING, not an object
+ * (`core.rs::row_json` writes `card.result_json`), so it has to be re-parsed
+ * before the nested keys are reachable. Reading it with `optJSONObject` always
+ * returned null, which made both nested lookups dead and meant no tool card
+ * ever rendered its diff.
  */
 private fun inlineDiffOf(obj: org.json.JSONObject): String {
-    val result = obj.optJSONObject("result")
+    val result = obj.optStringOrNull("result")?.let { raw ->
+        try {
+            org.json.JSONObject(raw)
+        } catch (_: Exception) {
+            null
+        }
+    }
     val sources = listOfNotNull(
         obj.optStringOrNull("inline_diff"),
         obj.optStringOrNull("diff"),
@@ -125,6 +137,24 @@ private fun inlineDiffOf(obj: org.json.JSONObject): String {
         result?.optStringOrNull("diff"),
     )
     return sources.firstOrNull { it.isNotBlank() } ?: ""
+}
+
+/**
+ * The tool's exit code, from the top level or from inside the result payload
+ * (same string-not-object shape as [inlineDiffOf]). `0` is a real exit code
+ * and must survive: only an absent key yields null.
+ */
+private fun exitCodeOf(obj: org.json.JSONObject): Int? {
+    if (obj.has("exit_code") && !obj.isNull("exit_code")) return obj.optInt("exit_code")
+    val result = obj.optStringOrNull("result")?.let { raw ->
+        try {
+            org.json.JSONObject(raw)
+        } catch (_: Exception) {
+            null
+        }
+    } ?: return null
+    if (result.has("exit_code") && !result.isNull("exit_code")) return result.optInt("exit_code")
+    return null
 }
 
 private fun org.json.JSONObject.optStringOrNull(key: String): String? =
