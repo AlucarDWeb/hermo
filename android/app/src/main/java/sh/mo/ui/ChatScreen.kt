@@ -26,7 +26,9 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -53,10 +55,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import sh.mo.ApprovalCopy
+import sh.mo.AppViewModel
 import sh.mo.ChatRow
 import sh.mo.SessionUiState
+import sh.mo.SlashCompletionRow
+import sh.mo.SlashPolicy
 import sh.mo.TranscriptRows
 import sh.mo.formatElapsed
 import sh.mo.ui.LocalFonts
@@ -97,6 +103,18 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
     // too, not only on Pairing/Password: on the Ready/chat surface it was
     // silently dropped (PI_TASK_FIX5 item 2).
     val errorText by viewModel.errorText.collectAsState()
+    // T10b: completion rows / replace_from / ephemeral banner live in the
+    // view model (testable); this composable renders what it is handed.
+    val slashCompletions by viewModel.slashCompletions.collectAsState()
+    val slashReplaceFrom by viewModel.slashReplaceFrom.collectAsState()
+    val slashBanner by viewModel.slashBanner.collectAsState()
+
+    // Draft lives here, not inside Composer: the popup sits *above* the
+    // field, so a pick must rewrite the same state the TextField shows.
+    // Inserting against "" (the first draft) dropped the typed prefix and
+    // never updated the field — the completion looked like it fired and
+    // the input stayed at `/he`.
+    var draft by remember { mutableStateOf("") }
 
     // The repository OWNS the screen's session. A second entry in the sessions
     // map (a foreign key nobody opened) must never steal the view, so there is
@@ -126,9 +144,26 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
                 modifier = Modifier.weight(1f),
             )
             StatusStrip(state = state, rows = rows)
+            SlashCompletionsPopup(
+                completions = slashCompletions,
+                onPick = { item ->
+                    val next = SlashPolicy.insertCompletion(draft, item.text, slashReplaceFrom)
+                    draft = next
+                    viewModel.dismissCompletions()
+                    viewModel.onDraftChanged(next)
+                },
+            )
+            SlashBanner(text = slashBanner)
             Composer(
                 model = model,
                 running = state.running,
+                draft = draft,
+                prefillEvents = viewModel.composerEvents,
+                onDraftChanged = {
+                    draft = it
+                    viewModel.onDraftChanged(it)
+                },
+                onDismissCompletions = { viewModel.dismissCompletions() },
                 onSend = { text -> viewModel.send(text) },
                 onStop = { key?.let { viewModel.interrupt(it) } },
             )
@@ -429,11 +464,22 @@ private fun successDot(t: sh.mo.ui.HermoTokens): Color = Color(0xFF2AA17C)
 private fun Composer(
     model: String,
     running: Boolean,
+    draft: String,
+    prefillEvents: SharedFlow<AppViewModel.ComposerEvent>,
+    onDraftChanged: (String) -> Unit,
+    onDismissCompletions: () -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
 ) {
     val t = LocalHermoTokens.current
-    var draft by remember { mutableStateOf("") }
+    // T10b: Prefill from the core rewrites the parent-owned draft.
+    LaunchedEffect(prefillEvents) {
+        prefillEvents.collect { event ->
+            when (event) {
+                is AppViewModel.ComposerEvent.Prefill -> onDraftChanged(event.text)
+            }
+        }
+    }
     // Desktop re-rolls the placeholder per conversation, not per keystroke —
     // one pick per composer composition here (the phone has one session view).
     val placeholder = remember { PLACEHOLDERS.random() }
@@ -476,7 +522,11 @@ private fun Composer(
         ) {
             BasicTextField(
                 value = draft,
-                onValueChange = { draft = it },
+                onValueChange = {
+                    // T10b: the view model owns when to complete (150 ms
+                    // debounce) — the field only reports edits.
+                    onDraftChanged(it)
+                },
                 // Desktop's `1fr` input column (index.tsx:1381): the only
                 // weighted child, so it absorbs whatever the `auto` pill and
                 // button leave. The min height matches the control cluster, so
@@ -535,7 +585,8 @@ private fun Composer(
                         onStop()
                     } else if (draft.isNotBlank()) {
                         onSend(draft)
-                        draft = ""
+                        onDraftChanged("")
+                        onDismissCompletions()
                     }
                 },
                 enabled = running || draft.isNotBlank(),
@@ -585,5 +636,113 @@ private fun ModelPill(model: String, modifier: Modifier = Modifier) {
             // the pill never exceeds min(its Row share, max-w-40).
             .widthIn(max = t.composerPillMaxWidthDp.dp)
             .padding(horizontal = 8.dp, vertical = 4.dp), // px-2; 4dp vertical ≈ h-(--composer-control-size) on text-xs
+    )
+}
+
+/**
+ * T10b: the slash completion popup, Desktop's composer-completion-drawer
+ * (completion-drawer.tsx COMPLETION_DRAWER_CLASS: `bottom-full mb-1` — it
+ * floats just above the composer edge, inset from the left) rendering the
+ * trigger-popover row (trigger-popover.tsx ROW_CLASS: one line, icon column,
+ * name + description). DESIGN.md "Slash descriptions": the row is
+ * single-line ellipsized and Desktop reveals the full description on hover —
+ * the phone has no hover, so `meta` is a SUBTITLE on the row (declared
+ * phone-native equivalent). Desktop groups rows Commands/Skills from the
+ * backend `kind`; the phone's drawer is narrow, so `kind` renders as a quiet
+ * trailing label instead of group headers.
+ *
+ * Rendered in the screen's Column directly above the composer, so nothing
+ * floats — the popup simply appears between the status strip and the field.
+ */
+@Composable
+fun SlashCompletionsPopup(
+    completions: List<SlashCompletionRow>,
+    onPick: (SlashCompletionRow) -> Unit,
+) {
+    if (completions.isEmpty()) return
+    val t = LocalHermoTokens.current
+    // The drawer shell: w-80 (320dp capped to the width), max-h 22rem ≈ 352dp,
+    // popover surface + hairline (composerPanelCard) — Desktop's own numbers.
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .heightIn(max = 352.dp)
+            .clip(hermoRadius(t.radiusLg))
+            .background(t.elevated)
+            .border(1.dp, t.strokeTertiary, hermoRadius(t.radiusLg))
+            .padding(vertical = 4.dp) // p-1 of the drawer shell
+            .verticalScroll(rememberScrollState()),
+    ) {
+        completions.forEach { item ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onPick(item) }
+                    .padding(horizontal = 8.dp, vertical = 4.dp), // px-2 py-1 (ROW_CLASS)
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp), // gap-2
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = item.display,
+                        style = androidx.compose.ui.text.TextStyle(
+                            fontFamily = LocalFonts.current.sans,
+                            fontSize = t.convFontSize.sp,
+                        ),
+                        color = t.text,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (item.meta.isNotBlank()) {
+                        Text(
+                            text = item.meta,
+                            style = androidx.compose.ui.text.TextStyle(
+                                fontFamily = LocalFonts.current.sans,
+                                fontSize = t.convToolFontSize.sp,
+                            ),
+                            color = t.textTertiary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                if (item.kind.isNotBlank()) {
+                    Text(
+                        text = item.kind,
+                        style = androidx.compose.ui.text.TextStyle(
+                            fontFamily = LocalFonts.current.sans,
+                            fontSize = 10.sp,
+                        ),
+                        color = t.textTertiary,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * T10b: the ephemeral slash-output banner. `SlashOutcome.Output` is NOT a
+ * transcript row (that would invent an index on the stream) — a one-line
+ * status line above the composer that fades after a few seconds. Declared
+ * divergence: Desktop renders slash output inline in the transcript.
+ */
+@Composable
+private fun SlashBanner(text: String) {
+    if (text.isBlank()) return
+    val t = LocalHermoTokens.current
+    Text(
+        text = text,
+        style = androidx.compose.ui.text.TextStyle(
+            fontFamily = LocalFonts.current.sans,
+            fontSize = t.convToolFontSize.sp,
+        ),
+        color = t.scaffoldText,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
     )
 }
