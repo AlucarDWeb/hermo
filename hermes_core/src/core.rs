@@ -34,7 +34,7 @@ use crate::protocol::EventParams;
 use crate::reconnect;
 use crate::rpc::api::{self, SubmitStatus};
 use crate::rpc::client::{ClientConfig, ConnectionState, GatewayClient, GatewayEvent};
-use crate::rpc::slash::{self, SlashDispatch, SlashPlan, MAX_ALIAS_HOPS};
+use crate::rpc::slash::{self, SlashDispatch, SlashPlan, ALIAS_LOOP_CODE, MAX_ALIAS_HOPS};
 use crate::session_registry::{SessionRecord, SessionRegistry};
 use crate::transcript::markdown::split_blocks;
 use crate::transcript::model::{Row, RowKind};
@@ -956,14 +956,21 @@ impl HermesCore {
     ///    [`SlashOutcome::Submitted`] is returned, `alias` → the whole ladder
     ///    re-runs for the target (leading `/` preserved), capped at
     ///    [`MAX_ALIAS_HOPS`] hops — a cycle reports a stable
-    ///    [`CoreError::Rpc`], never a panic. An unknown dispatch type
-    ///    degrades to an empty `Output`.
+    ///    [`CoreError::Rpc`] with [`slash::ALIAS_LOOP_CODE`] (not 4018),
+    ///    never a panic. An unknown dispatch type degrades to
+    ///    `Output { "unknown dispatch type" }`.
     pub async fn run_slash(
         self: Arc<Self>,
         key: String,
         command: String,
     ) -> Result<SlashOutcome, CoreError> {
-        Self::run_slash_ladder(self, key, command, 0).await
+        // Same hop every other exported async method takes: UniFFI polls on
+        // a different executor than the core runtime (`joined` at :60-64).
+        let handle = self.handle.clone();
+        joined(handle.spawn(async move {
+            Self::run_slash_ladder(self, key, command, 0).await
+        }))
+        .await
     }
 
     /// Composer completion (gateway-global, no session key). T10 carries the
@@ -1204,8 +1211,9 @@ impl HermesCore {
                             if hop >= MAX_ALIAS_HOPS {
                                 // A cycle only ever ends here: report a
                                 // stable error, never a panic or a hang.
+                                // Not 4018 — that code means "dispatch".
                                 return Err(CoreError::Rpc {
-                                    code: 4018,
+                                    code: ALIAS_LOOP_CODE,
                                     detail: "slash alias chain exceeded 8 hops".to_string(),
                                 });
                             }
@@ -2823,6 +2831,51 @@ mod tests {
         );
     }
 
+    /// Sibling of the 4018 test (review #14 finding 3): a non-4018
+    /// `slash.exec` error (4009) must NOT call `command.dispatch` and must
+    /// surface as `Err(CoreError::Rpc { code: 4009 })`. The policy unit
+    /// tests in `rpc/slash.rs` are not enough — this is the FFI path.
+    #[tokio::test]
+    async fn run_slash_does_not_dispatch_on_a_non_4018_exec_error() {
+        let dir = temp_dir("slash-4009-no-dispatch");
+        let dispatch_calls = Arc::new(StdMutex::new(0usize));
+        let d = Arc::clone(&dispatch_calls);
+        let gw = FakeGw::spawn(move |method, _params| {
+            let d = Arc::clone(&d);
+            async move {
+                match method.as_str() {
+                    "slash.exec" => Err(FakeRpcError::Coded {
+                        code: 4009,
+                        message: "session busy".into(),
+                    }),
+                    "command.dispatch" => {
+                        *d.lock().unwrap() += 1;
+                        Ok(json!({"type": "exec", "output": "should not run"}))
+                    }
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let (core, _sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let result = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/help".to_string())
+            .await;
+        match result {
+            Err(CoreError::Rpc { code, .. }) => {
+                assert_eq!(code, 4009, "the original slash.exec code is preserved");
+            }
+            other => panic!("4009 must surface as Rpc, got {other:?}"),
+        }
+        assert_eq!(
+            *dispatch_calls.lock().unwrap(),
+            0,
+            "command.dispatch must not run on a non-4018 slash.exec error"
+        );
+    }
+
     /// Rule pinned (T10): a successful `slash.exec` output renders as
     /// `Output` — and `command.dispatch` is NOT called for it.
     #[tokio::test]
@@ -3093,7 +3146,10 @@ mod tests {
         .expect("the alias cycle must terminate, not hang");
         match result {
             Err(CoreError::Rpc { code, detail }) => {
-                assert_eq!(code, 4018, "the cap reports a stable coded error");
+                assert_eq!(
+                    code, ALIAS_LOOP_CODE,
+                    "the cap is not 4018 (that code means dispatch)"
+                );
                 assert!(detail.contains("8 hops"), "stable cap detail: {detail}");
             }
             other => panic!("an alias cycle must error at the cap, got {other:?}"),

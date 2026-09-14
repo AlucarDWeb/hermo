@@ -26,6 +26,12 @@ use super::client::ClientError;
 /// ever ends at this cap, which is why it is a named constant.
 pub const MAX_ALIAS_HOPS: usize = 8;
 
+/// Client-side Rpc code when the alias cap is hit. **Not a gateway code**
+/// and **not 4018**: this crate matches Rpc by `code`, and 4018 means
+/// "fall back to `command.dispatch`". A caller that reused 4018 here
+/// would treat an alias loop as an unknown command.
+pub const ALIAS_LOOP_CODE: i64 = 4091;
+
 /// What the caller must do after a `slash.exec` attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlashPlan {
