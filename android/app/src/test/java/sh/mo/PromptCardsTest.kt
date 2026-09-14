@@ -89,6 +89,16 @@ class PromptCardsTest {
     }
 
     @Test
+    fun `single-select chip pick encodes the pick not the empty draft`() {
+        // The chip tap stores `selected = listOf(choice)` and clears `draft`;
+        // a single-select answer must leave the device as the pick itself
+        // (Desktop's stagedAnswer), never as the blank draft.
+        val json = """[{"qid":"q0","question":"Pick one","choices":["a","b"],"multi_select":false}]"""
+        val q = parseClarifyQuestions(json).single()
+        assertEquals("a", encodeClarifyAnswer(q, listOf("a"), ""))
+    }
+
+    @Test
     fun `clarify garbage is empty never throws`() {
         assertEquals(emptyList<ClarifyQuestionUi>(), parseClarifyQuestions(""))
         assertEquals(emptyList<ClarifyQuestionUi>(), parseClarifyQuestions("not-json"))

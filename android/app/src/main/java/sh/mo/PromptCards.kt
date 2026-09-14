@@ -125,25 +125,25 @@ fun isMultiSelectAnswer(question: ClarifyQuestionUi, picks: List<String>): Boole
     question.multiSelect && picks.isNotEmpty()
 
 /**
- * The batch clarify join rule. Confirmed against the gateway's own parser
- * (`tools/clarify_tool.py::_parse_multi_select_response`): a multi-select
- * reply is parsed as a JSON array first, then a comma-split fallback — so
- * the canonical wire form is the JSON array. Desktop encodes exactly that
- * (`stagedAnswer`: `JSON.stringify(selectedChoices)` for multiSelect).
+ * Serialise a clarify answer for `respond_clarify`. The chip pick travels as
+ * the pick itself: a multi-select reply is the JSON array the gateway's own
+ * parser reads first (`tools/clarify_tool.py::_parse_multi_select_response`),
+ * and a single-select reply is `picks.first()` — the chip tap stores the pick
+ * in `picks` and clears the draft, so returning `draft` here made Continue a
+ * no-op (the review blocker). Draft text (Desktop's stagedAnswer "Other")
+ * only applies when no chip was picked.
  */
 fun encodeClarifyAnswer(question: ClarifyQuestionUi, picks: List<String>, draft: String): String =
     when {
-        question.multiSelect && picks.isNotEmpty() ->
-            org.json.JSONArray(picks).toString()
+        picks.isNotEmpty() && question.multiSelect -> org.json.JSONArray(picks).toString()
+        picks.isNotEmpty() -> picks.first()
         else -> draft.trim()
     }
 
-/** Desktop's batch progress line (en.ts clarify.questionProgress). */
-fun clarifyProgressLabel(answered: Int, total: Int): String = "$answered of $total answered"
-
 /**
- * The skip affordance's copy: an expired card resolves server-side to a
- * settle whose `timed_out`/skip shape the tool result carries — the phone
- * surfaces Desktop's `skipped` copy for it.
+ * Desktop's batch progress line (en.ts clarify.questionProgress).
+ * NOTE (PI_TASK_FIX5 item 3): the phone renders one unanswered question at a
+ * time, so `answered` counts only the answers sent for the card so far, not
+ * a Desktop-style per-qid loop — see [encodeClarifyAnswer].
  */
-const val CLARIFY_SKIPPED = "Skipped"
+fun clarifyProgressLabel(answered: Int, total: Int): String = "$answered of $total answered"

@@ -92,6 +92,11 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
     val t = LocalHermoTokens.current
     val sessions by viewModel.sessions.collectAsState()
     val currentKey by viewModel.currentKey.collectAsState()
+    // The repository's last message (errors, and the "Answered elsewhere"
+    // copy a 4009/4018 approval/clarify response produces) — surfaced here
+    // too, not only on Pairing/Password: on the Ready/chat surface it was
+    // silently dropped (PI_TASK_FIX5 item 2).
+    val errorText by viewModel.errorText.collectAsState()
 
     // The repository OWNS the screen's session. A second entry in the sessions
     // map (a foreign key nobody opened) must never steal the view, so there is
@@ -112,6 +117,7 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
                 .imePadding(),
         ) {
             ChatTitlebar(title = state.title)
+            ErrorBanner(text = errorText)
             TranscriptList(
                 rows = rows,
                 running = state.running,
@@ -175,6 +181,30 @@ private fun ChatTitlebar(title: String) {
                 .background(t.strokeTertiary),
         )
     }
+}
+
+/**
+ * One-line banner directly under the titlebar (PI_TASK_FIX5 item 2): the
+ * repository's `_errorText` was only read by Pairing/Password, so the
+ * "Answered elsewhere" copy a 4009/4018 response produced never appeared on
+ * the session window. A quiet destructive-tinted line — Desktop has no error
+ * dialog here and neither does the phone.
+ */
+@Composable
+private fun ErrorBanner(text: String) {
+    if (text.isBlank()) return
+    val t = LocalHermoTokens.current
+    Text(
+        text = text,
+        style = androidx.compose.ui.text.TextStyle(
+            fontFamily = LocalFonts.current.sans,
+            fontSize = t.convToolFontSize.sp,
+        ),
+        color = t.destructive,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+    )
 }
 
 @Composable

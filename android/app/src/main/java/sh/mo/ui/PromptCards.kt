@@ -5,6 +5,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -27,6 +29,7 @@ import sh.mo.ChatRow
 import sh.mo.ClarifyQuestionUi
 import sh.mo.encodeClarifyAnswer
 import sh.mo.parseClarifyQuestions
+import sh.mo.primaryApprovalChoice
 
 /**
  * T9 cards — DESIGN.md "Chat, tools & boot surfaces" inline widgets:
@@ -37,6 +40,7 @@ import sh.mo.parseClarifyQuestions
  * row of every choice the server sent. Always-allow is a second tap, not
  * a dialog window. Hover does not exist.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun ApprovalCard(
     row: ChatRow.Approval,
@@ -102,15 +106,20 @@ internal fun ApprovalCard(
                 }
             }
         } else {
-            Row(
+            // FlowRow, not a non-wrapping Row: the phone renders every choice
+            // the server sent as a button (the phone-native stand-in for
+            // Desktop's overflow menu), and four Desktop labels clip on a
+            // Pixel-7a-width screen (PI_TASK_FIX5 item 5).
+            FlowRow(
                 modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                val primary = primaryApprovalChoice(row.choices)
                 row.choices.forEach { wire ->
                     val known = ApprovalChoice.fromWire(wire)
                     val label = known?.label ?: wire
-                    val primary = wire == "once" || (wire == "deny" && "once" !in row.choices)
-                    ChoiceButton(label = label, primary = primary) {
+                    val primaryHere = primary != null && wire == primary.wire
+                    ChoiceButton(label = label, primary = primaryHere) {
                         if (wire == "always") confirmAlways = true
                         else onChoice(row.requestId, wire)
                     }
@@ -120,6 +129,7 @@ internal fun ApprovalCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun ClarifyCard(
     row: ChatRow.Clarify,
@@ -132,12 +142,21 @@ internal fun ClarifyCard(
         return
     }
     Column(modifier = Modifier.fillMaxWidth().padding(bottom = t.paragraphGapDp.dp)) {
-        questions.forEachIndexed { index, q ->
+        // One unanswered question at a time: the core `respond_clarify`
+        // resolves the WHOLE card after the first successful RPC and the FFI
+        // returns `()` (no `remaining` arrives), so a fake q1…n list would
+        // vanish after the first Continue while q2…n were never actually
+        // asked (PI_TASK_FIX5 item 3). The answered count is the card's real
+        // one: every question before the first unanswered one.
+        val firstOpen = questions.indexOfFirst { !row.resolved }
+        val visible = if (row.resolved) questions else questions.take(firstOpen + 1)
+        val answeredCount = if (row.resolved) questions.size else firstOpen.coerceAtLeast(0)
+        visible.forEachIndexed { index, q ->
             ClarifyQuestionBlock(
                 question = q,
                 resolved = row.resolved,
-                showProgress = questions.size > 1,
-                index = index,
+                showProgress = questions.size > 1 && !row.resolved,
+                answered = answeredCount + index,
                 total = questions.size,
                 onSubmit = { answer ->
                     onAnswer(row.requestId, answer, q.qid.ifBlank { null })
@@ -147,12 +166,13 @@ internal fun ClarifyCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ClarifyQuestionBlock(
     question: ClarifyQuestionUi,
     resolved: Boolean,
     showProgress: Boolean,
-    index: Int,
+    answered: Int,
     total: Int,
     onSubmit: (String) -> Unit,
 ) {
@@ -160,11 +180,11 @@ private fun ClarifyQuestionBlock(
     var selected by remember(question.qid) { mutableStateOf(listOf<String>()) }
     var draft by remember(question.qid) { mutableStateOf("") }
 
-    Column(modifier = Modifier.padding(bottom = if (index < total - 1) 12.dp else 0.dp)) {
+    Column(modifier = Modifier.padding(bottom = if (answered < total - 1 && !resolved) 12.dp else 0.dp)) {
         WidgetShell {
             if (showProgress) {
                 Text(
-                    text = sh.mo.clarifyProgressLabel(index, total),
+                    text = sh.mo.clarifyProgressLabel(answered, total),
                     style = TextStyle(
                         fontFamily = LocalFonts.current.sans,
                         fontSize = t.convToolFontSize.sp,
@@ -185,7 +205,9 @@ private fun ClarifyQuestionBlock(
         }
         if (resolved) return@Column
         if (question.choices.isNotEmpty()) {
-            Row(
+            // FlowRow: clarify choice chips share the approval labels' clipping
+            // problem on a narrow screen (PI_TASK_FIX5 item 5).
+            FlowRow(
                 modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
