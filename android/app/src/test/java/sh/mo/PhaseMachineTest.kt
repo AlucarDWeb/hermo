@@ -98,12 +98,8 @@ class PhaseMachineTest {
     }
 
     /**
-     * T11 (empty-jar dead-end): a connect failure whose Throwable is
-     * auth-shaped (SessionExpired with an EMPTY UniFFI message — the jar is
-     * gone, `Closed("error: ")` carried no class information) must land on
-     * NeedsPassword when an endpoint is saved, never Offline. RED against
-     * today's code: there is no AuthFailed event and the synthesized
-     * `Closed("error: ")` reduces to Offline.
+     * T11 (empty-jar dead-end): AuthFailed with a saved endpoint is
+     * NeedsPassword. Overlay when a transcript was already open.
      */
     @Test
     fun `auth-shaped failure with a saved endpoint asks for the password`() {
@@ -135,5 +131,16 @@ class PhaseMachineTest {
     fun `password ask after first pair has no overlay`() {
         val p = PhaseMachine.reduce(AppPhase.Connecting, PhaseMachine.ConnEvent.AuthFailed, "ep", hasLiveSession = false)
         assertEquals(AppPhase.NeedsPassword("ep", overlay = false), p)
+    }
+
+    @Test
+    fun `sink NeedsPassword overlays when a session is live`() {
+        val p = PhaseMachine.reduce(
+            PhaseMachine.ready("m"),
+            PhaseMachine.ConnEvent.NeedsPassword,
+            "ep",
+            hasLiveSession = true,
+        )
+        assertEquals(AppPhase.NeedsPassword("ep", overlay = true), p)
     }
 }

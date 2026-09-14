@@ -103,7 +103,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             is ConnectionStatus.Closed ->
                 PhaseMachine.reduce(_phase.value, PhaseMachine.ConnEvent.Closed(status.reason), endpointText)
             is ConnectionStatus.NeedsPassword ->
-                PhaseMachine.reduce(_phase.value, PhaseMachine.ConnEvent.NeedsPassword, endpointText)
+                PhaseMachine.reduce(
+                    _phase.value,
+                    PhaseMachine.ConnEvent.NeedsPassword,
+                    endpointText,
+                    hasLiveSession(),
+                )
         }
     }
 

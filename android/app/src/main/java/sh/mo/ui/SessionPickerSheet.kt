@@ -93,24 +93,14 @@ fun SessionPickerSheet(
                 ) {
                     CircularProgressIndicator(color = t.midground, modifier = Modifier.padding(4.dp))
                 }
-                sessions.isEmpty() -> Text(
-                    text = "No sessions on the gateway yet",
-                    style = androidx.compose.ui.text.TextStyle(
-                        fontFamily = LocalFonts.current.sans,
-                        fontSize = t.convToolFontSize.sp,
-                    ),
-                    color = t.textTertiary,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(24.dp),
-                )
                 else -> LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(max = 420.dp),
                 ) {
-                    // "New chat" first (Desktop's picker order): mints a
-                    // fresh session via open_session(null).
+                    // Always first — even when the gateway list is empty
+                    // (fresh install / list failed). Hiding it behind
+                    // sessions.isNotEmpty() made New chat unreachable.
                     item {
                         PickerRow(
                             title = "New chat",
@@ -118,12 +108,28 @@ fun SessionPickerSheet(
                             onClick = onNewChat,
                         )
                     }
-                    items(sessions, key = { it.id }) { s ->
-                        PickerRow(
-                            title = s.displayTitle,
-                            preview = s.displayPreview,
-                            onClick = { onResume(s.id) },
-                        )
+                    if (sessions.isEmpty()) {
+                        item {
+                            Text(
+                                text = "No other sessions on the gateway yet",
+                                style = androidx.compose.ui.text.TextStyle(
+                                    fontFamily = LocalFonts.current.sans,
+                                    fontSize = t.convToolFontSize.sp,
+                                ),
+                                color = t.textTertiary,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                            )
+                        }
+                    } else {
+                        items(sessions, key = { it.id }) { s ->
+                            PickerRow(
+                                title = s.displayTitle,
+                                preview = s.displayPreview,
+                                onClick = { onResume(s.id) },
+                            )
+                        }
                     }
                 }
             }
