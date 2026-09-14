@@ -92,4 +92,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun interrupt(key: String) {
         viewModelScope.launch { repo.interrupt(key) }
     }
+
+    /** Approval card tap (T9): the repository owns the session key. */
+    fun respondApproval(requestId: String, choice: String) {
+        viewModelScope.launch { repo.respondApproval(requestId, choice) }
+    }
+
+    /** Clarify card answer (T9): one lock per call, `questionId` for batch. */
+    fun respondClarify(requestId: String, answer: String, questionId: String? = null) {
+        viewModelScope.launch { repo.respondClarify(requestId, answer, questionId) }
+    }
 }

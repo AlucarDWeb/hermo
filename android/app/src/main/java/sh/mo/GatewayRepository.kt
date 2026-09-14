@@ -288,6 +288,47 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         false
     }
 
+    /**
+     * Answer an approval card on the session [GatewayRepository] owns — the
+     * repository resolves the key, so a caller can never pass an absent one
+     * (the same ownership rule `send` already enforces). 4009/4018 mean the
+     * card was answered elsewhere; the core still resolves the local row, so
+     * those surface as the "answered elsewhere" copy, not an error.
+     */
+    suspend fun respondApproval(requestId: String, choice: String): Boolean {
+        val key: String = _currentKey.value ?: run {
+            _errorText.value = "No open session to answer in"
+            return false
+        }
+        return try {
+            core.respondApproval(key, requestId, choice)
+            _errorText.value = ""
+            true
+        } catch (t: Throwable) {
+            _errorText.value = approvalRespondErrorCopy(t) ?: ErrorMessages.of(t)
+            false
+        }
+    }
+
+    /**
+     * Answer a clarify card (single: `questionId == null`; batch: one lock
+     * per qid, exactly the per-question RPCs Desktop's confirm loop sends).
+     */
+    suspend fun respondClarify(requestId: String, answer: String, questionId: String? = null): Boolean {
+        val key: String = _currentKey.value ?: run {
+            _errorText.value = "No open session to answer in"
+            return false
+        }
+        return try {
+            core.respondClarify(key, requestId, answer, questionId)
+            _errorText.value = ""
+            true
+        } catch (t: Throwable) {
+            _errorText.value = approvalRespondErrorCopy(t) ?: ErrorMessages.of(t)
+            false
+        }
+    }
+
     suspend fun appDidForeground() {
         try {
             core.appDidForeground()

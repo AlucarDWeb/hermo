@@ -47,6 +47,8 @@ sealed interface ChatRow {
         val requestId: String,
         val command: String,
         val description: String,
+        /** The choices the SERVER sent (T9): rendered verbatim, never recomputed. */
+        val choices: List<String> = emptyList(),
         val resolved: Boolean,
     ) : ChatRow
     data class Clarify(
@@ -96,6 +98,12 @@ fun parseChatRow(id: Int, rowJson: String): ChatRow {
             requestId = obj.optString("request_id"),
             command = obj.optString("command"),
             description = obj.optString("description"),
+            // `choices` is the server's own list (`core.rs::row_json` writes
+            // it verbatim): parsed as strings, empty when absent, never
+            // synthesised (T9: render exactly the choices the server sent).
+            choices = obj.optJSONArray("choices")?.let { arr ->
+                List(arr.length()) { arr.optString(it) }.filter { it.isNotBlank() }
+            } ?: emptyList(),
             resolved = obj.optBoolean("resolved"),
         )
         "clarify" -> ChatRow.Clarify(

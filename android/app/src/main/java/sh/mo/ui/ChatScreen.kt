@@ -39,6 +39,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,6 +53,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import sh.mo.ApprovalCopy
 import sh.mo.ChatRow
 import sh.mo.SessionUiState
 import sh.mo.TranscriptRows
@@ -109,7 +112,13 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
                 .imePadding(),
         ) {
             ChatTitlebar(title = state.title)
-            TranscriptList(rows = rows, running = state.running, modifier = Modifier.weight(1f))
+            TranscriptList(
+                rows = rows,
+                running = state.running,
+                onApproval = { id, choice -> viewModel.respondApproval(id, choice) },
+                onClarify = { id, answer, qid -> viewModel.respondClarify(id, answer, qid) },
+                modifier = Modifier.weight(1f),
+            )
             StatusStrip(state = state, rows = rows)
             Composer(
                 model = model,
@@ -169,9 +178,24 @@ private fun ChatTitlebar(title: String) {
 }
 
 @Composable
-private fun TranscriptList(rows: List<ChatRow>, running: Boolean, modifier: Modifier) {
+private fun TranscriptList(
+    rows: List<ChatRow>,
+    running: Boolean,
+    onApproval: (String, String) -> Unit,
+    onClarify: (String, String, String?) -> Unit,
+    modifier: Modifier,
+) {
     val t = LocalHermoTokens.current
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val pendingIdx = rows.indexOfFirst { it is ChatRow.Approval && !it.resolved }
+    val pendingOffscreen by remember(pendingIdx) {
+        derivedStateOf {
+            if (pendingIdx < 0) return@derivedStateOf false
+            val visible = listState.layoutInfo.visibleItemsInfo
+            visible.isNotEmpty() && visible.none { it.index == pendingIdx }
+        }
+    }
 
     // Stick-to-bottom only when already there (Desktop's following rule):
     // nearBottom is derived, the jump fires only while the reader parked at
@@ -201,9 +225,10 @@ private fun TranscriptList(rows: List<ChatRow>, running: Boolean, modifier: Modi
             return@CompositionLocalProvider
         }
 
+        Box(modifier.fillMaxSize()) {
         LazyColumn(
             state = listState,
-            modifier = modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().fillMaxSize(),
             contentPadding = PaddingValues(
                 start = 16.dp,
                 end = 16.dp,
@@ -215,8 +240,27 @@ private fun TranscriptList(rows: List<ChatRow>, running: Boolean, modifier: Modi
             verticalArrangement = Arrangement.spacedBy(t.turnGapDp.dp),
         ) {
             items(rows, key = { it.id }) { row ->
-                TranscriptRow(row)
+                TranscriptRow(row, onApproval = onApproval, onClarify = onClarify)
             }
+        }
+        if (pendingOffscreen && pendingIdx >= 0) {
+            Text(
+                text = ApprovalCopy.JUMP_TO_APPROVAL,
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = LocalFonts.current.sans,
+                    fontSize = t.convToolFontSize.sp,
+                    fontWeight = FontWeight.Medium,
+                ),
+                color = t.onPrimary,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp)
+                    .clip(hermoRadius(t.radiusXl))
+                    .background(t.primarySolid)
+                    .clickable { scope.launch { listState.animateScrollToItem(pendingIdx) } }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            )
+        }
         }
     }
 }
