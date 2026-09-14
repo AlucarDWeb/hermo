@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,6 +34,7 @@ use crate::protocol::EventParams;
 use crate::reconnect;
 use crate::rpc::api::{self, SubmitStatus};
 use crate::rpc::client::{ClientConfig, ConnectionState, GatewayClient, GatewayEvent};
+use crate::rpc::slash::{self, SlashDispatch, SlashPlan, ALIAS_LOOP_CODE, MAX_ALIAS_HOPS};
 use crate::session_registry::{SessionRecord, SessionRegistry};
 use crate::transcript::markdown::split_blocks;
 use crate::transcript::model::{Row, RowKind};
@@ -134,12 +136,37 @@ pub struct MarkdownBlockDto {
     pub open: bool,
 }
 
-/// One composer completion item (`complete_slash`).
+/// One composer completion item (`complete_slash`). `meta` is the popup's
+/// short description for the entry (T10).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SlashCompletionDto {
     pub display: String,
     pub text: String,
     pub kind: String,
+    pub meta: String,
+}
+
+/// The `complete.slash` answer: the items plus the offset in the typed text
+/// where the replacement starts (`-1` = absent — without it the popup cannot
+/// insert, so T10 carries it across the FFI instead of dropping it).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SlashCompletionsDto {
+    pub items: Vec<SlashCompletionDto>,
+    pub replace_from: i64,
+}
+
+/// Result of a slash command (`run_slash`), per PLAN §4 T10. `Output` is
+/// shown in the session; `Prefill` goes to the composer input unsubmitted;
+/// `Submitted` means the text went out through the normal send path (the
+/// user row is already published by the core, with `display` as the row text
+/// when the dispatch carried one); `Empty` is the gateway's 4004 for an
+/// empty command — nothing to run, not an error.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum SlashOutcome {
+    Output { text: String },
+    Prefill { text: String },
+    Submitted,
+    Empty,
 }
 
 // ── EventSink (foreign callback trait, PLAN §3/§4 T5) ───────────────────────
@@ -912,29 +939,49 @@ impl HermesCore {
         .await
     }
 
-    /// Run a slash command in session `key` (e.g. `/model`).
-    pub async fn run_slash(self: Arc<Self>, key: String, command: String) -> Result<String, CoreError> {
+    /// Run a slash command in session `key` (e.g. `/model`), following the
+    /// try-then-fallback ladder of PLAN §4 T10:
+    ///
+    /// 1. `slash.exec` — `Ok` renders as [`SlashOutcome::Output`] (a
+    ///    `warning` field is concatenated Desktop-style); a `4004` is
+    ///    [`SlashOutcome::Empty`], NOT an error.
+    /// 2. `4018` — the command lives behind `command.dispatch`: `name` =
+    ///    first token without the leading `/`, `arg` = the rest. The strict
+    ///    reading of the plan: only 4018 falls back, every other `slash.exec`
+    ///    error surfaces as [`CoreError::Rpc`].
+    /// 3. The dispatch outcome maps onto the FFI: `exec`/`plugin` →
+    ///    `Output`, `prefill` → `Prefill`, `send`/`skill` → the message is
+    ///    submitted through the T7c send path (user row published; the row
+    ///    shows the dispatch's `display` when non-empty, else the text) and
+    ///    [`SlashOutcome::Submitted`] is returned, `alias` → the whole ladder
+    ///    re-runs for the target (leading `/` preserved), capped at
+    ///    [`MAX_ALIAS_HOPS`] hops — a cycle reports a stable
+    ///    [`CoreError::Rpc`] with [`slash::ALIAS_LOOP_CODE`] (not 4018),
+    ///    never a panic. An unknown dispatch type degrades to
+    ///    `Output { "unknown dispatch type" }`.
+    pub async fn run_slash(
+        self: Arc<Self>,
+        key: String,
+        command: String,
+    ) -> Result<SlashOutcome, CoreError> {
+        // Same hop every other exported async method takes: UniFFI polls on
+        // a different executor than the core runtime (`joined` at :60-64).
         let handle = self.handle.clone();
         joined(handle.spawn(async move {
-                let (client, live_sid) = {
-                    let state = self.inner.lock();
-                    let client = state.client.clone().ok_or(CoreError::NotConnected)?;
-                    let live_sid = state
-                        .sessions
-                        .get(&key)
-                        .map(|l| l.live_sid.clone())
-                        .ok_or(CoreError::NotConnected)?;
-                    (client, live_sid)
-                };
-                let value = api::slash_exec(&client, &live_sid, &command).await?;
-                Ok(json::str_at(&value, "output").to_string())
-            })
-        )
+            Self::run_slash_ladder(self, key, command, 0).await
+        }))
         .await
     }
 
-    /// Composer completion (gateway-global, no session key).
-    pub async fn complete_slash(self: Arc<Self>, text: String) -> Result<Vec<SlashCompletionDto>, CoreError> {
+    /// Composer completion (gateway-global, no session key). T10 carries the
+    /// full `SlashCompletionsDto` across the FFI: `replace_from` is the
+    /// offset where the popup's replacement starts (-1 = absent) and each
+    /// item keeps its `meta` description — both were dropped before and the
+    /// popup could not insert.
+    pub async fn complete_slash(
+        self: Arc<Self>,
+        text: String,
+    ) -> Result<SlashCompletionsDto, CoreError> {
         let handle = self.handle.clone();
         joined(handle.spawn(async move {
                 let client = {
@@ -942,15 +989,19 @@ impl HermesCore {
                     state.client.clone().ok_or(CoreError::NotConnected)?
                 };
                 let completions = api::complete_slash(&client, &text).await?;
-                Ok(completions
-                    .items
-                    .into_iter()
-                    .map(|i| SlashCompletionDto {
-                        display: i.display,
-                        text: i.text,
-                        kind: i.kind,
-                    })
-                    .collect())
+                Ok(SlashCompletionsDto {
+                    items: completions
+                        .items
+                        .into_iter()
+                        .map(|i| SlashCompletionDto {
+                            display: i.display,
+                            text: i.text,
+                            kind: i.kind,
+                            meta: i.meta,
+                        })
+                        .collect(),
+                    replace_from: completions.replace_from,
+                })
             })
         )
         .await
@@ -1092,6 +1143,143 @@ impl HermesCore {
 // FFI type.
 
 impl HermesCore {
+    /// The slash ladder itself, one level of alias recursion per `hop`.
+    /// Private (and in the non-exported impl): `usize` and `GatewayClient`
+    /// are not FFI types, so UniFFI must not see this signature.
+    fn run_slash_ladder(
+        self: Arc<Self>,
+        key: String,
+        command: String,
+        hop: usize,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<SlashOutcome, CoreError>> + Send>> {
+        Box::pin(async move {
+            let (client, live_sid) = {
+                let state = self.inner.lock();
+                let client = state.client.clone().ok_or(CoreError::NotConnected)?;
+                let live_sid = state
+                    .sessions
+                    .get(&key)
+                    .map(|l| l.live_sid.clone())
+                    .ok_or(CoreError::NotConnected)?;
+                (client, live_sid)
+            };
+
+            // Step 1: slash.exec (try).
+            let exec = api::slash_exec(&client, &live_sid, &command).await;
+            match slash::plan_after_slash_exec(&command, exec)? {
+                SlashPlan::Output(text) => Ok(SlashOutcome::Output { text }),
+                SlashPlan::Empty => Ok(SlashOutcome::Empty),
+                // Step 2: 4018 — fall back to command.dispatch.
+                SlashPlan::Dispatch { name, arg } => {
+                    let outcome = api::command_dispatch(&client, &live_sid, &name, &arg).await?;
+                    match slash::plan_from_dispatch(&outcome) {
+                        SlashDispatch::Output(text) => {
+                            // The dispatch `exec`/`plugin` output.
+                            Ok(SlashOutcome::Output { text })
+                        }
+                        SlashDispatch::Prefill(text) => Ok(SlashOutcome::Prefill { text }),
+                        SlashDispatch::Unknown => Ok(SlashOutcome::Output {
+                            // A short stable text instead of a bare empty
+                            // string: the surface must be able to show that
+                            // the dispatcher answered with an unknown type.
+                            text: "unknown dispatch type".to_string(),
+                        }),
+                        SlashDispatch::Submit { message, display } => {
+                            // The send path owns the user row (T7c). The row
+                            // text is `display` when the dispatch carried
+                            // one, else the submitted message itself.
+                            let row_text = if display.is_empty() {
+                                message.as_str()
+                            } else {
+                                display.as_str()
+                            };
+                            Self::submit_slash_message(
+                                &self, &client, &key, &live_sid, &message, row_text,
+                            )
+                            .await?;
+                            Ok(SlashOutcome::Submitted)
+                        }
+                        SlashDispatch::Alias(target) => {
+                            // The whole ladder re-runs for the target, its
+                            // leading `/` preserved (a dispatch target is a
+                            // slash command).
+                            let target = if target.starts_with('/') {
+                                target
+                            } else {
+                                format!("/{target}")
+                            };
+                            if hop >= MAX_ALIAS_HOPS {
+                                // A cycle only ever ends here: report a
+                                // stable error, never a panic or a hang.
+                                // Not 4018 — that code means "dispatch".
+                                return Err(CoreError::Rpc {
+                                    code: ALIAS_LOOP_CODE,
+                                    detail: "slash alias chain exceeded 8 hops".to_string(),
+                                });
+                            }
+                            Self::run_slash_ladder(self, key, target, hop + 1).await
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Submit the message a `send`/`skill` dispatch resolved to, through the
+    /// same submit + user-row publication the T7c `send` uses. Factor of
+    /// `send`: the public signature stays `send(key, text)`; only the row
+    /// text differs here (`display` when the dispatch carries one). Same
+    /// semantics as `send`: `streaming` and `redirected` both publish the
+    /// row, an unknown status publishes none and errors.
+    async fn submit_slash_message(
+        self: &Arc<Self>,
+        client: &GatewayClient,
+        key: &str,
+        live_sid: &str,
+        message: &str,
+        row_text: &str,
+    ) -> Result<(), CoreError> {
+        // The history epoch is captured BEFORE the submit await and
+        // re-checked under the lock (the submit/resume race, PR #10 finding
+        // 2 — the same guard `send` applies).
+        let history_epoch = {
+            let state = self.inner.lock();
+            state
+                .sessions
+                .get(key)
+                .map(|l| l.history_epoch)
+                .ok_or(CoreError::NotConnected)?
+        };
+        let status = api::submit(client, live_sid, message).await?;
+        if !matches!(status, SubmitStatus::Streaming | SubmitStatus::Redirected) {
+            return Err(CoreError::UnexpectedStatus);
+        }
+        let (changes, rows, sink) = {
+            let mut state = self.inner.lock();
+            let changes = match state.sessions.get_mut(key) {
+                // A rebuild re-ingested this session while the submit RPC
+                // was in flight: the rebuilt history already contains the
+                // message (PR #10 finding 2) — skip the append.
+                Some(live) if live.history_epoch == history_epoch => {
+                    live.reducer.append_user_row(key, row_text)
+                }
+                _ => Vec::new(),
+            };
+            let rows = state
+                .sessions
+                .get(key)
+                .map(|l| l.reducer.transcript().rows.clone())
+                .unwrap_or_default();
+            (changes, rows, state.sink.clone())
+        };
+        if let Some(sink) = sink {
+            for change in &changes {
+                sink.on_transcript(change_to_dto(key, &change.change, &rows));
+            }
+        }
+        Ok(())
+    }
+
     async fn connect_inner(self: Arc<Self>, sink: Arc<dyn EventSink>) -> Result<(), CoreError> {
         // The sink is the single one the app registers; the supervisor and
         // every exported method deliver through it.
@@ -1674,6 +1862,28 @@ mod tests {
 
     // ── fake gateway (in-process WS, no port binding beyond 127.0.0.1:0) ────
 
+    /// A fake gateway handler's error: either a plain message (mapped to the
+    /// generic `-32000`) or a coded wire error (`code` + `message`) — the
+    /// slash ladder distinguishes error CODES, so tests must be able to send
+    /// real ones (T10).
+    #[derive(Clone)]
+    enum FakeRpcError {
+        Plain(String),
+        Coded { code: i64, message: String },
+    }
+
+    impl From<&str> for FakeRpcError {
+        fn from(s: &str) -> Self {
+            FakeRpcError::Plain(s.to_string())
+        }
+    }
+
+    impl From<String> for FakeRpcError {
+        fn from(s: String) -> Self {
+            FakeRpcError::Plain(s)
+        }
+    }
+
     /// A minimal fake gateway: accepts ONE connection, answers every JSON-RPC
     /// request via `handler`, and can push wire events.
     struct FakeGw {
@@ -1685,11 +1895,12 @@ mod tests {
 
     impl FakeGw {
         /// `handler` receives (method, params) and returns the JSON-RPC result
-        /// value (or an Err message string -> error object).
+        /// value (or an Err -> error object; `FakeRpcError::Coded` carries a
+        /// real wire error code, `Plain` degrades to the generic `-32000`).
         fn spawn<F, Fut>(handler: F) -> Self
         where
             F: Fn(String, Value) -> Fut + Send + 'static,
-            Fut: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+            Fut: std::future::Future<Output = Result<Value, FakeRpcError>> + Send + 'static,
         {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
             listener.set_nonblocking(true).expect("nonblocking");
@@ -1755,8 +1966,14 @@ mod tests {
                                 let result = handler(method, params).await;
                                 let reply = match result {
                                     Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
-                                    Err(msg) => json!({"jsonrpc": "2.0", "id": id,
-                                        "error": {"code": -32000, "message": msg}}),
+                                    Err(FakeRpcError::Plain(msg)) => {
+                                        json!({"jsonrpc": "2.0", "id": id,
+                                            "error": {"code": -32000, "message": msg}})
+                                    }
+                                    Err(FakeRpcError::Coded { code, message }) => {
+                                        json!({"jsonrpc": "2.0", "id": id,
+                                            "error": {"code": code, "message": message, "data": null}})
+                                    }
                                 };
                                 if sink.send(Message::text(reply.to_string())).await.is_err() { return; }
                             }
@@ -2363,7 +2580,7 @@ mod tests {
         let dir = temp_dir("send-user-row-error");
         let gw = FakeGw::spawn(|method, _params| async move {
             match method.as_str() {
-                "prompt.submit" => Err("gateway down".to_string()),
+                "prompt.submit" => Err(FakeRpcError::Plain("gateway down".to_string())),
                 _ => Ok(json!({})),
             }
         });
@@ -2538,5 +2755,404 @@ mod tests {
             "the user text is delivered exactly once across the race: {:?}",
             sink.transcript()
         );
+    }
+
+    // ── test 8: the slash ladder (T10) ─────────────────────────────────────
+
+    /// Rule pinned (T10, anti-tautology): `slash.exec` answering **4018** for
+    /// a skill command MUST make `run_slash` perform the second RPC
+    /// (`command.dispatch`) and carry the dispatch's skill message out
+    /// through the submit path. With today's pre-fix `run_slash`
+    /// (`slash.exec` only, string output) this test fails: the 4018 surfaces
+    /// as `Err(Rpc)` and neither `command.dispatch` nor `prompt.submit` is
+    /// ever called.
+    #[tokio::test]
+    async fn run_slash_falls_back_to_dispatch_on_4018_and_submits_the_skill_message() {
+        let dir = temp_dir("slash-4018-dispatch");
+        let dispatch_calls = Arc::new(StdMutex::new(0usize));
+        let submit_calls = Arc::new(StdMutex::new(0usize));
+        let d = Arc::clone(&dispatch_calls);
+        let s = Arc::clone(&submit_calls);
+        let gw = FakeGw::spawn(move |method, params| {
+            let d = Arc::clone(&d);
+            let s = Arc::clone(&s);
+            async move {
+                match method.as_str() {
+                    // The skill-command redirect, word for word off the wire.
+                    "slash.exec" => Err(FakeRpcError::Coded {
+                        code: 4018,
+                        message: "skill command: use command.dispatch for /deploy".into(),
+                    }),
+                    "command.dispatch" => {
+                        *d.lock().unwrap() += 1;
+                        assert_eq!(params["name"], "deploy", "dispatch gets the bare name");
+                        assert_eq!(params["arg"], "prod", "dispatch gets the rest");
+                        Ok(json!({
+                            "type": "skill", "name": "deploy",
+                            "message": "hi", "display": "/deploy"
+                        }))
+                    }
+                    "prompt.submit" => {
+                        *s.lock().unwrap() += 1;
+                        assert_eq!(params["text"], "hi", "the skill message is submitted");
+                        Ok(json!({"status": "streaming"}))
+                    }
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let outcome = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/deploy prod".to_string())
+            .await
+            .expect("the 4018 ladder must succeed via dispatch");
+
+        assert_eq!(*dispatch_calls.lock().unwrap(), 1, "command.dispatch WAS called");
+        assert_eq!(*submit_calls.lock().unwrap(), 1, "the skill message WAS submitted");
+        assert!(
+            matches!(outcome, SlashOutcome::Submitted),
+            "the FFI reports Submitted for the send/skill path: {outcome:?}"
+        );
+        // The user row is published through the T7c contract, showing the
+        // dispatch's `display` (non-empty wins over the message).
+        let deliveries = sink.transcript();
+        let user_rows: Vec<&TranscriptChangeDto> = deliveries
+            .iter()
+            .filter(|c| c.row_json.contains("\"kind\":\"user\""))
+            .collect();
+        assert_eq!(user_rows.len(), 1, "exactly one user row: {:?}", sink.transcript());
+        assert!(
+            user_rows[0].row_json.contains("/deploy"),
+            "the row shows the dispatch display: {:?}",
+            user_rows[0].row_json
+        );
+    }
+
+    /// Sibling of the 4018 test (review #14 finding 3): a non-4018
+    /// `slash.exec` error (4009) must NOT call `command.dispatch` and must
+    /// surface as `Err(CoreError::Rpc { code: 4009 })`. The policy unit
+    /// tests in `rpc/slash.rs` are not enough — this is the FFI path.
+    #[tokio::test]
+    async fn run_slash_does_not_dispatch_on_a_non_4018_exec_error() {
+        let dir = temp_dir("slash-4009-no-dispatch");
+        let dispatch_calls = Arc::new(StdMutex::new(0usize));
+        let d = Arc::clone(&dispatch_calls);
+        let gw = FakeGw::spawn(move |method, _params| {
+            let d = Arc::clone(&d);
+            async move {
+                match method.as_str() {
+                    "slash.exec" => Err(FakeRpcError::Coded {
+                        code: 4009,
+                        message: "session busy".into(),
+                    }),
+                    "command.dispatch" => {
+                        *d.lock().unwrap() += 1;
+                        Ok(json!({"type": "exec", "output": "should not run"}))
+                    }
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let (core, _sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let result = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/help".to_string())
+            .await;
+        match result {
+            Err(CoreError::Rpc { code, .. }) => {
+                assert_eq!(code, 4009, "the original slash.exec code is preserved");
+            }
+            other => panic!("4009 must surface as Rpc, got {other:?}"),
+        }
+        assert_eq!(
+            *dispatch_calls.lock().unwrap(),
+            0,
+            "command.dispatch must not run on a non-4018 slash.exec error"
+        );
+    }
+
+    /// Rule pinned (T10): a successful `slash.exec` output renders as
+    /// `Output` — and `command.dispatch` is NOT called for it.
+    #[tokio::test]
+    async fn run_slash_renders_exec_output_without_dispatching() {
+        let dir = temp_dir("slash-ok-output");
+        let dispatch_calls = Arc::new(StdMutex::new(0usize));
+        let d = Arc::clone(&dispatch_calls);
+        let gw = FakeGw::spawn(move |method, _params| {
+            let d = Arc::clone(&d);
+            async move {
+                match method.as_str() {
+                    "slash.exec" => Ok(json!({"output": "help"})),
+                    "command.dispatch" => {
+                        *d.lock().unwrap() += 1;
+                        Ok(json!({"type": "exec", "output": "WRONG"}))
+                    }
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let (core, _sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let outcome = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/help".to_string())
+            .await
+            .expect("run_slash");
+        assert!(
+            matches!(&outcome, SlashOutcome::Output { text } if text == "help"),
+            "the exec output becomes Output: {outcome:?}"
+        );
+        assert_eq!(
+            *dispatch_calls.lock().unwrap(),
+            0,
+            "a successful exec never falls back to dispatch"
+        );
+    }
+
+    /// Rule pinned (T10): a `slash.exec` warning is concatenated
+    /// Desktop-style (`warning: …\n{body}`) onto the output text.
+    #[tokio::test]
+    async fn run_slash_concatenates_the_exec_warning_desktop_style() {
+        let dir = temp_dir("slash-warning");
+        let gw = FakeGw::spawn(|method, _params| async move {
+            match method.as_str() {
+                "slash.exec" => Ok(json!({"output": "done", "warning": "config drifted"})),
+                _ => Ok(json!({})),
+            }
+        });
+        let (core, _sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let outcome = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/goal".to_string())
+            .await
+            .expect("run_slash");
+        assert!(
+            matches!(&outcome, SlashOutcome::Output { text } if text == "warning: config drifted\ndone"),
+            "warning rides on the output text: {outcome:?}"
+        );
+    }
+
+    /// Rule pinned (T10): the 4004 "empty command" is `SlashOutcome::Empty`,
+    /// NOT an error — and no dispatch or submit ever happens.
+    #[tokio::test]
+    async fn run_slash_maps_4004_to_empty_not_an_error() {
+        let dir = temp_dir("slash-4004-empty");
+        let gw = FakeGw::spawn(|method, _params| async move {
+            match method.as_str() {
+                // methods_tools.py:816 — `slash.exec` with an empty command.
+                "slash.exec" => Err(FakeRpcError::Coded {
+                    code: 4004,
+                    message: "empty command".into(),
+                }),
+                _ => Ok(json!({})),
+            }
+        });
+        let (core, _sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let outcome = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), String::new())
+            .await
+            .expect("4004 is Empty, not an error");
+        assert!(
+            matches!(outcome, SlashOutcome::Empty),
+            "the gateway's empty-command answer maps to Empty: {outcome:?}"
+        );
+    }
+
+    /// Rule pinned (T10): a `type:"prefill"` dispatch outcome comes back as
+    /// `SlashOutcome::Prefill` — composer input, never submitted.
+    #[tokio::test]
+    async fn run_slash_returns_prefill_without_submitting() {
+        let dir = temp_dir("slash-prefill");
+        let submit_calls = Arc::new(StdMutex::new(0usize));
+        let s = Arc::clone(&submit_calls);
+        let gw = FakeGw::spawn(move |method, _params| {
+            let s = Arc::clone(&s);
+            async move {
+                match method.as_str() {
+                    "slash.exec" => Err(FakeRpcError::Coded {
+                        code: 4018,
+                        message: "use command.dispatch for /model".into(),
+                    }),
+                    "command.dispatch" => Ok(json!({
+                        "type": "prefill", "message": "/model gpt-5"
+                    })),
+                    "prompt.submit" => {
+                        *s.lock().unwrap() += 1;
+                        Ok(json!({"status": "streaming"}))
+                    }
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let outcome = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/model".to_string())
+            .await
+            .expect("run_slash");
+        assert!(
+            matches!(&outcome, SlashOutcome::Prefill { text } if text == "/model gpt-5"),
+            "the prefill text goes back for the composer: {outcome:?}"
+        );
+        assert_eq!(
+            *submit_calls.lock().unwrap(),
+            0,
+            "a prefill is NEVER submitted"
+        );
+        assert!(
+            sink.transcript().is_empty(),
+            "and no user row is published for it: {:?}",
+            sink.transcript()
+        );
+    }
+
+    /// Rule pinned (T10): `type:"send"` submits its message (user row shows
+    /// the submitted text — a `send` carries no display override).
+    #[tokio::test]
+    async fn run_slash_submits_a_send_dispatch_and_publishes_the_message_row() {
+        let dir = temp_dir("slash-send");
+        let gw = FakeGw::spawn(|method, params| async move {
+            match method.as_str() {
+                "slash.exec" => Err(FakeRpcError::Coded {
+                    code: 4018,
+                    message: "use command.dispatch for /work".into(),
+                }),
+                "command.dispatch" => Ok(json!({
+                    "type": "send", "message": "kick off the build"
+                })),
+                "prompt.submit" => {
+                    assert_eq!(params["text"], "kick off the build");
+                    Ok(json!({"status": "streaming"}))
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let outcome = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/work now".to_string())
+            .await
+            .expect("run_slash");
+        assert!(
+            matches!(outcome, SlashOutcome::Submitted),
+            "send submits: {outcome:?}"
+        );
+        let deliveries = sink.transcript();
+        let user_rows: Vec<&TranscriptChangeDto> = deliveries
+            .iter()
+            .filter(|c| c.row_json.contains("\"kind\":\"user\""))
+            .collect();
+        assert_eq!(user_rows.len(), 1, "exactly one user row: {:?}", sink.transcript());
+        assert!(
+            user_rows[0].row_json.contains("kick off the build"),
+            "a send has no display, so the row shows the submitted text: {:?}",
+            user_rows[0].row_json
+        );
+    }
+
+    /// Rule pinned (T10): an `alias` dispatch re-runs the ladder for the
+    /// target (leading `/` preserved) — the second leg here resolves through
+    /// `slash.exec`, so the alias really re-entered the FULL ladder.
+    #[tokio::test]
+    async fn run_slash_follows_an_alias_target_through_the_whole_ladder() {
+        let dir = temp_dir("slash-alias");
+        let exec_texts = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let e = Arc::clone(&exec_texts);
+        let gw = FakeGw::spawn(move |method, params| {
+            let e = Arc::clone(&e);
+            async move {
+                match method.as_str() {
+                    "slash.exec" => {
+                        e.lock().unwrap().push(
+                            params["command"].as_str().unwrap_or("").to_string(),
+                        );
+                        if params["command"] == "/first" {
+                            Err(FakeRpcError::Coded {
+                                code: 4018,
+                                message: "use command.dispatch for /first".into(),
+                            })
+                        } else {
+                            Ok(json!({"output": "second leg done"}))
+                        }
+                    }
+                    "command.dispatch" => Ok(json!({
+                        "type": "alias", "target": "/second"
+                    })),
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let (core, _sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let outcome = core
+            .clone()
+            .run_slash("stored-alpha".to_string(), "/first".to_string())
+            .await
+            .expect("run_slash");
+        assert!(
+            matches!(&outcome, SlashOutcome::Output { text } if text == "second leg done"),
+            "the alias target's own output comes back: {outcome:?}"
+        );
+        assert_eq!(
+            *exec_texts.lock().unwrap(),
+            vec!["/first".to_string(), "/second".to_string()],
+            "the alias re-ran slash.exec for /second with its leading slash intact"
+        );
+    }
+
+    /// Rule pinned (T10): a cycle of aliases hits the cap and surfaces as a
+    /// stable `CoreError::Rpc` — never a panic, never an infinite loop.
+    #[tokio::test]
+    async fn run_slash_capped_alias_cycle_errors_instead_of_looping() {
+        let dir = temp_dir("slash-alias-cycle");
+        let gw = FakeGw::spawn(|method, _params| async move {
+            match method.as_str() {
+                // Every leg of the ladder is a 4018 whose dispatch aliases
+                // right back: `/a` -> `/b` -> `/a` -> ...
+                "slash.exec" => Err(FakeRpcError::Coded {
+                    code: 4018,
+                    message: "use command.dispatch".into(),
+                }),
+                "command.dispatch" => Ok(json!({
+                    "type": "alias", "target": "/b"
+                })),
+                _ => Ok(json!({})),
+            }
+        });
+        let (core, _sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            core.clone().run_slash("stored-alpha".to_string(), "/a".to_string()),
+        )
+        .await
+        .expect("the alias cycle must terminate, not hang");
+        match result {
+            Err(CoreError::Rpc { code, detail }) => {
+                assert_eq!(
+                    code, ALIAS_LOOP_CODE,
+                    "the cap is not 4018 (that code means dispatch)"
+                );
+                assert!(detail.contains("8 hops"), "stable cap detail: {detail}");
+            }
+            other => panic!("an alias cycle must error at the cap, got {other:?}"),
+        }
     }
 }
