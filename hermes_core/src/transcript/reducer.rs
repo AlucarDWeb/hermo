@@ -601,8 +601,15 @@ impl Reducer {
         vec![TranscriptChange::RowAppended { index }]
     }
 
+    /// The most recent unpaired `tool.generating` placeholder for `name`.
+    ///
+    /// Searched from the END on purpose. A turn interrupted between
+    /// `tool.generating` and `tool.start` leaves its placeholder unpaired on
+    /// the transcript forever; a forward scan then bound the NEXT run of the
+    /// same tool to that abandoned row far up the transcript, updating it
+    /// instead of the fresh placeholder and orphaning the new card.
     fn pending_generating_row(&self, name: &str) -> Option<usize> {
-        self.state.rows.iter().position(|row| {
+        self.state.rows.iter().rposition(|row| {
             matches!(&row.kind, RowKind::Tool(card) if card.tool_id.is_empty() && card.name == name)
         })
     }
@@ -712,6 +719,42 @@ mod tests {
         match &row.kind {
             RowKind::Assistant { text, .. } => text,
             other => panic!("row {} is not an assistant row: {:?}", row.index, other),
+        }
+    }
+
+    /// Rule pinned: a `tool.start` pairs with the MOST RECENT unpaired
+    /// `tool.generating` placeholder, not the first one on the transcript.
+    /// A turn interrupted between generating and start leaves its placeholder
+    /// unpaired forever; a forward scan bound the next run of the same tool to
+    /// that abandoned row, updating history and orphaning the fresh card.
+    #[test]
+    fn tool_start_pairs_with_the_newest_placeholder_not_an_abandoned_one() {
+        let mut r = Reducer::new();
+        // Turn 1: a placeholder that never gets its tool.start (interrupted).
+        r.apply(&event("tool.generating", json!({"name": "Bash"})));
+        // Turn 2: a fresh placeholder, then its start.
+        r.apply(&event("tool.generating", json!({"name": "Bash"})));
+        r.apply(&event("tool.start", json!({"tool_id": "t-2", "name": "Bash"})));
+
+        let rows = &r.transcript().rows;
+        assert_eq!(rows.len(), 2, "one card per generating, none invented");
+        match (&rows[0].kind, &rows[1].kind) {
+            (RowKind::Tool(abandoned), RowKind::Tool(fresh)) => {
+                assert_eq!(abandoned.tool_id, "", "the abandoned card stays unpaired");
+                assert_eq!(fresh.tool_id, "t-2", "the newest placeholder took the id");
+            }
+            other => panic!("expected two tool rows, got {other:?}"),
+        }
+
+        // The completion must land on the row that was actually started.
+        r.apply(&event("tool.complete", json!({"tool_id": "t-2", "result": {"ok": true}})));
+        match &r.transcript().rows[1].kind {
+            RowKind::Tool(card) => assert!(card.complete, "the fresh card completed"),
+            other => panic!("expected a tool row, got {other:?}"),
+        }
+        match &r.transcript().rows[0].kind {
+            RowKind::Tool(card) => assert!(!card.complete, "history was not rewritten"),
+            other => panic!("expected a tool row, got {other:?}"),
         }
     }
 

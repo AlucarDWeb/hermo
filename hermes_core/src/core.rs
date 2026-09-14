@@ -48,6 +48,22 @@ const SESSIONS_FILE: &str = "sessions.json";
 const LOCAL_CLOSE_REASON: &str = "user logout";
 /// Terminal cols used when a session is created without a UI-provided value.
 const DEFAULT_COLS: i64 = 80;
+/// How often the supervisor flushes a dirty session registry to disk. The
+/// watermark moves with every streamed event, so writing the file inline
+/// rewrote it hundreds of times per turn; the writes are coalesced and the
+/// worst case after a crash is re-replaying a few seconds of events, which
+/// `events.since` already handles.
+const REGISTRY_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Flatten the `JoinHandle` of a body delegated onto the core's runtime.
+///
+/// Every exported async method ends in this. The handle is always cloned out
+/// of `self` first at the call site: `self.handle.spawn(async move { self… })`
+/// borrows `self` for the whole call while the future moves it (E0505).
+async fn joined<T>(task: tokio::task::JoinHandle<Result<T, CoreError>>) -> Result<T, CoreError> {
+    task.await
+        .map_err(|e| CoreError::Io(format!("join: {e}")))?
+}
 
 // ── FFI DTOs (plain data only, PLAN §3) ─────────────────────────────────────
 
@@ -252,6 +268,12 @@ pub struct HermesCore {
     inner: Mutex<CoreState>,
     /// Shared with the supervisor task so `disconnect()` can stop it.
     stop_flag: Arc<AtomicBool>,
+    /// Wakes the reconnect ladder out of its backoff sleep the moment
+    /// `stop_flag` is raised, so the ladder never polls the flag.
+    stop_notify: Arc<tokio::sync::Notify>,
+    /// Set when an event moved a watermark; cleared by `flush_registry`.
+    /// See [`REGISTRY_FLUSH_INTERVAL`].
+    registry_dirty: Arc<AtomicBool>,
     /// True while a supervisor task is alive (PLAN §3: ONE supervisor).
     /// `app_did_foreground` checks it so a foreground probe never races a
     /// second supervisor against a live reconnect ladder.
@@ -408,17 +430,16 @@ impl HermesCore {
                 history_epoch: 0,
             }),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
+            registry_dirty: Arc::new(AtomicBool::new(false)),
             supervising: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Parse a `hermes://connect?...` QR payload without pairing yet.
     pub async fn parse_qr(self: Arc<Self>, payload: String) -> Result<EndpointDto, CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 let ep = parse_qr_payload(&payload)?;
                 Ok(EndpointDto {
                     base_url: ep.base_url.to_string(),
@@ -426,16 +447,15 @@ impl HermesCore {
                     display_name: ep.display_name,
                 })
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// The paired endpoint, if any (from disk at construction).
     pub async fn saved_endpoint(self: Arc<Self>) -> Option<EndpointDto> {
         let handle = self.handle.clone();
         let this = Arc::clone(&self);
-        handle
-            .spawn(async move {
+        handle.spawn(async move {
                 this.inner.lock().endpoint.as_ref().map(|ep| EndpointDto {
                     base_url: ep.base_url.to_string(),
                     username: ep.username.clone(),
@@ -449,11 +469,8 @@ impl HermesCore {
 
     /// Pair from a QR payload: parse, validate and persist (no login yet).
     pub async fn pair(self: Arc<Self>, payload: String) -> Result<EndpointDto, CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 let ep = parse_qr_payload(&payload)?;
                 let _ = Self::save_endpoint(&self.data_dir, &ep);
                 self.inner.lock().endpoint = Some(ep.clone());
@@ -463,18 +480,15 @@ impl HermesCore {
                     display_name: ep.display_name,
                 })
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Password login against the paired endpoint (policy lives in the auth
     /// adapter: 401 → `InvalidCredentials`, 429 → `RateLimited`, …).
     pub async fn login(self: Arc<Self>, password: String) -> Result<(), CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 let (base, username) = {
                     let state = self.inner.lock();
                     let ep = state.endpoint.as_ref().ok_or(CoreError::NotConnected)?;
@@ -493,22 +507,19 @@ impl HermesCore {
                 };
                 auth.login(&base, &username, &password).await
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Forget the gateway: drop the endpoint file, the tab list and the
     /// cookies. Transcripts are irrelevant after this (logout wipes tabs).
     pub async fn forget_gateway(self: Arc<Self>) -> Result<(), CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 // Stop the supervisor first: it must not keep a socket open
                 // (and reconnect!) for a gateway the app just forgot. It
                 // clears its own `supervising` flag when it exits.
-                self.stop_flag.store(true, Ordering::Relaxed);
+                self.signal_stop();
                 if let Some(client) = self.inner.lock().client.take() {
                     client.close(LOCAL_CLOSE_REASON);
                 }
@@ -522,8 +533,8 @@ impl HermesCore {
                 state.emitted_approvals.clear();
                 Ok(())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Open (or resume) a chat tab. `stored_id = None` mints a new session
@@ -537,13 +548,10 @@ impl HermesCore {
         stored_id: Option<String>,
         cols: i64,
     ) -> Result<String, CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move { self.open_session_inner(stored_id, cols).await })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        joined(handle.spawn(async move { self.open_session_inner(stored_id, cols).await })
+        )
+        .await
     }
 
     async fn open_session_inner(
@@ -556,22 +564,17 @@ impl HermesCore {
             state.client.clone().ok_or(CoreError::NotConnected)?
         };
         let cols = if cols <= 0 { DEFAULT_COLS } else { cols };
-        let (key, live_sid, mut changes, title, messages) = match &stored_id {
+        let (key, live_sid, messages) = match &stored_id {
             None => {
                 let created = api::create_session(&client, cols).await?;
-                (
-                    created.stored_session_id.clone(),
-                    created.session_id.clone(),
-                    Vec::new(),
-                    String::new(),
-                    Vec::new(),
-                )
+                (created.stored_session_id, created.session_id, Vec::new())
             }
             Some(id) => {
                 let resumed = api::resume_session(&client, id).await?;
-                (id.clone(), resumed.session_id.clone(), Vec::new(), String::new(), resumed.messages)
+                (id.clone(), resumed.session_id, resumed.messages)
             }
         };
+        let mut changes = Vec::new();
         let mut state = self.inner.lock();
         // A fresh LiveSession is a rebuild: bump the epoch so an in-flight
         // `send` that snapshotted the PREVIOUS session under this key can
@@ -588,12 +591,23 @@ impl HermesCore {
         }
         state.sessions.insert(key.clone(), live);
         state.sid_index.insert(live_sid, key.clone());
+        // Re-opening a tab must not blank what the last run persisted: an
+        // `upsert` of a fresh record dropped the replay epoch (which the
+        // reconnect rebuild check needs non-empty to fire) and the title,
+        // leaving the titlebar empty until a `session.title` event happened to
+        // land. The transcript IS rebuilt from `messages` here, so the
+        // watermark does reset; the epoch and title do not.
+        let (title, replay_epoch) = state
+            .registry
+            .get(&key)
+            .map(|rec| (rec.title.clone(), rec.replay_epoch.clone()))
+            .unwrap_or_default();
         state.registry.upsert(SessionRecord {
             stored_id: key.clone(),
             last_seen_seq: 0,
-            replay_epoch: String::new(),
+            replay_epoch,
             cols,
-            title: title.clone(),
+            title,
         });
         state.registry.set_active(Some(&key));
         let _ = Self::save_registry(&self.data_dir, &state.registry);
@@ -617,11 +631,8 @@ impl HermesCore {
     /// Close a tab: remove it from the core state and the registry. The
     /// server keeps the durable session (it can be re-opened later).
     pub async fn close_session(self: Arc<Self>, key: String) -> Result<(), CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 let mut state = self.inner.lock();
                 if let Some(live) = state.sessions.remove(&key) {
                     state.sid_index.remove(&live.live_sid);
@@ -631,16 +642,15 @@ impl HermesCore {
                 let _ = Self::save_registry(&self.data_dir, &state.registry);
                 Ok(())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// The open tabs with their header + running flags (the tab strip).
     pub async fn open_sessions(self: Arc<Self>) -> Vec<SessionSummary> {
         let handle = self.handle.clone();
         let this = Arc::clone(&self);
-        handle
-            .spawn(async move {
+        handle.spawn(async move {
                 let state = this.inner.lock();
                 state
                     .registry
@@ -674,6 +684,27 @@ impl HermesCore {
             .unwrap_or_default()
     }
 
+    /// The durable key of the tab that was active when the app last ran, if
+    /// the registry still holds it. The app resumes this instead of minting a
+    /// fresh session on every launch — without it `sessions.json` grew by one
+    /// record per launch and nothing ever read the tab list back.
+    pub async fn last_active_session(self: Arc<Self>) -> Option<String> {
+        let handle = self.handle.clone();
+        let this = Arc::clone(&self);
+        handle
+            .spawn(async move {
+                let state = this.inner.lock();
+                let active = state.registry.active_key()?;
+                state
+                    .registry
+                    .get(active)
+                    .map(|rec| rec.stored_id.clone())
+            })
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Submit a prompt to the session `key` (T7c contract). On a SUCCESSFUL
     /// submit the core appends the user's own row to the transcript and
     /// delivers it through the same sink fan-out the wire events use — the
@@ -694,11 +725,8 @@ impl HermesCore {
     /// per-session history epoch is captured before the await and re-checked
     /// under the lock.
     pub async fn send(self: Arc<Self>, key: String, text: String) -> Result<(), CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 // One lock for all three: client, live sid and the history
                 // epoch snapshot used by the post-submit race re-check.
                 let (client, live_sid, history_epoch) = {
@@ -751,36 +779,31 @@ impl HermesCore {
                 }
                 Ok(())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Interrupt the running turn of session `key`.
     pub async fn interrupt(self: Arc<Self>, key: String) -> Result<(), CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
-                let client = {
+        joined(handle.spawn(async move {
+                let (client, live_sid) = {
                     let state = self.inner.lock();
-                    state.client.clone().ok_or(CoreError::NotConnected)?
-                };
-                let live_sid = {
-                    let state = self.inner.lock();
-                    state
+                    let client = state.client.clone().ok_or(CoreError::NotConnected)?;
+                    let live_sid = state
                         .sessions
                         .get(&key)
                         .map(|l| l.live_sid.clone())
-                        .ok_or(CoreError::NotConnected)?
+                        .ok_or(CoreError::NotConnected)?;
+                    (client, live_sid)
                 };
                 api::interrupt(&client, &live_sid)
                     .await
                     .map(|_| ())
                     .map_err(CoreError::from)
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Answer an approval card. Resolves the local card only after the RPC
@@ -791,22 +814,17 @@ impl HermesCore {
         request_id: String,
         choice: String,
     ) -> Result<(), CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
-                let client = {
+        joined(handle.spawn(async move {
+                let (client, live_sid) = {
                     let state = self.inner.lock();
-                    state.client.clone().ok_or(CoreError::NotConnected)?
-                };
-                let live_sid = {
-                    let state = self.inner.lock();
-                    state
+                    let client = state.client.clone().ok_or(CoreError::NotConnected)?;
+                    let live_sid = state
                         .sessions
                         .get(&key)
                         .map(|l| l.live_sid.clone())
-                        .ok_or(CoreError::NotConnected)?
+                        .ok_or(CoreError::NotConnected)?;
+                    (client, live_sid)
                 };
                 api::respond_approval(&client, &live_sid, &request_id, &choice).await?;
                 let (changes, rows, sink) = {
@@ -832,8 +850,8 @@ impl HermesCore {
                 }
                 Ok(())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Answer a clarification card (single or batch: `answer`/`question_id`
@@ -846,22 +864,17 @@ impl HermesCore {
         answer: String,
         question_id: Option<String>,
     ) -> Result<(), CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
-                let client = {
+        joined(handle.spawn(async move {
+                let (client, live_sid) = {
                     let state = self.inner.lock();
-                    state.client.clone().ok_or(CoreError::NotConnected)?
-                };
-                let live_sid = {
-                    let state = self.inner.lock();
-                    state
+                    let client = state.client.clone().ok_or(CoreError::NotConnected)?;
+                    let live_sid = state
                         .sessions
                         .get(&key)
                         .map(|l| l.live_sid.clone())
-                        .ok_or(CoreError::NotConnected)?
+                        .ok_or(CoreError::NotConnected)?;
+                    (client, live_sid)
                 };
                 api::respond_clarify(
                     &client,
@@ -895,43 +908,35 @@ impl HermesCore {
                 }
                 Ok(())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Run a slash command in session `key` (e.g. `/model`).
     pub async fn run_slash(self: Arc<Self>, key: String, command: String) -> Result<String, CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
-                let client = {
+        joined(handle.spawn(async move {
+                let (client, live_sid) = {
                     let state = self.inner.lock();
-                    state.client.clone().ok_or(CoreError::NotConnected)?
-                };
-                let live_sid = {
-                    let state = self.inner.lock();
-                    state
+                    let client = state.client.clone().ok_or(CoreError::NotConnected)?;
+                    let live_sid = state
                         .sessions
                         .get(&key)
                         .map(|l| l.live_sid.clone())
-                        .ok_or(CoreError::NotConnected)?
+                        .ok_or(CoreError::NotConnected)?;
+                    (client, live_sid)
                 };
                 let value = api::slash_exec(&client, &live_sid, &command).await?;
                 Ok(json::str_at(&value, "output").to_string())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Composer completion (gateway-global, no session key).
     pub async fn complete_slash(self: Arc<Self>, text: String) -> Result<Vec<SlashCompletionDto>, CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 let client = {
                     let state = self.inner.lock();
                     state.client.clone().ok_or(CoreError::NotConnected)?
@@ -947,17 +952,14 @@ impl HermesCore {
                     })
                     .collect())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Split markdown text into blocks (entity rule, exposed over FFI).
     pub async fn split_markdown(self: Arc<Self>, text: String) -> Vec<MarkdownBlockDto> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        handle.spawn(async move {
                 split_blocks(&text)
                     .into_iter()
                     .map(|b| MarkdownBlockDto {
@@ -973,11 +975,8 @@ impl HermesCore {
 
     /// The gateway's own `session.list` (the remote session picker).
     pub async fn list_remote_sessions(self: Arc<Self>) -> Result<Vec<RemoteSessionDto>, CoreError> {
-        // Clone the handle out first: calling `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 let client = {
                     let state = self.inner.lock();
                     state.client.clone().ok_or(CoreError::NotConnected)?
@@ -994,8 +993,8 @@ impl HermesCore {
                     })
                     .collect())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Deliberate disconnect (PI_TASK_T5A §3): set `stop_flag` so the
@@ -1006,21 +1005,21 @@ impl HermesCore {
     /// offline).
     pub async fn disconnect(self: Arc<Self>) -> Result<(), CoreError> {
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
-                self.stop_flag.store(true, Ordering::Relaxed);
+        joined(handle.spawn(async move {
+                self.signal_stop();
                 let client = self.inner.lock().client.take();
                 if let Some(client) = client {
                     client.close(LOCAL_CLOSE_REASON);
                 }
+                self.flush_registry();
                 // No `Closed` emission here: the SUPERVISOR observes the
                 // client's state watch and is the single source of connection
                 // status. Emitting here too produced two `Closed` events per
                 // user action (caught by the live gate).
                 Ok(())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// The app came back to the foreground: probe the connection with the
@@ -1029,8 +1028,7 @@ impl HermesCore {
     /// everything itself; this must never spawn a second one (PLAN §3).
     pub async fn app_did_foreground(self: Arc<Self>) -> Result<(), CoreError> {
         let handle = self.handle.clone();
-        handle
-            .spawn(async move {
+        joined(handle.spawn(async move {
                 // A live supervisor owns recovery: just probe (the dead
                 // peer will trip its own deadline / reconnect ladder).
                 if self.supervising.load(Ordering::Relaxed) {
@@ -1067,8 +1065,8 @@ impl HermesCore {
                 drop(self.handle.spawn(Self::supervise(self.clone(), client, sink)));
                 Ok(())
             })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        )
+        .await
     }
 
     /// Connect to the paired gateway (PLAN §4 T5 item 1 / PI_TASK_T5A §1).
@@ -1081,13 +1079,10 @@ impl HermesCore {
     /// key-routed fan-out, the reconnect ladder and the per-session resume.
     /// The state lock is never held across an `.await`.
     pub async fn connect(self: Arc<Self>, sink: Arc<dyn EventSink>) -> Result<(), CoreError> {
-        // Clone the handle out first: `self.runtime.spawn(async move { self… })`
-        // borrows `self` for the whole call while the future moves it (E0505).
         let handle = self.handle.clone();
-        handle
-            .spawn(async move { self.connect_inner(sink).await })
-            .await
-            .map_err(|e| CoreError::Io(format!("join: {e}")))?
+        joined(handle.spawn(async move { self.connect_inner(sink).await })
+        )
+        .await
     }
 }
 
@@ -1176,50 +1171,92 @@ impl HermesCore {
             let mut state = current.state();
             sink.on_connection(ConnectionStatus::Connecting);
 
+            // `GatewayClient::connect` marks the state Open before it returns,
+            // and `watch::Sender::subscribe` hands back a receiver that already
+            // counts the current value as seen — so `state.changed()` below
+            // never fires for THIS connection's Open and the arm in the select
+            // was unreachable. Publish from the initial value instead, or the
+            // app never hears that the socket came up.
+            let mut dead_on_arrival = false;
+            match state.borrow_and_update().clone() {
+                ConnectionState::Open => {
+                    attempt = 0;
+                    sink.on_connection(ConnectionStatus::Open);
+                }
+                ConnectionState::Closed(reason) => {
+                    sink.on_connection(ConnectionStatus::Closed { reason: reason.clone() });
+                    if reason == LOCAL_CLOSE_REASON {
+                        self.flush_registry();
+                        return;
+                    }
+                    // Already terminal: the watch will never change again and
+                    // the broadcast keepalive means `recv()` would block
+                    // forever, so skip the event loop and take the ladder.
+                    dead_on_arrival = true;
+                }
+                _ => {}
+            }
+
             // ── resume phase: every open session, every (re)connect ─────
             let fresh_epoch = current.replay_epoch();
-            self.resume_all(&current, &fresh_epoch, &sink).await;
+            if !dead_on_arrival {
+                self.resume_all(&current, &fresh_epoch, &sink).await;
+            }
 
             // ── event loop ───────────────────────────────────────────────
-            loop {
-                tokio::select! {
-                    ev = events.recv() => match ev {
-                        Ok(GatewayEvent::Event(params)) => {
-                            self.deliver_event(&params, &sink);
+            let mut flush_tick = tokio::time::interval(REGISTRY_FLUSH_INTERVAL);
+            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            flush_tick.tick().await; // the first tick resolves immediately
+            // The flag cannot change inside the loop, so this is a guard,
+            // not a condition (clippy::while_immutable_condition).
+            if !dead_on_arrival {
+                loop {
+                    tokio::select! {
+                        _ = flush_tick.tick() => {
+                            self.flush_registry();
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            // Broadcast overflow: fill the gap from the
-                            // per-session watermarks.
-                            log::warn!("supervisor lagged, dropped {n} events");
-                            self.catch_up_all(&current, &fresh_epoch, &sink).await;
-                        }
-                        Err(_) => break, // sender dropped: connection over
-                    },
-                    changed = state.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        match state.borrow().clone() {
-                            ConnectionState::Open => {
-                                attempt = 0; // successful connect resets the ladder
-                                sink.on_connection(ConnectionStatus::Open);
+                        ev = events.recv() => match ev {
+                            Ok(GatewayEvent::Event(params)) => {
+                                self.deliver_event(&params, &sink);
                             }
-                            ConnectionState::Closed(reason) => {
-                                sink.on_connection(ConnectionStatus::Closed { reason: reason.clone() });
-                                if reason == LOCAL_CLOSE_REASON {
-                                    // Deliberate local disconnect: never
-                                    // reconnect after it (PI_TASK_T5A §3).
-                                    return;
-                                }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                // Broadcast overflow: fill the gap from the
+                                // per-session watermarks.
+                                log::warn!("supervisor lagged, dropped {n} events");
+                                self.catch_up_all(&current, &sink).await;
+                            }
+                            Err(_) => break, // sender dropped: connection over
+                        },
+                        changed = state.changed() => {
+                            if changed.is_err() {
                                 break;
                             }
-                            _ => {}
+                            match state.borrow().clone() {
+                                ConnectionState::Open => {
+                                    attempt = 0; // successful connect resets the ladder
+                                    sink.on_connection(ConnectionStatus::Open);
+                                }
+                                ConnectionState::Closed(reason) => {
+                                    sink.on_connection(ConnectionStatus::Closed { reason: reason.clone() });
+                                    if reason == LOCAL_CLOSE_REASON {
+                                        // Deliberate local disconnect: never
+                                        // reconnect after it (PI_TASK_T5A §3).
+                                        self.flush_registry();
+                                        return;
+                                    }
+                                    break;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
             }
 
             // ── reconnect ladder ─────────────────────────────────────────
+            // The socket is down: the watermarks are worth more on disk than
+            // in memory now.
+            self.flush_registry();
             if self.stop_flag.load(Ordering::Relaxed) {
                 return;
             }
@@ -1236,6 +1273,7 @@ impl HermesCore {
                 .await
                 .is_ok()
                 {
+                    self.flush_registry();
                     return;
                 }
                 match self.establish().await {
@@ -1250,6 +1288,7 @@ impl HermesCore {
                     Err(CoreError::SessionExpired) => {
                         // Auth is gone: the user must re-enter the password.
                         // Transcripts survive (kept in `sessions`).
+                        self.flush_registry();
                         sink.on_connection(ConnectionStatus::NeedsPassword);
                         return;
                     }
@@ -1289,8 +1328,8 @@ impl HermesCore {
             (deliveries, !routed.is_empty())
         };
         if registry_updates {
-            let state = self.inner.lock();
-            let _ = Self::save_registry(&self.data_dir, &state.registry);
+            // Coalesced, never written inline: see REGISTRY_FLUSH_INTERVAL.
+            self.registry_dirty.store(true, Ordering::Relaxed);
         }
         for batch in deliveries {
             for change in batch {
@@ -1300,9 +1339,35 @@ impl HermesCore {
     }
 
     /// Resolve when `stop_flag` is set (the ladder's interruptible sleep).
+    /// The `notified()` future is registered BEFORE the flag is read, so a
+    /// `signal_stop` landing between the two still wakes this future instead
+    /// of parking it for the rest of the backoff step.
     async fn sleep_until_stopped(&self) {
-        while !self.stop_flag.load(Ordering::Relaxed) {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        loop {
+            let waiter = self.stop_notify.notified();
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            waiter.await;
+        }
+    }
+
+    /// Raise the stop flag and wake every waiter on it.
+    fn signal_stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.stop_notify.notify_waiters();
+    }
+
+    /// Write the session registry out if an event moved a watermark since the
+    /// last flush. A no-op when nothing changed.
+    fn flush_registry(&self) {
+        if !self.registry_dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let state = self.inner.lock();
+        if let Err(e) = Self::save_registry(&self.data_dir, &state.registry) {
+            log::warn!("session registry flush failed: {e}");
+            self.registry_dirty.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1437,7 +1502,7 @@ impl HermesCore {
 
     /// Gap fill after a broadcast lag: the transcript state is intact, only
     /// the missed frames must be replayed per watermark.
-    async fn catch_up_all(&self, client: &GatewayClient, fresh_epoch: &str, sink: &Arc<dyn EventSink>) {
+    async fn catch_up_all(&self, client: &GatewayClient, sink: &Arc<dyn EventSink>) {
         let snapshots: Vec<(String, i64)> = {
             let state = self.inner.lock();
             state
@@ -1465,7 +1530,6 @@ impl HermesCore {
                 self.deliver_event(&params, sink);
             }
         }
-        let _ = fresh_epoch;
     }
 
     /// Re-emit unresolved `approval.pending` cards after a (re)connect,
@@ -1502,8 +1566,13 @@ impl HermesCore {
                 if request_id.is_empty() {
                     continue;
                 }
-                let (already, changes, rows) = {
+                let (changes, rows) = {
                     let mut state = self.inner.lock();
+                    // Dedupe BEFORE touching the reducer. Applying the card
+                    // first and only then honouring `already` appended a row
+                    // the sink never heard about, so the core's transcript and
+                    // the app's row list drifted apart by one and every later
+                    // index in the change stream addressed the wrong row.
                     let already = state
                         .emitted_approvals
                         .get(&key)
@@ -1511,31 +1580,31 @@ impl HermesCore {
                         .unwrap_or(false);
                     let mut changes: Vec<SessionChange> = Vec::new();
                     let mut rows: Vec<Row> = Vec::new();
-                    if let Some(live) = state.sessions.get_mut(&key) {
-                        rows = live.reducer.transcript().rows.clone();
-                        // Dedupe, second half: a card already sitting on THIS
-                        // transcript unresolved is not re-emitted either.
-                        if !live.reducer.has_unresolved_approval(&request_id) {
-                            if let Some(emitted) =
-                                live.reducer.apply_approval_card(&key, &request_id, card)
-                            {
-                                changes = emitted;
-                                rows = live.reducer.transcript().rows.clone();
+                    if !already {
+                        if let Some(live) = state.sessions.get_mut(&key) {
+                            // Dedupe, second half: a card already sitting on
+                            // THIS transcript unresolved is not re-emitted.
+                            if !live.reducer.has_unresolved_approval(&request_id) {
+                                if let Some(emitted) =
+                                    live.reducer.apply_approval_card(&key, &request_id, card)
+                                {
+                                    changes = emitted;
+                                    rows = live.reducer.transcript().rows.clone();
+                                }
                             }
                         }
                     }
-                    (already, changes, rows)
+                    if !changes.is_empty() {
+                        state
+                            .emitted_approvals
+                            .entry(key.clone())
+                            .or_default()
+                            .push(request_id.clone());
+                    }
+                    (changes, rows)
                 };
-                if already || changes.is_empty() {
+                if changes.is_empty() {
                     continue;
-                }
-                {
-                    let mut state = self.inner.lock();
-                    state
-                        .emitted_approvals
-                        .entry(key.clone())
-                        .or_default()
-                        .push(request_id);
                 }
                 for change in &changes {
                     sink.on_transcript(change_to_dto(&key, &change.change, &rows));
@@ -1847,6 +1916,9 @@ mod tests {
     /// watermarks — survives building a NEW `HermesCore` over the same
     /// `data_dir`. Fails if `save_registry` stopped being atomic (a torn
     /// `sessions.json` would not parse) or losty (dropped fields).
+    ///
+    /// Also pins the write-coalescing contract: `deliver_event` only marks the
+    /// registry dirty, and `flush_registry` is the single writer.
     #[test]
     fn registry_round_trip_through_a_new_core_instance() {
         let dir = temp_dir("registry");
@@ -1866,6 +1938,22 @@ mod tests {
         core1.deliver_event(
             &ev("message.start", "live-A", 42, json!({})),
             &(sink.clone() as Arc<dyn EventSink>),
+        );
+        // Delivery marks the registry dirty and writes NOTHING: the file is
+        // rewritten on a timer, not once per streamed event
+        // (REGISTRY_FLUSH_INTERVAL). The flush is what persists.
+        assert!(
+            core1.registry_dirty.load(Ordering::Relaxed),
+            "delivery marks the registry dirty",
+        );
+        assert!(
+            !dir.join(SESSIONS_FILE).exists(),
+            "delivery does not write the registry inline",
+        );
+        core1.flush_registry();
+        assert!(
+            !core1.registry_dirty.load(Ordering::Relaxed),
+            "a flush clears the dirty flag",
         );
         drop(core1);
 
@@ -2013,6 +2101,42 @@ mod tests {
                 .unwrap_or(0)
         };
         assert_eq!(approval_rows, 1, "exactly one approval row exists");
+
+        // The case the dedupe used to get wrong: the request_id IS in the
+        // emitted set AND the card has since been resolved, so
+        // `has_unresolved_approval` says no. The old order applied the card to
+        // the reducer first and only then honoured the emitted set, appending
+        // a row the sink never heard about — the core's transcript and the
+        // app's row list then disagreed on every later index.
+        {
+            let mut state = core.inner.lock();
+            // An earlier step cleared the emitted set to exercise the other
+            // half of the guard; put req-1 back, then resolve the card.
+            state
+                .emitted_approvals
+                .insert("stored-alpha".to_string(), vec!["req-1".to_string()]);
+            let live = state.sessions.get_mut("stored-alpha").expect("session");
+            live.reducer.resolve_approval("stored-alpha", "req-1");
+        }
+        let deliveries_before = sink.transcript().len();
+        core.reemit_approvals(&client, &sink_dyn).await;
+        assert_eq!(
+            sink.transcript().len(),
+            deliveries_before,
+            "a resolved, already-emitted card delivers nothing",
+        );
+        let rows_after = {
+            let state = core.inner.lock();
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.transcript().rows.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            rows_after, 1,
+            "and appends no row the sink was never told about",
+        );
     }
 
     // ── test 5: the supervisor's ladder attempt behaviour ───────────────────

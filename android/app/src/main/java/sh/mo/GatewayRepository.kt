@@ -185,7 +185,7 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     }
 
     private suspend fun openMainSession(cols: Int) {
-        val key = core.openSession(null, cols.toLong())
+        val key = resumeLastOrCreate(cols)
         _currentKey.value = key
         // Register the tab immediately: the Ready screen's Send guard reads
         // this map, so an entry must exist before any header arrives.
@@ -197,6 +197,29 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         refreshHeader(key)
         _errorText.value = ""
         _phase.value = PhaseMachine.ready(headerModel(key) ?: "")
+    }
+
+    /**
+     * Resume the tab that was active when the app last ran, falling back to a
+     * fresh session.
+     *
+     * Passing `null` unconditionally minted a new session on every launch: the
+     * durable tab list was written and never read, so `sessions.json` grew by
+     * a record per launch and every reconnect then spent two RPCs per stale
+     * record resuming sessions nobody had open.
+     */
+    private suspend fun resumeLastOrCreate(cols: Int): String {
+        val last = core.lastActiveSession()
+        if (last != null) {
+            try {
+                return core.openSession(last, cols.toLong())
+            } catch (t: Throwable) {
+                // The server may have dropped it (pruned, expired, restarted):
+                // a new session is the right answer, not a dead screen.
+                applyError(t)
+            }
+        }
+        return core.openSession(null, cols.toLong())
     }
 
     private suspend fun refreshHeader(key: String) {

@@ -72,3 +72,50 @@ fun applyTranscriptChange(rows: List<String>, kind: String, index: Long, rowJson
         else -> rows // headerUpdated: no row change
     }
 }
+
+/**
+ * Incremental parse of the raw row JSON into [ChatRow]s.
+ *
+ * Two things this exists for.
+ *
+ * Identity: a row's id is its TRANSCRIPT index, not its position after the
+ * empty-row filter. `applyTranscriptChange` pads gaps with empty strings, so a
+ * filtered position shifts for every row after a gap the moment that gap is
+ * filled — and the transcript list keys on the id, so every later row looked
+ * like a brand new item: scroll position jumped and per-row state (expanded
+ * tool cards, thinking disclosures) reset mid-turn.
+ *
+ * Cost: a streaming turn rewrites ONE row's JSON per delta while recomposition
+ * happens for unrelated reasons too (the elapsed-time tick, IME insets, focus).
+ * Re-parsing the whole transcript each time is O(rows) of `JSONObject` per
+ * token; reusing the previous parse for every row whose JSON is unchanged
+ * makes it O(changed).
+ */
+class TranscriptRows {
+    private var lastRaw: List<String> = emptyList()
+    private var lastParsed: List<ChatRow?> = emptyList()
+    private var lastVisible: List<ChatRow> = emptyList()
+
+    fun of(raw: List<String>): List<ChatRow> {
+        // Reference equality, not structural: the same instance means nothing
+        // moved, and a structural compare would cost the per-row string
+        // comparison the incremental path below already does.
+        if (raw === lastRaw) return lastVisible
+        val parsed = ArrayList<ChatRow?>(raw.size)
+        for (index in raw.indices) {
+            val json = raw[index]
+            val reusable = index < lastRaw.size && lastRaw[index] == json
+            parsed.add(
+                when {
+                    reusable -> lastParsed[index]
+                    json.isEmpty() -> null
+                    else -> parseChatRow(index, json)
+                },
+            )
+        }
+        lastRaw = raw
+        lastParsed = parsed
+        lastVisible = parsed.filterNotNull()
+        return lastVisible
+    }
+}

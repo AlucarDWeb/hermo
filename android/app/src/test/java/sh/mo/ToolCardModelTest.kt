@@ -158,25 +158,31 @@ class ToolCardModelTest {
 
     @Test
     fun `row parsing carries the T8 payload fields through`() {
+        // `args` and `result` arrive as compact JSON STRINGS, the shape
+        // core.rs::row_json actually writes — not as nested objects.
         val tool = parseChatRow(
             0,
             """{"kind":"tool","tool_id":"t1","name":"terminal","complete":true,
-               "args":{"command":"ls"},"result":{"exit_code":0,"output":"x"},
+               "args":"{\"command\":\"ls\"}","result":"{\"exit_code\":0,\"output\":\"x\"}",
                "duration_s":12.0}""",
         ) as ChatRow.Tool
         assertTrue(tool.complete)
         assertTrue(tool.argsJson.contains("command"))
         assertTrue(tool.resultJson.contains("exit_code"))
         assertEquals("", tool.inlineDiff)
+        assertTrue("exit code 0 is a real value, not absence", tool.exitCode == 0)
         assertEquals(12.0, tool.durationS, 0.001)
 
-        // inline_diff hides under result (Desktop's inlineDiffFromResult)
+        // inline_diff hides inside the result STRING (Desktop's
+        // inlineDiffFromResult). Reading `result` as an object found nothing,
+        // so no tool card ever rendered a diff.
         val diff = parseChatRow(
             1,
             """{"kind":"tool","name":"patch","complete":true,
-               "result":{"inline_diff":"--- a\n+++ b\n+hi"},"duration_s":1.0}""",
+               "result":"{\"inline_diff\":\"--- a\\n+++ b\\n+hi\"}","duration_s":1.0}""",
         ) as ChatRow.Tool
-        assertTrue(diff.inlineDiff.startsWith("---"))
+        assertTrue("diff found inside the result string", diff.inlineDiff.startsWith("---"))
+        assertNull("an absent exit code stays null", diff.exitCode)
 
         // assistant usage crosses untyped
         val assistant = parseChatRow(
