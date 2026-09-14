@@ -6,6 +6,8 @@ import uniffi.hermes_core.EndpointDto
 import uniffi.hermes_core.EventSink
 import uniffi.hermes_core.HermesCore
 import uniffi.hermes_core.SessionSummary
+import uniffi.hermes_core.SlashCompletionsDto
+import uniffi.hermes_core.SlashOutcome
 import uniffi.hermes_core.TranscriptChangeDto
 import uniffi.hermes_core.TranscriptChangeKind
 import kotlinx.coroutines.CoroutineScope
@@ -277,6 +279,38 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             applyError(t)
             false
         }
+    }
+
+    /**
+     * T10b: run a slash command through the core's ladder (`slash.exec` →
+     * `command.dispatch` fallback), on the session key the repository owns —
+     * the same ownership rule `send` enforces. The returned [SlashOutcome]
+     * drives the composer (Output banner / Prefill draft / clear), never the
+     * transcript directly.
+     */
+    suspend fun runSlash(command: String): SlashOutcome? {
+        val key: String = _currentKey.value ?: run {
+            _errorText.value = "No open session to send into"
+            return null
+        }
+        return try {
+            val outcome = core.runSlash(key, command)
+            _errorText.value = ""
+            outcome
+        } catch (t: Throwable) {
+            applyError(t)
+            null
+        }
+    }
+
+    /**
+     * T10b: composer completion (`complete.slash`) — the popup's rows. A
+     * failure yields an empty list (the popup just hides), never a crash.
+     */
+    suspend fun completeSlash(text: String): SlashCompletionsDto? = try {
+        core.completeSlash(text)
+    } catch (_: Throwable) {
+        null
     }
 
     /** Interrupt the session's running turn (the composer's Stop). */
