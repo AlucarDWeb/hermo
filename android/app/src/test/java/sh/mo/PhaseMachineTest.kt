@@ -96,4 +96,44 @@ class PhaseMachineTest {
         val connecting: AppPhase = AppPhase.Connecting
         assertEquals(connecting, PhaseMachine.reduce(connecting, PhaseMachine.ConnEvent.Header("m"), "e"))
     }
+
+    /**
+     * T11 (empty-jar dead-end): a connect failure whose Throwable is
+     * auth-shaped (SessionExpired with an EMPTY UniFFI message — the jar is
+     * gone, `Closed("error: ")` carried no class information) must land on
+     * NeedsPassword when an endpoint is saved, never Offline. RED against
+     * today's code: there is no AuthFailed event and the synthesized
+     * `Closed("error: ")` reduces to Offline.
+     */
+    @Test
+    fun `auth-shaped failure with a saved endpoint asks for the password`() {
+        val ep = "http://192.168.1.48:9123 (hermo)"
+        var p: AppPhase = PhaseMachine.reduce(AppPhase.Connecting, PhaseMachine.ConnEvent.AuthFailed, ep)
+        assertEquals(AppPhase.NeedsPassword(ep), p)
+
+        // Same failure on a READY screen (cookie expired mid-session): the
+        // sheet must say it overlays the transcript.
+        p = PhaseMachine.reduce(PhaseMachine.ready("m"), PhaseMachine.ConnEvent.AuthFailed, ep, hasLiveSession = true)
+        assertEquals(AppPhase.NeedsPassword(ep, overlay = true), p)
+    }
+
+    @Test
+    fun `auth failure with no saved endpoint stays unpaired`() {
+        val p = PhaseMachine.reduce(AppPhase.Connecting, PhaseMachine.ConnEvent.AuthFailed, "")
+        assertEquals(AppPhase.Unpaired, p)
+    }
+
+    /** A genuine transport close still goes Offline — even with an empty reason. */
+    @Test
+    fun `genuine transport close stays offline`() {
+        val p = PhaseMachine.reduce(PhaseMachine.ready("m"), PhaseMachine.ConnEvent.Closed("connection reset"), "e")
+        assertEquals(AppPhase.Offline("connection reset"), p)
+    }
+
+    /** The overlay flag is false when no transcript existed (first pair). */
+    @Test
+    fun `password ask after first pair has no overlay`() {
+        val p = PhaseMachine.reduce(AppPhase.Connecting, PhaseMachine.ConnEvent.AuthFailed, "ep", hasLiveSession = false)
+        assertEquals(AppPhase.NeedsPassword("ep", overlay = false), p)
+    }
 }

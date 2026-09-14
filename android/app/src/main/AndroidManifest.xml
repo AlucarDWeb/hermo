@@ -4,6 +4,10 @@
 
     <!-- The app talks to the self-hosted Hermes gateway over the tailnet. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- T11: the ConnectivityManager network callback (offline → retry when
+         the network returns) requires the network-state query permission;
+         normal, not runtime-requested. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- QR pairing without Google Play Services: our own CameraX+ZXing scan
          screen (T6b). Requested at runtime before the camera opens; a
          denial shows a readable line, never a crash. -->

@@ -55,7 +55,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var completionJob: Job? = null
     private var bannerGeneration = 0
 
+    /**
+     * The model of the last Ready state, for T11's overlay ask: a re-login
+     * sheet must render over the transcript it interrupted, and the
+     * NeedsPassword phase carries no model — the last known one is shown
+     * until the login lands a fresh header.
+     */
+    var lastReadyModel: String = ""
+        private set
+
     init {
+        // Track the last Ready model for the T11 overlay ask (see
+        // [lastReadyModel]). The flow read runs on Main (the repository's
+        // scope is Main.immediate), so a plain field write is safe.
+        viewModelScope.launch {
+            phase.collect { if (it is AppPhase.Ready) lastReadyModel = it.model }
+        }
         // Relaunch path (checklist: 1 h / 25 h later must not ask for the
         // password): saved endpoint + cookie jar first.
         viewModelScope.launch {
@@ -113,15 +128,75 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.send(text) }
     }
 
+    // ── T11: lifecycle / reconnect / session picker ─────────────────────
+
+    private val _remoteSessions = MutableStateFlow<List<RemoteSessionRow>>(emptyList())
+    val remoteSessions: StateFlow<List<RemoteSessionRow>> = _remoteSessions.asStateFlow()
+
+    /** The picker sheet's visibility (phone sheet, not Desktop's sidebar). */
+    private val _pickerOpen = MutableStateFlow(false)
+    val pickerOpen: StateFlow<Boolean> = _pickerOpen.asStateFlow()
+
+    /** The picker's rows are being refreshed (first open of the sheet). */
+    private val _pickerLoading = MutableStateFlow(false)
+    val pickerLoading: StateFlow<Boolean> = _pickerLoading.asStateFlow()
+
+    /**
+     * ON_RESUME (decision 3): the core's probe ping + reconnect. `ON_STOP`
+     * does nothing on purpose — the server parks the socket 20 s, and a
+     * disconnect here would drop a live turn.
+     */
+    fun onAppForeground() {
+        viewModelScope.launch { repo.appDidForeground() }
+    }
+
+    /**
+     * Decision 4: retry once when the network returns while Offline. No
+     * busy-loop — the callback fires at most per network transition, and a
+     * callback arriving outside Offline is ignored by the guard below.
+     */
+    fun onNetworkAvailable() {
+        if (repo.phase.value is AppPhase.Offline) retryResume()
+    }
+
+    /** Open the session picker sheet and (re)load its rows. */
+    fun openSessionPicker() {
+        if (!repo.hasEndpoint()) return
+        _pickerOpen.value = true
+        viewModelScope.launch {
+            _pickerLoading.value = true
+            _remoteSessions.value = repo.listRemoteSessions().orEmpty()
+            _pickerLoading.value = false
+        }
+    }
+
+    fun dismissSessionPicker() {
+        _pickerOpen.value = false
+    }
+
+    /** Picker tap on an existing session: resume, then close the sheet. */
+    fun resumeSession(storedId: String) {
+        viewModelScope.launch {
+            if (repo.openExistingSession(storedId, cols())) _pickerOpen.value = false
+        }
+    }
+
+    /** Picker "New chat": `open_session(null)`, then close the sheet. */
+    fun newChat() {
+        viewModelScope.launch {
+            if (repo.openNewSession(cols())) _pickerOpen.value = false
+        }
+    }
+
     /** Decision 3's local branch: phone-native equivalents, declared. */
     private fun handleLocalCommand(command: String) {
         when (command) {
             // /clear: clear the composer draft only (the composer already
             // does) — the transcript rows stay: the stream is the source (T7c).
             "/clear" -> Unit
-            // /sessions is T11's picker: intercepted with a one-line copy,
-            // no invented sheet.
-            "/sessions" -> showSlashBanner("The session picker arrives with T11 — nothing to list here yet.")
+            // /sessions opens T11's picker sheet (same surface as the
+            // titlebar entry point).
+            "/sessions" -> openSessionPicker()
             // /quit: do NOT finish() the Activity — one-line copy, stay Ready.
             "/quit" -> showSlashBanner("Quitting is a desktop command — the phone stays ready.")
         }

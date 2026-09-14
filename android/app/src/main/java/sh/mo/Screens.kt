@@ -1,6 +1,7 @@
 package sh.mo
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,6 +21,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import sh.mo.ui.SessionPickerSheet
 
 /**
  * Password sheet (PLAN §4 T6 item 6): plain field + button. The optional
@@ -85,10 +87,27 @@ fun ConnectingScreen() {
 /**
  * Ready: the Desktop-shaped session window (T7a) — titlebar, transcript with
  * markdown, composer. Kept as the phase-screen hook MainActivity renders.
+ *
+ * T11: the session picker sheet overlays the chat when the view model's
+ * `pickerOpen` is true (titlebar tap or `/sessions`).
  */
 @Composable
 fun ReadyScreen(viewModel: AppViewModel, model: String) {
-    sh.mo.ui.ChatScreen(viewModel = viewModel, model = model)
+    val pickerOpen by viewModel.pickerOpen.collectAsState()
+    val remoteSessions by viewModel.remoteSessions.collectAsState()
+    val pickerLoading by viewModel.pickerLoading.collectAsState()
+    Box(modifier = Modifier.fillMaxSize()) {
+        sh.mo.ui.ChatScreen(viewModel = viewModel, model = model)
+        if (pickerOpen) {
+            SessionPickerSheet(
+                sessions = remoteSessions,
+                loading = pickerLoading,
+                onDismiss = viewModel::dismissSessionPicker,
+                onResume = viewModel::resumeSession,
+                onNewChat = viewModel::newChat,
+            )
+        }
+    }
 }
 
 /** Offline banner with retry (the retry re-runs the resume path). */

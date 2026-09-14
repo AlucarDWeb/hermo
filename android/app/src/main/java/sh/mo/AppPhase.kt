@@ -9,8 +9,15 @@ sealed interface AppPhase {
     /** No gateway paired yet. */
     data object Unpaired : AppPhase
 
-    /** Paired endpoint known, but no valid cookie jar: password required. */
-    data class NeedsPassword(val endpoint: String) : AppPhase
+    /**
+     * Paired endpoint known, but no valid cookie jar: password required.
+     *
+     * `overlay` (T11): the transcript already had a live session (the ask
+     * arrived mid-session — cookie expiry, 401, session kill) — the sheet
+     * must open OVER the existing transcript, never blank it. False on the
+     * first pair (Unpaired → NeedsPassword), where there is nothing under.
+     */
+    data class NeedsPassword(val endpoint: String, val overlay: Boolean = false) : AppPhase
 
     /** connect()/login() in flight. */
     data object Connecting : AppPhase

@@ -250,10 +250,76 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
 
     private fun onConnectFailure(t: Throwable) {
         applyError(t)
+        // T11 (empty-jar dead-end): classify on the UniFFI CLASS, never on
+        // `t.message` — the generated `SessionExpired` carries an EMPTY
+        // message, so `Closed("error: ")` could only ever reduce to Offline
+        // and an empty cookie jar stuck the app on Retry forever.
+        if (ErrorMessages.isAuthShape(t)) {
+            _phase.value = PhaseMachine.reduce(
+                _phase.value, PhaseMachine.ConnEvent.AuthFailed, endpointText, hasLiveSession(),
+            )
+            return
+        }
         _phase.value = PhaseMachine.reduce(
             _phase.value, PhaseMachine.ConnEvent.Closed("error: ${t.message ?: "?"}"), endpointText,
         )
     }
+
+    /** Whether a transcript session is currently open (the overlay decision). */
+    private fun hasLiveSession(): Boolean = _currentKey.value != null
+
+    // ── T11: lifecycle / session picker ─────────────────────────────────
+
+    /**
+     * The remote sessions for the picker: title + preview + count. `null`
+     * on failure (the sheet shows its own empty/error copy) — the failure
+     * text is already in [errorText].
+     */
+    suspend fun listRemoteSessions(): List<RemoteSessionRow>? = try {
+        core.listRemoteSessions().map {
+            RemoteSessionRow(id = it.id, title = it.title, preview = it.preview, messageCount = it.messageCount)
+        }
+    } catch (t: Throwable) {
+        applyError(t)
+        null
+    }
+
+    /**
+     * Picker tap on an existing session: resume it and make it current.
+     * `false` on failure (the error text says why; the sheet stays open).
+     */
+    suspend fun openExistingSession(storedId: String, cols: Int): Boolean = try {
+        val key = core.openSession(storedId, cols.toLong())
+        setCurrentSession(key)
+        true
+    } catch (t: Throwable) {
+        applyError(t)
+        false
+    }
+
+    /** Picker "New chat": `open_session(null)` mints a fresh session. */
+    suspend fun openNewSession(cols: Int): Boolean = try {
+        val key = core.openSession(null, cols.toLong())
+        setCurrentSession(key)
+        true
+    } catch (t: Throwable) {
+        applyError(t)
+        false
+    }
+
+    /** Shared tail of the two picker opens: current key + Ready refresh. */
+    private suspend fun setCurrentSession(key: String) {
+        _currentKey.value = key
+        if (_sessions.value[key] == null) {
+            _sessions.value = _sessions.value + (key to SessionUiState(key = key))
+        }
+        refreshHeader(key)
+        _errorText.value = ""
+        _phase.value = PhaseMachine.ready(headerModel(key) ?: "")
+    }
+
+    /** True when an endpoint is paired (the picker/lifecycle guards). */
+    fun hasEndpoint(): Boolean = endpointText.isNotEmpty()
 
     /**
      * Submit a prompt for the open session, resolving the key HERE (the

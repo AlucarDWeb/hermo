@@ -134,7 +134,7 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
                 .background(t.background)
                 .imePadding(),
         ) {
-            ChatTitlebar(title = state.title)
+            ChatTitlebar(title = state.title, onTitlebarTap = { viewModel.openSessionPicker() })
             ErrorBanner(text = errorText)
             TranscriptList(
                 rows = rows,
@@ -180,15 +180,19 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
  * The model chip used to draw here; it moved into the composer as the
  * Desktop's control-row pill (model-pill.tsx 25-28, controls.tsx:110) —
  * Desktop itself calls it "the relocated status-bar pill".
+ *
+ * T11: the titlebar is the picker's entry point (decision 5) — a tap on the
+ * whole bar opens the session sheet; `/sessions` opens the same sheet.
  */
 @Composable
-private fun ChatTitlebar(title: String) {
+private fun ChatTitlebar(title: String, onTitlebarTap: () -> Unit) {
     val t = LocalHermoTokens.current
     val statusBarPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     Column {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .clickable(onClick = onTitlebarTap)
                 .padding(top = statusBarPadding)
                 .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
