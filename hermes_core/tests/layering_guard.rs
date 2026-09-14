@@ -281,6 +281,11 @@ fn adapter_allowlist() -> Vec<PathBuf> {
         src.join("rpc/frames.rs"),
         src.join("rpc/client.rs"),
         src.join("rpc/api.rs"),
+        // The slash-ladder policy: maps wire shapes (verified against
+        // methods_tools.py) onto the try-then-fallback plan. It sits with the
+        // adapters (it speaks wire code/DTO vocabulary), holds no I/O of its
+        // own, and is unit-tested without a socket (T10).
+        src.join("rpc/slash.rs"),
         // HTTP auth adapter (login, cookie jar, ticket minting).
         src.join("auth/client.rs"),
         // The probe binary: an executable adapter that drives the use case

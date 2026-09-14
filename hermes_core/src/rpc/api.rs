@@ -182,6 +182,8 @@ pub struct SlashCompletionItem {
     pub display: String,
     pub text: String,
     pub kind: String,
+    /// Short description the popup shows next to the display string (T10).
+    pub meta: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -347,7 +349,8 @@ pub async fn slash_exec(
         .await
 }
 
-/// `command.dispatch {name, arg}` — parse with [`DispatchOutcome`].
+/// `command.dispatch {name, arg}` — parse with [`DispatchOutcome`]. `pub`
+/// from T10: `rpc::slash` maps the outcome onto the slash-ladder plan.
 pub async fn command_dispatch(
     client: &GatewayClient,
     session_id: &str,
@@ -379,6 +382,7 @@ pub async fn complete_slash(
                         display: json::str_at(i, "display").to_string(),
                         text: json::str_at(i, "text").to_string(),
                         kind: json::str_at(i, "kind").to_string(),
+                        meta: json::str_at(i, "meta").to_string(),
                     })
                     .collect()
             })
@@ -523,5 +527,48 @@ mod tests {
         assert_eq!(r.message_count, 5);
         assert!(r.messages.is_empty(), "mistyped messages degrade to empty");
         assert!(!r.running, "mistyped bool degrades to false");
+    }
+
+    /// Wire-shaped, through the production `complete_slash` wrapper (T10):
+    /// the popup cannot insert without `replace_from`, and the item rows are
+    /// flat `{text, display, meta, kind}` objects exactly as
+    /// `methods_complete.py` writes them — not nested. A test that passed
+    /// against a `Vec<item>`-only return would be tautological, so the DTO
+    /// fields themselves are asserted.
+    #[tokio::test]
+    async fn complete_slash_keeps_replace_from_and_item_meta() {
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(&|_m, _p| async {
+            Ok(json!({
+                "items": [
+                    {"text": "/deploy", "display": "/deploy", "meta": "ship it", "kind": "skill"},
+                    {"text": "/docs", "display": "/docs", "meta": "", "kind": "command"}
+                ],
+                "replace_from": 8
+            }))
+        })
+        .await;
+        let c = complete_slash(&gw, "/deploy ").await.expect("complete_slash");
+        assert_eq!(c.replace_from, 8, "replace_from must survive to the DTO");
+        assert_eq!(c.items.len(), 2);
+        assert_eq!(c.items[0].text, "/deploy");
+        assert_eq!(c.items[0].display, "/deploy");
+        assert_eq!(c.items[0].meta, "ship it");
+        assert_eq!(c.items[0].kind, "skill");
+        assert_eq!(c.items[1].meta, "", "an absent meta degrades to empty");
+        assert_eq!(c.items[1].kind, "command");
+    }
+
+    /// `replace_from` missing (or mistyped) degrades to the -1 sentinel the
+    /// surface already knows (`SlashCompletions::replace_from` doc) — never a
+    /// panic, never a wrong offset.
+    #[tokio::test]
+    async fn complete_slash_degrades_to_minus_one_without_replace_from() {
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(&|_m, _p| async {
+            Ok(json!({"items": []}))
+        })
+        .await;
+        let c = complete_slash(&gw, "/d").await.expect("complete_slash");
+        assert_eq!(c.replace_from, -1);
+        assert!(c.items.is_empty());
     }
 }

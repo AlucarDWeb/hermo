@@ -374,6 +374,96 @@ impl GatewayClient {
         spawn_heartbeat(shared);
         Ok(client)
     }
+    /// In-process fake backend for `#[cfg(test)]` RPC-wrapper tests (T10):
+    /// builds a live `GatewayClient` over a loopback WS server whose every
+    /// JSON-RPC request is answered by `handler(method, params)` (an `Err`
+    /// string becomes a `-32000` error object). The same shape as the
+    /// integration fake in `tests/client_fake_server.rs`, kept next to the
+    /// client so adapter unit tests need no socket plumbing of their own.
+    #[cfg(test)]
+    pub async fn for_fixture_tests<F, Fut>(handler: &'static F) -> GatewayClient
+    where
+        F: Fn(String, Value) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<Value, String>> + Send,
+    {
+        use futures_util::{SinkExt, StreamExt};
+        // `json` (the crate module) shadows the macro name inside the client;
+        // import the macro under its full path for this fixture body.
+        use serde_json::json;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let addr = listener.local_addr().expect("addr");
+        let handler = std::sync::Arc::new(handler);
+        // Pre-queue `gateway.ready` so it reaches the client before any reply
+        // to a request sent after connecting (FakeGw's queued-frame shape).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let _ = tx.send(
+            json!({
+                "jsonrpc": "2.0", "method": "event",
+                "params": {"type": "gateway.ready", "payload":
+                    {"heartbeat": true, "replay_epoch": "e-fixture", "skin": {}, "change_events": true}}
+            })
+            .to_string(),
+        );
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else { return };
+            let (mut sink, mut stream_r) = ws.split();
+            // Drain the pre-queued frames in order (gateway.ready first)
+            // BEFORE serving requests, then drop the queue: the sender lives
+            // in the spawning scope and is dropped when this function
+            // returns, so a `recv()` arm would end this loop immediately.
+            while let Ok(line) = rx.try_recv() {
+                if sink.send(Message::text(line)).await.is_err() {
+                    return;
+                }
+            }
+            drop(rx);
+            loop {
+                let inbound = stream_r.next().await;
+                let Some(Ok(Message::Text(text))) = inbound else { return };
+                for line in text.split('\n').filter(|l| !l.trim().is_empty()) {
+                    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                    // Heartbeats get the trivial answer, never the handler.
+                    let reply =
+                        if v.get("method").and_then(Value::as_str) == Some("gateway.ping") {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": v.get("id").cloned().unwrap_or(Value::Null),
+                                "result": {"ok": true}
+                            })
+                        } else {
+                            let method = v
+                                .get("method")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let params = v.get("params").cloned().unwrap_or(Value::Null);
+                            match (handler)(method, params).await {
+                                Ok(value) => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": v.get("id").cloned().unwrap_or(Value::Null),
+                                    "result": value
+                                }),
+                                Err(message) => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": v.get("id").cloned().unwrap_or(Value::Null),
+                                    "error": {"code": -32000, "message": message}
+                                }),
+                            }
+                        };
+                    if sink.send(Message::text(reply.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        GatewayClient::connect(&format!("ws://{addr}"), ClientConfig::for_tests())
+            .await
+            .expect("fixture client connects")
+    }
 
     /// Current connection state (watch channel, no polling).
     pub fn state(&self) -> watch::Receiver<ConnectionState> {
