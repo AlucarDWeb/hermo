@@ -69,15 +69,19 @@ import sh.mo.ui.LocalHermoTokens
  * - tool rows are Desktop's ToolEntry: label = the tool's title, trailing
  *   duration meta, expandable payload (`Arguments`/`Result` pretty-printed),
  *   the inline diff rendered verbatim when present (T8 scope 2);
- * - approval / clarify stay Desktop-neutral placeholder rows (NOT this
- *   stream's deliverable — T9), one quiet scaffold line, never raw JSON;
+ * - approval / clarify are T9 widget-shell cards (actions below the panel);
+ *   Desktop Run+menu becomes a phone button row of the server's choices;
  * - error rows are the ErrorState look: no background chip, the message in
  *   --dt-destructive (DESIGN.md "Feedback & empty/error/loading states");
  * - bordered surfaces inside the transcript (code fences) use
  *   --ui-stroke-tertiary, never `border` (DESIGN.md bordered-surface rule).
  */
 @Composable
-fun TranscriptRow(row: ChatRow) {
+fun TranscriptRow(
+    row: ChatRow,
+    onApproval: (requestId: String, choice: String) -> Unit = { _, _ -> },
+    onClarify: (requestId: String, answer: String, questionId: String?) -> Unit = { _, _, _ -> },
+) {
     val t = LocalHermoTokens.current
     when (row) {
         is ChatRow.User -> UserBubble(row.text)
@@ -88,13 +92,9 @@ fun TranscriptRow(row: ChatRow) {
 
         is ChatRow.Tool -> ToolCard(row)
 
-        is ChatRow.Approval -> ScaffoldLine(
-            label = "Approval",
-            detail = if (row.command.isNotBlank()) firstLine(row.command) else row.description,
-            meta = if (row.resolved) "" else "pending",
-        )
+        is ChatRow.Approval -> ApprovalCard(row, onChoice = onApproval)
 
-        is ChatRow.Clarify -> ScaffoldLine(label = "Question", meta = if (row.resolved) "" else "pending")
+        is ChatRow.Clarify -> ClarifyCard(row, onAnswer = onClarify)
 
         is ChatRow.Status -> if (row.text.isNotBlank() || row.kind.isNotBlank()) {
             ScaffoldLine(label = row.kind.replaceFirstChar { it.uppercase() }, detail = firstLine(row.text))

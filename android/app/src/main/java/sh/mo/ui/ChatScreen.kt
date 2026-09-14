@@ -39,6 +39,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,6 +53,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import sh.mo.ApprovalCopy
 import sh.mo.ChatRow
 import sh.mo.SessionUiState
 import sh.mo.TranscriptRows
@@ -89,6 +92,11 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
     val t = LocalHermoTokens.current
     val sessions by viewModel.sessions.collectAsState()
     val currentKey by viewModel.currentKey.collectAsState()
+    // The repository's last message (errors, and the "Answered elsewhere"
+    // copy a 4009/4018 approval/clarify response produces) — surfaced here
+    // too, not only on Pairing/Password: on the Ready/chat surface it was
+    // silently dropped (PI_TASK_FIX5 item 2).
+    val errorText by viewModel.errorText.collectAsState()
 
     // The repository OWNS the screen's session. A second entry in the sessions
     // map (a foreign key nobody opened) must never steal the view, so there is
@@ -109,7 +117,14 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
                 .imePadding(),
         ) {
             ChatTitlebar(title = state.title)
-            TranscriptList(rows = rows, running = state.running, modifier = Modifier.weight(1f))
+            ErrorBanner(text = errorText)
+            TranscriptList(
+                rows = rows,
+                running = state.running,
+                onApproval = { id, choice -> viewModel.respondApproval(id, choice) },
+                onClarify = { id, answer, qid -> viewModel.respondClarify(id, answer, qid) },
+                modifier = Modifier.weight(1f),
+            )
             StatusStrip(state = state, rows = rows)
             Composer(
                 model = model,
@@ -168,10 +183,49 @@ private fun ChatTitlebar(title: String) {
     }
 }
 
+/**
+ * One-line banner directly under the titlebar (PI_TASK_FIX5 item 2): the
+ * repository's `_errorText` was only read by Pairing/Password, so the
+ * "Answered elsewhere" copy a 4009/4018 response produced never appeared on
+ * the session window. A quiet destructive-tinted line — Desktop has no error
+ * dialog here and neither does the phone.
+ */
 @Composable
-private fun TranscriptList(rows: List<ChatRow>, running: Boolean, modifier: Modifier) {
+private fun ErrorBanner(text: String) {
+    if (text.isBlank()) return
+    val t = LocalHermoTokens.current
+    Text(
+        text = text,
+        style = androidx.compose.ui.text.TextStyle(
+            fontFamily = LocalFonts.current.sans,
+            fontSize = t.convToolFontSize.sp,
+        ),
+        color = t.destructive,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+    )
+}
+
+@Composable
+private fun TranscriptList(
+    rows: List<ChatRow>,
+    running: Boolean,
+    onApproval: (String, String) -> Unit,
+    onClarify: (String, String, String?) -> Unit,
+    modifier: Modifier,
+) {
     val t = LocalHermoTokens.current
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val pendingIdx = rows.indexOfFirst { it is ChatRow.Approval && !it.resolved }
+    val pendingOffscreen by remember(pendingIdx) {
+        derivedStateOf {
+            if (pendingIdx < 0) return@derivedStateOf false
+            val visible = listState.layoutInfo.visibleItemsInfo
+            visible.isNotEmpty() && visible.none { it.index == pendingIdx }
+        }
+    }
 
     // Stick-to-bottom only when already there (Desktop's following rule):
     // nearBottom is derived, the jump fires only while the reader parked at
@@ -201,9 +255,10 @@ private fun TranscriptList(rows: List<ChatRow>, running: Boolean, modifier: Modi
             return@CompositionLocalProvider
         }
 
+        Box(modifier.fillMaxSize()) {
         LazyColumn(
             state = listState,
-            modifier = modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().fillMaxSize(),
             contentPadding = PaddingValues(
                 start = 16.dp,
                 end = 16.dp,
@@ -215,8 +270,27 @@ private fun TranscriptList(rows: List<ChatRow>, running: Boolean, modifier: Modi
             verticalArrangement = Arrangement.spacedBy(t.turnGapDp.dp),
         ) {
             items(rows, key = { it.id }) { row ->
-                TranscriptRow(row)
+                TranscriptRow(row, onApproval = onApproval, onClarify = onClarify)
             }
+        }
+        if (pendingOffscreen && pendingIdx >= 0) {
+            Text(
+                text = ApprovalCopy.JUMP_TO_APPROVAL,
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = LocalFonts.current.sans,
+                    fontSize = t.convToolFontSize.sp,
+                    fontWeight = FontWeight.Medium,
+                ),
+                color = t.onPrimary,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp)
+                    .clip(hermoRadius(t.radiusXl))
+                    .background(t.primarySolid)
+                    .clickable { scope.launch { listState.animateScrollToItem(pendingIdx) } }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            )
+        }
         }
     }
 }
