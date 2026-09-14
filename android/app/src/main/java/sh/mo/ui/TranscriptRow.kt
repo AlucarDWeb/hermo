@@ -395,7 +395,10 @@ private fun ToolCard(row: ChatRow.Tool) {
                     append(toolTitle(row.name))
                     if (running) {
                         withStyle(androidx.compose.ui.text.SpanStyle(color = t.scaffoldMeta)) { append("  ·  running") }
-                    } else if (row.exitCode != null) {
+                    // exit_code 0 is a real value (PR #12 parser), not a
+                    // failure: only a non-zero code is a failure worth the
+                    // destructive styling.
+                    } else if (row.exitCode != null && row.exitCode != 0) {
                         withStyle(androidx.compose.ui.text.SpanStyle(color = t.destructive)) { append("  ·  exit ${row.exitCode}") }
                     }
                 },
