@@ -34,7 +34,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -127,6 +134,18 @@ fun ChatScreen(
     // the input stayed at `/he`.
     var draft by remember { mutableStateOf("") }
 
+    // T16c: the bot drawer (Material 3, from the left). The open/close
+    // gestures stay on the drawer state; the VM owns the rows / loading /
+    // error state and the open_bot_chat verb. Opening starts the load —
+    // never a silent empty drawer.
+    val scope = rememberCoroutineScope()
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val drawerUi by viewModel.drawerState.collectAsState()
+    val openDrawer: () -> Unit = {
+        viewModel.openBotDrawer()
+        scope.launch { drawerState.open() }
+    }
+
     // T13: the appearance sheet opens from the titlebar's trailing control
     // and overlays the chat (same shape as the session picker). The MODE is
     // handed in from above (MainActivity + UiPrefs) — never inferred here.
@@ -144,6 +163,20 @@ fun ChatScreen(
     val rows: List<ChatRow> = rowCache.of(state.rows)
 
     CompositionLocalProvider(LocalTurnRunning provides state.running) {
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            drawerContent = {
+                BotDrawerContent(
+                    state = drawerUi,
+                    onProfileTap = { row ->
+                        // The drawer closes only when the bot chat actually
+                        // opened; on failure the error row stays visible.
+                        viewModel.openBotChat(row.profile) { scope.launch { drawerState.close() } }
+                    },
+                    onRetry = { viewModel.retryBotDrawer() },
+                )
+            },
+        ) {
         Box(modifier = Modifier.fillMaxSize()) {
             Column(
                 modifier = Modifier
@@ -153,6 +186,7 @@ fun ChatScreen(
             ) {
                 ChatTitlebar(
                     title = state.title,
+                    onMenuTap = openDrawer,
                     onTitleTap = { viewModel.openSessionPicker() },
                     onAppearanceTap = { appearanceOpen = true },
                 )
@@ -206,6 +240,7 @@ fun ChatScreen(
                 )
             }
         }
+        }
     }
 }
 
@@ -226,9 +261,18 @@ fun ChatScreen(
  * trailing appearance control ("Aa") opens the theme sheet. The whole row
  * is no longer clickable, so the appearance control cannot steal the title
  * tap and the title cannot steal the appearance one.
+ *
+ * T16c: a LEADING hamburger IconButton (Material 3, before the title) opens
+ * the bot drawer from the left — the phone's declared equivalent of
+ * Desktop's Bot Mode sidebar entry point.
  */
 @Composable
-private fun ChatTitlebar(title: String, onTitleTap: () -> Unit, onAppearanceTap: () -> Unit) {
+private fun ChatTitlebar(
+    title: String,
+    onMenuTap: () -> Unit,
+    onTitleTap: () -> Unit,
+    onAppearanceTap: () -> Unit,
+) {
     val t = LocalHermoTokens.current
     val statusBarPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     Column {
@@ -240,6 +284,15 @@ private fun ChatTitlebar(title: String, onTitleTap: () -> Unit, onAppearanceTap:
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            // T16c: hamburger (M3 default menu icon) — the bot drawer's
+            // entry point, at the leading edge before the title.
+            IconButton(onClick = onMenuTap) {
+                Icon(
+                    imageVector = Icons.Filled.Menu,
+                    contentDescription = "Open bots drawer",
+                    tint = t.textSecondary,
+                )
+            }
             // `session.title` commonly lands after `open_session`, and a brand
             // new session has none at all, so the bar had nothing in it and
             // rendered as a bare strip plus a hairline. Name the session

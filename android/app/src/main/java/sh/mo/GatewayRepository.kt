@@ -486,6 +486,48 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         return true
     }
 
+    // ── T16c: the bot drawer ───────────────────────────────────────────
+
+    /**
+     * The bot profiles for the drawer, via the core's `list_profiles`
+     * (`GET /api/profiles`). `null` on failure (the drawer shows its error
+     * row with a retry; the failure text is already in [errorText]) — a
+     * failed RPC is NEVER an empty drawer.
+     */
+    suspend fun profiles(): List<BotDrawerRow>? = try {
+        core.listProfiles().map { botDrawerRow(it.name, it.model, it.description) }
+    } catch (t: Throwable) {
+        applyError(t)
+        null
+    }
+
+    /**
+     * Drawer tap on a profile: the core's `open_bot_chat(profile)` —
+     * create-or-resume of the canonical `(profile, "Bot Chat")` pair. The
+     * returned session goes through the SAME [openAndRegister] every open
+     * uses (parking/gating semantics apply for free): it joins [TabSet] and
+     * becomes `currentKey`. No client-side lookup duplication, no second
+     * identity — the core verb owns create-vs-resume.
+     */
+    suspend fun openBotChat(profile: String, cols: Int): Boolean {
+        // T16c review blocker 1: an already-open bot tab is a SWITCH (the
+        // T16b picker contract) — re-issuing the core verb would rebuild the
+        // LiveSession and RESET-clear the transcript. The profile is stamped
+        // on the entry at open time (withProfile), so the common re-tap
+        // matches even before the header lands; a still-blank profile field
+        // falls through to the core verb (create-or-resume: still correct,
+        // just costlier).
+        openTabForProfile(_sessions.value, profile)?.let { open ->
+            switchTab(open)
+            return true
+        }
+        val key = openAndRegister { core.openBotChat(profile, cols.toLong()) } ?: return false
+        _sessions.value = withProfile(_sessions.value, key, profile)
+        _currentKey.value = key
+        afterOpen(key)
+        return true
+    }
+
     /** Shared tail of the picker opens / tab switch: Ready refresh. */
     private suspend fun afterOpen(key: String) {
         refreshHeader(key)
