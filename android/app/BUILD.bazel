@@ -212,6 +212,7 @@ TEST_CLASSES = [
     "SlashPolicyTest",
     "ThemeModeTest",
     "SessionTabsTest",
+    "BotDrawerTest",
 ]
 
 [
@@ -251,6 +252,7 @@ kt_jvm_library(
         "src/main/java/sh/mo/SlashPolicy.kt",
         "src/main/java/sh/mo/ThemeMode.kt",
         "src/main/java/sh/mo/SessionTabs.kt",
+        "src/main/java/sh/mo/BotDrawer.kt",
     ],
     deps = ["@maven//:org_json_json"],
 )

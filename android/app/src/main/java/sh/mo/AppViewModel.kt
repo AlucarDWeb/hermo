@@ -202,6 +202,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.closeTab(key) }
     }
 
+    // ── T16c: the bot drawer ───────────────────────────────────────────
+
+    /** The drawer's rows / loading / error state (the pure [DrawerUiState]). */
+    private val _drawerState = MutableStateFlow<DrawerUiState>(DrawerUiState.Loading)
+    val drawerState: StateFlow<DrawerUiState> = _drawerState.asStateFlow()
+
+    /**
+     * Drawer opened (hamburger tap or retry): start from Loading — no silent
+     * empty drawer — then load the profiles through the adapter. A failed
+     * RPC is `null` (NOT an empty list) and reduces to Failed, per the pure
+     * [onProfilesLoaded].
+     */
+    fun openBotDrawer() {
+        _drawerState.value = DrawerUiState.Loading
+        viewModelScope.launch {
+            val rows = repo.profiles()
+            _drawerState.value = _drawerState.value.onProfilesLoaded(
+                rows,
+                message = repo.errorText.value.ifBlank { "Could not load profiles" },
+            )
+        }
+    }
+
+    /** The drawer's Retry row: same load path again. */
+    fun retryBotDrawer() {
+        _drawerState.value = _drawerState.value.onRetry()
+        openBotDrawer()
+    }
+
+    /**
+     * Drawer tap on a profile: open that bot's canonical chat through the
+     * core verb; [onOpened] (the composable closes the drawer) only fires on
+     * success — a failed open keeps the drawer with the surfaced error.
+     */
+    fun openBotChat(profile: String, onOpened: () -> Unit) {
+        viewModelScope.launch {
+            if (repo.openBotChat(profile, cols())) onOpened()
+        }
+    }
+
     /** Decision 3's local branch: phone-native equivalents, declared. */
     private fun handleLocalCommand(command: String) {
         when (command) {
