@@ -6,12 +6,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -123,9 +125,21 @@ fun ReadyScreen(
     }
 }
 
-/** Offline banner with retry (the retry re-runs the resume path). */
+/** Offline banner with retry (the retry re-runs the resume path).
+ *
+ * T14 dead-end: with dead stored session ids every retry failed the same
+ * way and the user was stuck ("no session could be resumed", nothing to
+ * tap). The destructive "Reset sessions" wipes the LOCAL registry (the
+ * pairing — host + password — and the host's chats survive) and mints a
+ * fresh chat, behind a confirm dialog.
+ */
 @Composable
-fun OfflineScreen(reason: String, onRetry: () -> Unit) {
+fun OfflineScreen(
+    reason: String,
+    onRetry: () -> Unit,
+    onResetSessions: () -> Unit,
+) {
+    var resetConfirm by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -137,5 +151,30 @@ fun OfflineScreen(reason: String, onRetry: () -> Unit) {
         OutlinedButton(onClick = onRetry, modifier = Modifier.padding(top = 12.dp)) {
             Text("Retry")
         }
+        TextButton(onClick = { resetConfirm = true }, modifier = Modifier.padding(top = 4.dp)) {
+            Text("Reset sessions", color = MaterialTheme.colorScheme.error)
+        }
+    }
+    if (resetConfirm) {
+        AlertDialog(
+            onDismissRequest = { resetConfirm = false },
+            title = { Text("Reset sessions?") },
+            text = {
+                Text(
+                    "Clears the local session list on this phone and starts a new " +
+                        "chat. The chats on the host are not deleted, and the pairing " +
+                        "(host + password) is kept.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    resetConfirm = false
+                    onResetSessions()
+                }) { Text("Reset") }
+            },
+            dismissButton = {
+                TextButton(onClick = { resetConfirm = false }) { Text("Cancel") }
+            },
+        )
     }
 }
