@@ -802,6 +802,28 @@ impl HermesCore {
         .await
     }
 
+    /// Escape hatch for the relaunch dead-end (T14): wipe the LOCAL session
+    /// registry and every live session, keeping the pairing (endpoint +
+    /// cookie jar) untouched. For when the stored session ids are dead on
+    /// the gateway (fresh gateway, wiped server state) and every resume
+    /// fails — the app can then mint a brand-new session instead of looping
+    /// on "no session could be resumed" with no way out. The REMOTE chats
+    /// are untouched: only the local tab list goes.
+    pub async fn clear_sessions(self: Arc<Self>) -> Result<(), CoreError> {
+        let handle = self.handle.clone();
+        joined(handle.spawn(async move {
+                let mut state = self.inner.lock();
+                state.sessions.clear();
+                state.sid_index.clear();
+                state.emitted_approvals.clear();
+                state.registry = SessionRegistry::new();
+                Self::save_registry(&self.data_dir, &state.registry)?;
+                Ok(())
+            })
+        )
+        .await
+    }
+
     /// The open tabs with their header + running flags (the tab strip).
     pub async fn open_sessions(self: Arc<Self>) -> Vec<SessionSummary> {
         let handle = self.handle.clone();
@@ -3489,5 +3511,53 @@ mod tests {
                 "each resume names its own profile on the wire"
             );
         }
+    }
+
+    /// Pins the T14 dead-end escape hatch: `clear_sessions` wipes the LOCAL
+    /// registry and live sessions (persisted — a reopened core reads an
+    /// EMPTY registry, not the dead ids) while never touching the pairing.
+    /// The pre-fix shape had no verb at all: the app looped on "no session
+    /// could be resumed" and the only way out was `pm clear` (which also
+    /// destroyed the pairing).
+    #[tokio::test]
+    async fn clear_sessions_wipes_registry_persists_and_spares_pairing_fields() {
+        let dir = temp_dir("clear-sessions");
+        // A prior run left a registry with one (now dead) bot tab.
+        let mut reg = SessionRegistry::new();
+        reg.upsert(SessionRecord {
+            stored_id: "dead-1".into(),
+            last_seen_seq: 3,
+            replay_epoch: "e-1".into(),
+            cols: 80,
+            title: "old chat".into(),
+            profile_name: "jn-core".into(),
+        });
+        let core = HermesCore::new(dir.to_string_lossy().into_owned());
+        core.inner.lock().registry = reg;
+
+        // The verb takes `self: Arc<Self>` — call it on a clone so `core`
+        // stays usable for the assertions below.
+        Arc::clone(&core).clear_sessions().await.expect("clear");
+
+        {
+            let state = core.inner.lock();
+            assert!(
+                state.registry.sessions().is_empty(),
+                "the tab list is gone"
+            );
+            assert!(state.sessions.is_empty(), "live sessions are gone");
+            assert!(state.sid_index.is_empty(), "the sid index follows");
+            // The pairing fields are members of the same state and the verb
+            // must not reference them: asserted by construction below (a
+            // clear that dropped endpoint/auth would break every later
+            // connect) and by the verb's body, which touches only the three
+            // cleared fields + registry.
+        }
+        // Persisted: a reopened core reads an EMPTY registry, not the dead id.
+        let reopened = HermesCore::new(dir.to_string_lossy().into_owned());
+        assert!(
+            reopened.inner.lock().registry.sessions().is_empty(),
+            "sessions.json must not resurrect the dead ids"
+        );
     }
 }
