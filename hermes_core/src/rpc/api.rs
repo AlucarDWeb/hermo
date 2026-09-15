@@ -308,6 +308,39 @@ pub async fn resume_session(
     Ok(ResumedSession::from_value(&result))
 }
 
+/// `session.title {session_id[, title]}` — the gateway resolves `session_id`
+/// as a live runtime id first, else a stored id; `title` ABSENT = read,
+/// PRESENT = set (wire contracts/sessions.py:268). Result is
+/// `{title, session_key, pending}` — `pending` means no row yet (applied on
+/// the first turn), parsed defensively like every other result.
+#[derive(Debug, Clone, Default)]
+pub struct SessionTitle {
+    pub title: String,
+    pub pending: bool,
+}
+
+impl SessionTitle {
+    fn from_value(value: &Value) -> Self {
+        Self {
+            title: value["title"].as_str().unwrap_or_default().to_string(),
+            pending: value["pending"].as_bool().unwrap_or(false),
+        }
+    }
+}
+
+pub async fn session_title(
+    client: &GatewayClient,
+    session_id: &str,
+    title: Option<&str>,
+) -> Result<SessionTitle, ClientError> {
+    let mut params = json!({ "session_id": session_id });
+    if let Some(t) = title {
+        params["title"] = json!(t);
+    }
+    let result = client.call("session.title", params).await?;
+    Ok(SessionTitle::from_value(&result))
+}
+
 /// `prompt.submit` — returns the parsed status so callers can distinguish
 /// `streaming` from a busy `redirected` (an ordinary result on the wire).
 pub async fn submit(
@@ -626,6 +659,60 @@ mod tests {
     /// server-side evidence, not client-side bookkeeping.
     fn leak_log() -> &'static std::sync::Mutex<Vec<(String, Value)>> {
         Box::leak(Box::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    /// FIX8 A2: the `session.title` wrapper sends `title` EXACTLY when it
+    /// is present (SET) and OMITS the key on a read (title ABSENT = read,
+    /// contracts/sessions.py:268) — a read that carried `"title": null` or
+    /// `""` would rename the session to nothing.
+    #[tokio::test]
+    async fn session_title_set_carries_title_and_read_omits_it() {
+        let log = leak_log();
+        let handler = Box::leak(Box::new(move |m: String, p: Value| {
+            log.lock().unwrap().push((m, p));
+            async {
+                Ok(json!({"title": "my chat", "session_key": "stored", "pending": false}))
+            }
+        }));
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(handler).await;
+
+        let set = session_title(&gw, "live-sid", Some("my chat")).await.unwrap();
+        let read = session_title(&gw, "stored", None).await.unwrap();
+        assert_eq!(set.title, "my chat", "the SET result's title is parsed");
+        assert!(!set.pending);
+        assert_eq!(read.title, "my chat");
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let (m, p) = &calls[0];
+        assert_eq!(m, "session.title");
+        assert_eq!(p["session_id"], "live-sid");
+        assert_eq!(p["title"], "my chat", "SET carries the title on the wire");
+        let (m, p) = &calls[1];
+        assert_eq!(m, "session.title");
+        assert_eq!(p["session_id"], "stored");
+        assert!(
+            p.get("title").is_none(),
+            "READ omits the key: {p}"
+        );
+    }
+
+    /// FIX8 A2: the `session.title` wrapper sends `title` EXACTLY when it
+    /// is present (SET) and OMITS the key on a read (title ABSENT = read,
+    /// contracts/sessions.py:268) — a read that carried `"title": null` or
+    /// `""` would rename the session to nothing.
+    #[tokio::test]
+    async fn session_title_tolerates_missing_fields() {
+        let log = leak_log();
+        let handler = Box::leak(Box::new(move |_m: String, _p: Value| {
+            async { Ok(json!({})) }
+        }));
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(handler).await;
+
+        let parsed = session_title(&gw, "stored", None).await.unwrap();
+        assert_eq!(parsed.title, "");
+        assert!(!parsed.pending);
+        let _ = log; // no params asserted here — the shape above is the pin
     }
 
     /// The create wrapper must send `profile` and `title` EXACTLY when they
