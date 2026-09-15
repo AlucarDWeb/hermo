@@ -32,16 +32,20 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -60,6 +64,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -151,6 +157,8 @@ fun ChatScreen(
     // and overlays the chat (same shape as the session picker). The MODE is
     // handed in from above (MainActivity + UiPrefs) — never inferred here.
     var appearanceOpen by remember { mutableStateOf(false) }
+    // FIX8 item 1: the titlebar's edit affordance opens the rename dialog.
+    var renameOpen by remember { mutableStateOf(false) }
 
     // The repository OWNS the screen's session. A second entry in the sessions
     // map (a foreign key nobody opened) must never steal the view, so there is
@@ -187,8 +195,10 @@ fun ChatScreen(
             ) {
                 ChatTitlebar(
                     title = state.title,
+                    themeMode = themeMode,
                     onMenuTap = openDrawer,
                     onTitleTap = { viewModel.openSessionPicker() },
+                    onEditTitleTap = { renameOpen = true },
                     onAppearanceTap = { appearanceOpen = true },
                 )
                 // T16b: the ordered open-tab strip UNDER the titlebar — the
@@ -240,6 +250,19 @@ fun ChatScreen(
                     onDismiss = { appearanceOpen = false },
                 )
             }
+            // FIX8 item 1: name the session — the phone's declared rename
+            // surface (Desktop renames elsewhere; this dialog is the phone
+            // entry point, reached from the titlebar's edit affordance).
+            if (renameOpen) {
+                RenameDialog(
+                    current = state.title,
+                    onConfirm = { name ->
+                        renameOpen = false
+                        viewModel.setSessionTitle(name)
+                    },
+                    onDismiss = { renameOpen = false },
+                )
+            }
         }
         }
     }
@@ -259,19 +282,33 @@ fun ChatScreen(
  * TITLE opens the session sheet; `/sessions` opens the same sheet.
  *
  * T13: the tap is SPLIT — the title text opens the session picker, and a
- * trailing appearance control ("Aa") opens the theme sheet. The whole row
+ * trailing appearance control opens the theme sheet. The whole row
  * is no longer clickable, so the appearance control cannot steal the title
  * tap and the title cannot steal the appearance one.
  *
  * T16c: a LEADING hamburger IconButton (Material 3, before the title) opens
  * the bot drawer from the left — the phone's declared equivalent of
  * Desktop's Bot Mode sidebar entry point.
+ *
+ * FIX8 item 1: a second leading IconButton (Edit) opens the rename dialog —
+ * the phone's DECLARED divergence from Desktop, which renames elsewhere:
+ * here the titlebar edit affordance is the entry point.
+ *
+ * FIX8 item 2: the picker entry is the title TAP, which was invisible — a
+ * trailing chevron now sits INSIDE the clickable title area so the
+ * affordance is visible (the picker itself is untouched).
+ *
+ * FIX8 item 4: the appearance control is now an M3 Icon reflecting the
+ * CURRENT `themeMode` (light/dark/system — see ThemeIcons.kt for the
+ * declared divergence on the icon source), not a text-only "Aa" glyph.
  */
 @Composable
 private fun ChatTitlebar(
     title: String,
+    themeMode: ThemeMode,
     onMenuTap: () -> Unit,
     onTitleTap: () -> Unit,
+    onEditTitleTap: () -> Unit,
     onAppearanceTap: () -> Unit,
 ) {
     val t = LocalHermoTokens.current
@@ -294,41 +331,51 @@ private fun ChatTitlebar(
                     tint = t.textSecondary,
                 )
             }
+            // FIX8 item 1: rename affordance (M3 Edit icon, core set) —
+            // opens the rename dialog.
+            IconButton(onClick = onEditTitleTap) {
+                Icon(
+                    imageVector = Icons.Filled.Edit,
+                    contentDescription = "Rename session",
+                    tint = t.textSecondary,
+                )
+            }
             // `session.title` commonly lands after `open_session`, and a brand
             // new session has none at all, so the bar had nothing in it and
             // rendered as a bare strip plus a hairline. Name the session
-            // rather than leaving the header empty.
-            Text(
-                text = title.ifBlank { "New session" },
-                style = androidx.compose.ui.text.TextStyle(
-                    fontFamily = LocalFonts.current.sans,
-                    fontSize = t.convFontSize.sp,
-                ),
-                color = if (title.isBlank()) t.textTertiary else t.textSecondary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+            // rather than leaving the header empty. FIX8 item 2: the tap is
+            // the picker's entry point and was invisible — one clickable area
+            // now carries the title AND a trailing chevron.
+            Row(
                 modifier = Modifier
                     .weight(1f)
                     .clickable(onClick = onTitleTap),
-            )
-            // T13 appearance control: a text-only "Aa" glyph (no icon set in
-            // the phone yet — same reason the picker draws a plain dot). It
-            // carries its OWN click target, kept ≥ 40dp for touch.
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .clickable(onClick = onAppearanceTap),
-                contentAlignment = Alignment.Center,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Aa",
+                    text = title.ifBlank { "New session" },
                     style = androidx.compose.ui.text.TextStyle(
                         fontFamily = LocalFonts.current.sans,
                         fontSize = t.convFontSize.sp,
-                        fontWeight = FontWeight.Medium,
                     ),
-                    color = t.textSecondary,
+                    color = if (title.isBlank()) t.textTertiary else t.textSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    imageVector = Icons.Filled.KeyboardArrowDown,
+                    contentDescription = "Open session picker",
+                    tint = t.textTertiary,
+                )
+            }
+            // FIX8 item 4: the theme glyph reflects the CURRENT mode. M3
+            // IconButton — the touch target stays ≥ 40dp.
+            IconButton(onClick = onAppearanceTap) {
+                Icon(
+                    imageVector = themeIcon(themeMode),
+                    contentDescription = "Appearance settings",
+                    tint = t.textSecondary,
                 )
             }
         }
@@ -339,6 +386,51 @@ private fun ChatTitlebar(
                 .background(t.strokeTertiary),
         )
     }
+}
+
+/**
+ * FIX8 item 1: the rename dialog — an M3 AlertDialog over an
+ * OutlinedTextField prefilled with the CURRENT title. The confirm button is
+ * disabled while the field is blank (empty = refuses), and the submit goes
+ * through `viewModel.setSessionTitle` → the core's `session.title` SET.
+ * Declared divergence: Desktop renames elsewhere; the phone renames from
+ * the titlebar's edit affordance.
+ */
+@Composable
+private fun RenameDialog(
+    current: String,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by remember { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = "Rename session",
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = LocalFonts.current.sans,
+                    fontWeight = FontWeight.Medium,
+                ),
+            )
+        },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                singleLine = true,
+                label = { Text("Session name") },
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(name) }, enabled = name.isNotBlank()) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 /**
@@ -713,7 +805,14 @@ private fun StatusStrip(state: SessionUiState, rows: List<ChatRow>) {
  *   max-height 9.375rem ≈ 7 lines; below that the field grows in place);
  * - send on the primary action, and STOP while a turn runs (Desktop's
  *   Stop button replaces Send mid-turn — one control, two states);
- * - the placeholder pool is Desktop's composer copy, re-rolled per session;
+ * - FIX8 item 3 (DECLARED divergence from Desktop): the per-conversation
+ *   placeholder pool is GONE — the field is simply empty, like Desktop's
+ *   composer, whose copy pool the phone never matched anyway. The empty-
+ *   transcript center text ("Ask anything…") is a DIFFERENT surface and
+ *   stays;
+ * - FIX8 item 6: a send dismisses the keyboard and clears focus —
+ *   Desktop hands focus back to its input, but on the phone a keyboard
+ *   left open over a just-sent turn is a defect, not parity;
  * - the aui_composer-clearance bottom spacing above is the transcript's
  *   counterpart so the composer never covers the last message.
  *
@@ -732,16 +831,6 @@ private fun StatusStrip(state: SessionUiState, rows: List<ChatRow>) {
  * flexible space — a weighted pill was capped at a quarter of that space,
  * which on a phone is narrower than the cap it was meant to honour.
  */
-private val PLACEHOLDERS = listOf(
-    "What are we building?",
-    "Give Hermes a task",
-    "What's on your mind?",
-    "Describe what you need",
-    "What should we tackle?",
-    "Ask anything",
-    "Start with a goal",
-)
-
 /** --ui-success bent toward the accent (themes/context.tsx harmonize) — the
  *  settled connection dot. Computed once: the harmonize of #10b981 against
  *  the nous midground lands near the token's own green in both modes. */
@@ -767,9 +856,9 @@ private fun Composer(
             }
         }
     }
-    // Desktop re-rolls the placeholder per conversation, not per keystroke —
-    // one pick per composer composition here (the phone has one session view).
-    val placeholder = remember { PLACEHOLDERS.random() }
+    // FIX8 item 6: the send path hides the keyboard and clears focus.
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
     // Border color follows focus exactly as the previous OutlinedTextField
     // colors did (focused = --theme-midground, rest = --ui-stroke-tertiary);
     // the hand-drawn shell needs the interaction source for that.
@@ -837,18 +926,9 @@ private fun Composer(
                 decorationBox = { inner ->
                     // Centered: the field now owns the full control-row height,
                     // so a single line must sit in the middle of it.
+                    // FIX8 item 3: no placeholder rendering — the field is
+                    // simply empty (declared divergence, see the doc above).
                     Box(contentAlignment = Alignment.CenterStart) {
-                        if (draft.isEmpty()) {
-                            Text(
-                                text = placeholder,
-                                style = androidx.compose.ui.text.TextStyle(
-                                    fontFamily = LocalFonts.current.sans,
-                                    fontSize = t.convFontSize.sp,
-                                    lineHeight = t.convLineHeight.sp,
-                                ),
-                                color = t.textTertiary,
-                            )
-                        }
                         inner()
                     }
                 },
@@ -872,6 +952,10 @@ private fun Composer(
                         onStop()
                     } else if (draft.isNotBlank()) {
                         onSend(draft)
+                        // FIX8 item 6: the keyboard must not sit over the
+                        // turn the send just started.
+                        keyboard?.hide()
+                        focusManager.clearFocus()
                         onDraftChanged("")
                         onDismissCompletions()
                     }

@@ -83,12 +83,21 @@ fun applySessionChange(
     index: Long,
     rowJson: String,
     knownKeys: Set<String>,
+    /** FIX8 item 5: the new title on a `headerUpdated` (core A1); empty = keep. */
+    title: String = "",
 ): Map<String, SessionUiState> {
     // The header branch (finding 4) sits behind the same gate: a header for
     // an unknown/closed key must not mint an empty entry either.
     if (key !in knownKeys) return sessions
     val current = sessions[key] ?: SessionUiState(key = key)
-    if (kind == "headerUpdated") return sessions + (key to current)
+    if (kind == "headerUpdated") {
+        // FIX8 item 5: the headerUpdated DTO now carries the session title
+        // (core FIX8 A1 threads the auto-titling rename through). Update the
+        // title when non-empty — an empty title must never BLANK the known
+        // one — and leave the row list untouched (headers are not rows).
+        return sessions +
+            (key to if (title.isNotEmpty()) current.copy(title = title) else current)
+    }
     return sessions + (key to current.copy(rows = applyTranscriptChange(current.rows, kind, index, rowJson)))
 }
 
