@@ -165,9 +165,11 @@ interface HermoTokens {
     // type scale is bumped ONE step here (declared divergence vs Desktop's
     // 13px/11px rem values — too small on a phone) and every size
     // `hermoTypography` draws lives in tokens, never as a literal.
-    val convFontSize: Float get() = 15f         // --conversation-text-font-size: 0.8125rem
-    val convToolFontSize: Float get() = 12f     // --conversation-tool-font-size: 0.6875rem
-    val convLineHeight: Float get() = 21f       // --conversation-line-height: 1.125rem
+    // T14 round 2 (user feedback on device, 2026-09-15): bumped AGAIN —
+    // 15sp body was still small on the phone. Declared divergence, round 2.
+    val convFontSize: Float get() = 17f         // Desktop: 0.8125rem
+    val convToolFontSize: Float get() = 13f     // Desktop: 0.6875rem
+    val convLineHeight: Float get() = 24f       // Desktop: 1.125rem
     // Material slot sizes hermoTypography uses (T13: moved off hardcoded
     // literals onto tokens, bumped in the same pass: 28→30, 16→18, 14→16).
     val headlineLargeFontSize: Float get() = 30f
