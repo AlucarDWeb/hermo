@@ -89,6 +89,9 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     /** Count of in-flight `open_session` calls (see [parkedChanges]). */
     private val inFlightOpens = java.util.concurrent.atomic.AtomicInteger(0)
 
+    /** Park capacity (FIX7-r3 nit): bounded so a runaway key cannot grow it. */
+    private val PARKED_CHANGES_MAX = 512
+
     /** Last error, surfaced as one line of text in whatever phase is shown. */
     private val _errorText = MutableStateFlow("")
     val errorText: StateFlow<String> = _errorText.asStateFlow()
@@ -161,7 +164,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             // (picker-open / mint have no pre-seeded key). Park those and
             // re-apply them at registration; with NO open in flight an
             // unknown-key change is dropped — no phantoms, no resurrection.
-            if (inFlightOpens.get() > 0) parkedChanges.add(change)
+            // FIX7-r3 (round 3, nit): bounded queue — a runaway key must
+            // not grow the park without limit; oldest entries give way.
+            if (inFlightOpens.get() > 0) {
+                while (parkedChanges.size >= PARKED_CHANGES_MAX) parkedChanges.poll()
+                parkedChanges.add(change)
+            }
             return
         }
         _sessions.value = applySessionChange(
@@ -215,14 +223,23 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         if (parkedChanges.isEmpty()) return
         val known = _tabs.value.keys.toSet() + pendingKeys + key
         var sessions = _sessions.value
+        // FIX7-r3 (round 3, should 1): opens can OVERLAP (each picker/+ tap
+        // launches its own coroutine) — changes parked for another open's
+        // key must be RE-QUEUED, never discarded, or that open registers
+        // with a truncated transcript.
+        val otherKeys = ArrayList<TranscriptChangeDto>()
         while (true) {
             val parked = parkedChanges.poll() ?: break
-            if (parked.key != key) continue
+            if (parked.key != key) {
+                otherKeys.add(parked)
+                continue
+            }
             sessions = applySessionChange(
                 sessions, key, kindOf(parked), parked.index.toLong(), parked.rowJson,
                 knownKeys = known,
             )
         }
+        for (change in otherKeys) parkedChanges.add(change)
         _sessions.value = sessions
     }
 
