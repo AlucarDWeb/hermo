@@ -33,6 +33,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import sh.mo.ui.HermoTheme
+import sh.mo.ThemeMode
+import sh.mo.UiPrefs
 
 /**
  * Single-activity host (T6b): renders the screen for the current [AppPhase].
@@ -83,7 +86,12 @@ class MainActivity : ComponentActivity() {
             }
         }
         setContent {
-            sh.mo.ui.HermoTheme {
+            // T13: the appearance mode is activity-level state — read once
+            // from the adapter (UiPrefs, SharedPreferences `hermo_ui`), fed
+            // to HermoTheme, and persisted on change. Process death: the
+            // relaunch re-reads the stored mode, so the choice survives.
+            var themeMode by remember { mutableStateOf(UiPrefs.loadThemeMode(this)) }
+            HermoTheme(mode = themeMode) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     AppScreen(
                         viewModel = viewModel(),
@@ -96,6 +104,11 @@ class MainActivity : ComponentActivity() {
                                 cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
                                 false
                             }
+                        },
+                        themeMode = themeMode,
+                        onThemeModeChange = { mode ->
+                            UiPrefs.saveThemeMode(this, mode)
+                            themeMode = mode
                         },
                     )
                 }
@@ -138,7 +151,12 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun AppScreen(viewModel: AppViewModel, onScanRequested: () -> Boolean) {
+fun AppScreen(
+    viewModel: AppViewModel,
+    onScanRequested: () -> Boolean,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+) {
     val phase by viewModel.phase.collectAsState()
     val errorText by viewModel.errorText.collectAsState()
     when (val p = phase) {
@@ -149,7 +167,12 @@ fun AppScreen(viewModel: AppViewModel, onScanRequested: () -> Boolean) {
                 // 401, session kill) — the sheet opens OVER the existing
                 // transcript, which stays mounted and live underneath.
                 Box(modifier = Modifier.fillMaxSize()) {
-                    ReadyScreen(viewModel, viewModel.lastReadyModel)
+                    ReadyScreen(
+                        viewModel,
+                        viewModel.lastReadyModel,
+                        themeMode = themeMode,
+                        onThemeModeChange = onThemeModeChange,
+                    )
                     PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
                 }
             } else {
@@ -158,7 +181,13 @@ fun AppScreen(viewModel: AppViewModel, onScanRequested: () -> Boolean) {
                 PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
             }
         is AppPhase.Connecting -> ConnectingScreen()
-        is AppPhase.Ready -> ReadyScreen(viewModel, p.model)
+        is AppPhase.Ready ->
+            ReadyScreen(
+                viewModel,
+                p.model,
+                themeMode = themeMode,
+                onThemeModeChange = onThemeModeChange,
+            )
         is AppPhase.Offline -> OfflineScreen(reason = p.reason, onRetry = { viewModel.retryResume() })
     }
 }

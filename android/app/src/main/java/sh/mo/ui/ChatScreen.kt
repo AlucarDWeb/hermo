@@ -63,6 +63,7 @@ import sh.mo.ChatRow
 import sh.mo.SessionUiState
 import sh.mo.SlashCompletionRow
 import sh.mo.SlashPolicy
+import sh.mo.ThemeMode
 import sh.mo.TranscriptRows
 import sh.mo.formatElapsed
 import sh.mo.ui.LocalFonts
@@ -94,7 +95,12 @@ import sh.mo.ui.hermoRadius
  */
 @SuppressLint("ConfigurationScreenWidthHeight")
 @Composable
-fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
+fun ChatScreen(
+    viewModel: sh.mo.AppViewModel,
+    model: String,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+) {
     val t = LocalHermoTokens.current
     val sessions by viewModel.sessions.collectAsState()
     val currentKey by viewModel.currentKey.collectAsState()
@@ -116,6 +122,11 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
     // the input stayed at `/he`.
     var draft by remember { mutableStateOf("") }
 
+    // T13: the appearance sheet opens from the titlebar's trailing control
+    // and overlays the chat (same shape as the session picker). The MODE is
+    // handed in from above (MainActivity + UiPrefs) — never inferred here.
+    var appearanceOpen by remember { mutableStateOf(false) }
+
     // The repository OWNS the screen's session. A second entry in the sessions
     // map (a foreign key nobody opened) must never steal the view, so there is
     // no map-order fallback at all: no current key means no session to show.
@@ -128,45 +139,58 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
     val rows: List<ChatRow> = rowCache.of(state.rows)
 
     CompositionLocalProvider(LocalTurnRunning provides state.running) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(t.background)
-                .imePadding(),
-        ) {
-            ChatTitlebar(title = state.title, onTitlebarTap = { viewModel.openSessionPicker() })
-            ErrorBanner(text = errorText)
-            TranscriptList(
-                rows = rows,
-                running = state.running,
-                onApproval = { id, choice -> viewModel.respondApproval(id, choice) },
-                onClarify = { id, answer, qid -> viewModel.respondClarify(id, answer, qid) },
-                modifier = Modifier.weight(1f),
-            )
-            StatusStrip(state = state, rows = rows)
-            SlashCompletionsPopup(
-                completions = slashCompletions,
-                onPick = { item ->
-                    val next = SlashPolicy.insertCompletion(draft, item.text, slashReplaceFrom)
-                    draft = next
-                    viewModel.dismissCompletions()
-                    viewModel.onDraftChanged(next)
-                },
-            )
-            SlashBanner(text = slashBanner)
-            Composer(
-                model = model,
-                running = state.running,
-                draft = draft,
-                prefillEvents = viewModel.composerEvents,
-                onDraftChanged = {
-                    draft = it
-                    viewModel.onDraftChanged(it)
-                },
-                onDismissCompletions = { viewModel.dismissCompletions() },
-                onSend = { text -> viewModel.send(text) },
-                onStop = { key?.let { viewModel.interrupt(it) } },
-            )
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(t.background)
+                    .imePadding(),
+            ) {
+                ChatTitlebar(
+                    title = state.title,
+                    onTitleTap = { viewModel.openSessionPicker() },
+                    onAppearanceTap = { appearanceOpen = true },
+                )
+                ErrorBanner(text = errorText)
+                TranscriptList(
+                    rows = rows,
+                    running = state.running,
+                    onApproval = { id, choice -> viewModel.respondApproval(id, choice) },
+                    onClarify = { id, answer, qid -> viewModel.respondClarify(id, answer, qid) },
+                    modifier = Modifier.weight(1f),
+                )
+                StatusStrip(state = state, rows = rows)
+                SlashCompletionsPopup(
+                    completions = slashCompletions,
+                    onPick = { item ->
+                        val next = SlashPolicy.insertCompletion(draft, item.text, slashReplaceFrom)
+                        draft = next
+                        viewModel.dismissCompletions()
+                        viewModel.onDraftChanged(next)
+                    },
+                )
+                SlashBanner(text = slashBanner)
+                Composer(
+                    model = model,
+                    running = state.running,
+                    draft = draft,
+                    prefillEvents = viewModel.composerEvents,
+                    onDraftChanged = {
+                        draft = it
+                        viewModel.onDraftChanged(it)
+                    },
+                    onDismissCompletions = { viewModel.dismissCompletions() },
+                    onSend = { text -> viewModel.send(text) },
+                    onStop = { key?.let { viewModel.interrupt(it) } },
+                )
+            }
+            if (appearanceOpen) {
+                AppearanceSheet(
+                    mode = themeMode,
+                    onModeChange = onThemeModeChange,
+                    onDismiss = { appearanceOpen = false },
+                )
+            }
         }
     }
 }
@@ -182,17 +206,21 @@ fun ChatScreen(viewModel: sh.mo.AppViewModel, model: String) {
  * Desktop itself calls it "the relocated status-bar pill".
  *
  * T11: the titlebar is the picker's entry point (decision 5) — a tap on the
- * whole bar opens the session sheet; `/sessions` opens the same sheet.
+ * TITLE opens the session sheet; `/sessions` opens the same sheet.
+ *
+ * T13: the tap is SPLIT — the title text opens the session picker, and a
+ * trailing appearance control ("Aa") opens the theme sheet. The whole row
+ * is no longer clickable, so the appearance control cannot steal the title
+ * tap and the title cannot steal the appearance one.
  */
 @Composable
-private fun ChatTitlebar(title: String, onTitlebarTap: () -> Unit) {
+private fun ChatTitlebar(title: String, onTitleTap: () -> Unit, onAppearanceTap: () -> Unit) {
     val t = LocalHermoTokens.current
     val statusBarPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     Column {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onTitlebarTap)
                 .padding(top = statusBarPadding)
                 .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -211,7 +239,30 @@ private fun ChatTitlebar(title: String, onTitlebarTap: () -> Unit) {
                 color = if (title.isBlank()) t.textTertiary else t.textSecondary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClick = onTitleTap),
             )
+            // T13 appearance control: a text-only "Aa" glyph (no icon set in
+            // the phone yet — same reason the picker draws a plain dot). It
+            // carries its OWN click target, kept ≥ 40dp for touch.
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .clickable(onClick = onAppearanceTap),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "Aa",
+                    style = androidx.compose.ui.text.TextStyle(
+                        fontFamily = LocalFonts.current.sans,
+                        fontSize = t.convFontSize.sp,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                    color = t.textSecondary,
+                )
+            }
         }
         Box(
             Modifier

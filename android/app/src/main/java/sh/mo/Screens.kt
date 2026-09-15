@@ -21,6 +21,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import sh.mo.ThemeMode
 import sh.mo.ui.SessionPickerSheet
 
 /**
@@ -89,15 +90,27 @@ fun ConnectingScreen() {
  * markdown, composer. Kept as the phase-screen hook MainActivity renders.
  *
  * T11: the session picker sheet overlays the chat when the view model's
- * `pickerOpen` is true (titlebar tap or `/sessions`).
+ * `pickerOpen` is true (titlebar tap or `/sessions`). T13: the theme mode is
+ * HANDED in (MainActivity reads it from UiPrefs) and passed down to the chat
+ * — a composable renders the mode it is given, never infers one.
  */
 @Composable
-fun ReadyScreen(viewModel: AppViewModel, model: String) {
+fun ReadyScreen(
+    viewModel: AppViewModel,
+    model: String,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+) {
     val pickerOpen by viewModel.pickerOpen.collectAsState()
     val remoteSessions by viewModel.remoteSessions.collectAsState()
     val pickerLoading by viewModel.pickerLoading.collectAsState()
     Box(modifier = Modifier.fillMaxSize()) {
-        sh.mo.ui.ChatScreen(viewModel = viewModel, model = model)
+        sh.mo.ui.ChatScreen(
+            viewModel = viewModel,
+            model = model,
+            themeMode = themeMode,
+            onThemeModeChange = onThemeModeChange,
+        )
         if (pickerOpen) {
             SessionPickerSheet(
                 sessions = remoteSessions,
