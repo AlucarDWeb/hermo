@@ -246,15 +246,19 @@ pub async fn create_session(
     Ok(CreatedSession::from_value(&result))
 }
 
-/// `session.list {limit[, include_hidden][, title]}` — durable sessions for
-/// the picker, with the T16a filters: `include_hidden`/`title` (the Bot Chat
-/// lookup needs both — hidden-at-birth rows are invisible without the flag).
-/// Default-valued keys are omitted.
+/// `session.list {limit[, include_hidden][, title][, profile]}` — durable
+/// sessions for the picker, with the T16a filters: `include_hidden`/`title`
+/// (the Bot Chat lookup needs both — hidden-at-birth rows are invisible
+/// without the flag) and `profile` (T16a FIX1: the gateway scopes the list
+/// to that profile's db — `tui_gateway` `_profile_db` — falling back to the
+/// LAUNCH profile's db when the key is absent). Default-valued keys are
+/// omitted.
 pub async fn list_sessions(
     client: &GatewayClient,
     limit: i64,
     include_hidden: bool,
     title: Option<&str>,
+    profile: Option<&str>,
 ) -> Result<SessionList, ClientError> {
     let mut params = json!({ "limit": limit });
     if include_hidden {
@@ -262,6 +266,9 @@ pub async fn list_sessions(
     }
     if let Some(t) = title.filter(|s| !s.is_empty()) {
         params["title"] = json!(t);
+    }
+    if let Some(p) = profile.filter(|s| !s.is_empty()) {
+        params["profile"] = json!(p);
     }
     let result = client.call("session.list", params).await?;
     let sessions = result
@@ -284,14 +291,20 @@ pub async fn list_sessions(
     Ok(SessionList { sessions })
 }
 
-/// `session.resume {session_id}` — stored id in, live sid out.
+/// `session.resume {session_id[, profile]}` — stored id in, live sid out.
+/// `profile` (T16a FIX1) scopes the resume to that profile's db on the
+/// gateway (`_Resume.profile`); `None`/empty OMITS the key, so a bare
+/// resume stays byte-for-byte what it always sent.
 pub async fn resume_session(
     client: &GatewayClient,
     stored_id: &str,
+    profile: Option<&str>,
 ) -> Result<ResumedSession, ClientError> {
-    let result = client
-        .call("session.resume", json!({ "session_id": stored_id }))
-        .await?;
+    let mut params = json!({ "session_id": stored_id });
+    if let Some(p) = profile.filter(|s| !s.is_empty()) {
+        params["profile"] = json!(p);
+    }
+    let result = client.call("session.resume", params).await?;
     Ok(ResumedSession::from_value(&result))
 }
 
@@ -660,8 +673,8 @@ mod tests {
         }));
         let gw = crate::rpc::client::GatewayClient::for_fixture_tests(handler).await;
 
-        list_sessions(&gw, 200, true, Some("Bot Chat")).await.unwrap();
-        list_sessions(&gw, 200, false, None).await.unwrap();
+        list_sessions(&gw, 200, true, Some("Bot Chat"), None).await.unwrap();
+        list_sessions(&gw, 200, false, None, None).await.unwrap();
 
         let calls = log.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -674,6 +687,45 @@ mod tests {
         assert!(p.get("include_hidden").is_none(), "default list omits the flag: {p}");
         assert!(p.get("title").is_none(), "default list omits title: {p}");
         assert_eq!(p["limit"], 200);
+    }
+
+    /// T16a FIX1: `session.list` and `session.resume` forward `profile`
+    /// when non-empty and OMIT the key otherwise (same rule as create):
+    /// the gateway scopes both methods to `params["profile"]` and an
+    /// omitted key means the LAUNCH profile's db, so a bare list/resume
+    /// must stay byte-for-byte what it always sent.
+    #[tokio::test]
+    async fn list_and_resume_forward_profile_and_omit_when_absent() {
+        let log = leak_log();
+        let handler = Box::leak(Box::new(move |m: String, p: Value| {
+            log.lock().unwrap().push((m, p));
+            async { Ok(json!({})) }
+        }));
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(handler).await;
+
+        list_sessions(&gw, 200, true, Some("Bot Chat"), Some("jn-core")).await.unwrap();
+        resume_session(&gw, "stored-bot", Some("jn-core")).await.unwrap();
+        // Absent and empty are the same: no key, not "".
+        list_sessions(&gw, 200, false, None, None).await.unwrap();
+        resume_session(&gw, "stored-bare", None).await.unwrap();
+        list_sessions(&gw, 200, false, None, Some("")).await.unwrap();
+        resume_session(&gw, "stored-bare", Some("")).await.unwrap();
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 6);
+        let (m, p) = &calls[0];
+        assert_eq!(m, "session.list");
+        assert_eq!(p["profile"], "jn-core", "profile forwarded on the list");
+        let (m, p) = &calls[1];
+        assert_eq!(m, "session.resume");
+        assert_eq!(p["profile"], "jn-core", "profile forwarded on the resume");
+        assert_eq!(p["session_id"], "stored-bot");
+        for (m, p) in &calls[2..] {
+            assert!(
+                p.get("profile").is_none(),
+                "bare/empty {m} omits profile: {p}"
+            );
+        }
     }
 
     /// `info.profile_name` is parsed defensively from both create and resume

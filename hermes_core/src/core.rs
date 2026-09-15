@@ -635,7 +635,9 @@ impl HermesCore {
                 )
             }
             Some(id) => {
-                let resumed = api::resume_session(&client, id).await?;
+                // T16a FIX1: the resume is scoped to the same profile's db
+                // the create/list were (`None` = bare resume, key omitted).
+                let resumed = api::resume_session(&client, id, profile.as_deref()).await?;
                 (id.clone(), resumed.session_id, resumed.messages, resumed.profile_name)
             }
         };
@@ -717,18 +719,23 @@ impl HermesCore {
                 let state = self.inner.lock();
                 state.client.clone().ok_or(CoreError::NotConnected)?
             };
-            // Hidden-at-birth rows are invisible without `include_hidden`.
+            // Hidden-at-birth rows are invisible without `include_hidden`;
+            // the list is scoped to THIS profile's db (T16a FIX1) — without
+            // the key the gateway answers from the launch profile's db and
+            // the lookup misses (or worse, resumes the wrong row).
             let list = api::list_sessions(
                 &client,
                 DEFAULT_LIST_LIMIT,
                 true,
                 Some(bot_chat::BOT_CHAT_TITLE),
+                Some(profile.as_str()),
             )
             .await?;
             let rows = list.sessions.iter().map(|s| (s.title.as_str(), s.id.as_str()));
             match bot_chat::resolve_bot_chat(rows) {
                 BotChatResolution::Resume { stored_id } => {
-                    // Resume THAT id; the profile is only the fallback label.
+                    // Resume THAT id — scoped to the same profile's db; the
+                    // profile is only the fallback label.
                     self.open_session_inner(Some(stored_id), cols, Some(profile), None).await
                 }
                 BotChatResolution::Create => {
@@ -1159,6 +1166,7 @@ impl HermesCore {
                     &client,
                     DEFAULT_LIST_LIMIT,
                     false,
+                    None,
                     None,
                 )
                 .await?;
@@ -1709,7 +1717,7 @@ impl HermesCore {
             // `session.resume` reattaches the durable session and returns
             // the live sid it now answers to (it may differ after a
             // reconnect — the sid_index MUST follow it).
-            let resumed = match api::resume_session(client, &key).await {
+            let resumed = match api::resume_session(client, &key, None).await {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("resume of session {key} failed: {e}");
@@ -3384,5 +3392,101 @@ mod tests {
 
         let summary = core.open_sessions().await.into_iter().find(|s| s.key == "stored-new").expect("tab");
         assert_eq!(summary.profile_name, "jn-worker");
+    }
+
+    /// Rule pinned (T16a FIX1): two profiles' Bot Chats are DISTINCT chats.
+    /// The fake gateway scopes `session.list` AND `session.resume` to
+    /// `params["profile"]` (exactly what `tui_gateway/server.py:_profile_db`
+    /// does: the key absent means the LAUNCH profile's db). Each profile's
+    /// db holds exactly its own Bot Chat row; the launch db holds none, and
+    /// a create is refused loudly — so a dropped profile key on either leg
+    /// (list or resume) turns this red instead of silently forking.
+    #[tokio::test]
+    async fn open_bot_chat_two_profiles_scope_list_and_resume_to_their_profile() {
+        let log = leak_rpc_log();
+        let gw = FakeGw::spawn(move |m, p| {
+            log.lock().unwrap().push((m.clone(), p.clone()));
+            async move {
+                match m.as_str() {
+                    "session.list" => match p.get("profile").and_then(Value::as_str) {
+                        Some("jn-core") => Ok(json!({
+                            "sessions": [
+                                {"id": "stored-core", "title": "Bot Chat", "message_count": 2}
+                            ]
+                        })),
+                        Some("jn-android") => Ok(json!({
+                            "sessions": [
+                                {"id": "stored-android", "title": "Bot Chat", "message_count": 3}
+                            ]
+                        })),
+                        // Launch-profile db: no Bot Chat in there.
+                        _ => Ok(json!({"sessions": []})),
+                    },
+                    "session.resume" => match p.get("profile").and_then(Value::as_str) {
+                        Some("jn-core") => Ok(json!({
+                            "session_id": "live-core", "resumed": true,
+                            "message_count": 2, "messages": []
+                        })),
+                        Some("jn-android") => Ok(json!({
+                            "session_id": "live-android", "resumed": true,
+                            "message_count": 3, "messages": []
+                        })),
+                        _ => Err(FakeRpcError::Coded {
+                            code: 4004,
+                            message: "no such session in the launch-profile db".into(),
+                        }),
+                    },
+                    // Both dbs already hold their Bot Chat: a create here is
+                    // exactly the fork the invariant forbids — refuse loudly.
+                    "session.create" => Err(FakeRpcError::Coded {
+                        code: 4009,
+                        message: "Bot Chat must be resumed, never created".into(),
+                    }),
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let dir = temp_dir("bot-two-profiles");
+        let (core, _sink) = connected_core(&dir, &gw).await;
+
+        let key_core =
+            core.clone().open_bot_chat("jn-core".into(), 80).await.expect("jn-core bot chat");
+        let key_android =
+            core.clone().open_bot_chat("jn-android".into(), 80).await.expect("jn-android bot chat");
+        assert_eq!(key_core, "stored-core", "jn-core resumed its OWN row");
+        assert_eq!(key_android, "stored-android", "jn-android resumed its OWN row");
+        assert_ne!(key_core, key_android, "two profiles, two distinct chats");
+
+        // Server-side counters: each leg of BOTH calls must name the profile
+        // the verb was called with, in order.
+        {
+            let calls = log.lock().unwrap();
+            let count = |m: &str| calls.iter().filter(|(mm, _)| mm == m).count();
+            assert_eq!(count("session.list"), 2);
+            assert_eq!(count("session.resume"), 2);
+            assert_eq!(count("session.create"), 0, "each profile's own db answered: no fork");
+            let profiles_of = |m: &str| -> Vec<String> {
+                calls
+                    .iter()
+                    .filter(|(mm, _)| mm == m)
+                    .map(|(_, p)| {
+                        p.get("profile")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<absent>")
+                            .to_string()
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                profiles_of("session.list"),
+                vec!["jn-core".to_string(), "jn-android".to_string()],
+                "each list names its own profile on the wire"
+            );
+            assert_eq!(
+                profiles_of("session.resume"),
+                vec!["jn-core".to_string(), "jn-android".to_string()],
+                "each resume names its own profile on the wire"
+            );
+        }
     }
 }
