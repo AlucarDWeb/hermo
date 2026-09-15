@@ -197,6 +197,11 @@ interface HermoTokens {
     // plus the 4dp it is nudged up by. The input matches it so a single
     // line fills the shell instead of leaving dead bordered box above it.
     val composerControlRowHeightDp: Float get() = 44f
+
+    // T16b tab strip (pane-tab.tsx numbers, phone-scaled — see the strip's
+    // KDoc for the declared phone-native divergences):
+    val tabStripSeparatorHeightDp: Float get() = 16f  // the tab separator's height (FIX7 nit 5: not a 1dp hairline)
+    val tabStripTabMaxWidthDp: Float get() = 160f     // pane-tab 'max-w-40' (10rem)
 }
 
 val LocalHermoTokens = staticCompositionLocalOf<HermoTokens> { LightTokens }

@@ -31,6 +31,12 @@ data class SessionUiState(
     val rows: List<String> = emptyList(),
     /** True while the session's turn is streaming (SessionSummary.running). */
     val running: Boolean = false,
+    /**
+     * T16b: which Hermes profile owns the chat (SessionSummary.profile_name),
+     * carried on the tab model for T16c's drawer — NOT rendered this layer.
+     * Empty when unknown — never a guess.
+     */
+    val profile: String = "",
 ) {
     fun withRows(rows: List<String>) = copy(rows = rows)
 }
@@ -52,6 +58,43 @@ data class RemoteSessionRow(
     /** The one-line preview, blank when the session has no text yet. */
     val displayPreview: String get() = preview.trim()
 }
+
+/**
+ * Apply one change-stream event to the per-key map.
+ *
+ * FIX7 (review 5214081721, finding 1): the map may only GROW for a key the
+ * repository considers open-or-restoring ([knownKeys] = the live `TabSet.keys`
+ * union the keys the launch restore plan pre-registered). The pre-fix code
+ * minted a [SessionUiState] for EVERY arriving key — contradicting this
+ * file's own contract and letting a late transcript change for a key closed
+ * via `closeTab` resurrect the phantom entry. Unknown and closed keys are
+ * now DROPPED.
+ *
+ * The resume race stays covered at the adapter: the repository puts the
+ * restore keys into `knownKeys` BEFORE the sink is allowed to deliver
+ * (register, then consume), so a resume's Reset+rows still land even when
+ * they race tab registration. `currentKey` is never set by an arriving
+ * change — that invariant is untouched.
+ */
+fun applySessionChange(
+    sessions: Map<String, SessionUiState>,
+    key: String,
+    kind: String,
+    index: Long,
+    rowJson: String,
+    knownKeys: Set<String>,
+): Map<String, SessionUiState> {
+    // The header branch (finding 4) sits behind the same gate: a header for
+    // an unknown/closed key must not mint an empty entry either.
+    if (key !in knownKeys) return sessions
+    val current = sessions[key] ?: SessionUiState(key = key)
+    if (kind == "headerUpdated") return sessions + (key to current)
+    return sessions + (key to current.copy(rows = applyTranscriptChange(current.rows, kind, index, rowJson)))
+}
+
+/** Register a tab's key without clobbering rows the stream already delivered. */
+fun ensureSession(sessions: Map<String, SessionUiState>, key: String): Map<String, SessionUiState> =
+    if (key in sessions) sessions else sessions + (key to SessionUiState(key = key))
 
 /**
  * Apply one transcript change to `rows`. `rowJson` is the core's row JSON

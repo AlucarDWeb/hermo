@@ -57,6 +57,40 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     private val _currentKey = MutableStateFlow<String?>(null)
     val currentKey: StateFlow<String?> = _currentKey.asStateFlow()
 
+    /**
+     * T16b: the ordered set of LOCALLY OPEN tabs (the strip's model) — an
+     * entity the repository owns, never `Map.keys`: a strip over the map's
+     * keys would show tabs nobody opened. The verbs live in SessionTabs.kt
+     * (pure, JVM-tested); this flow only CARRIES the set.
+     */
+    private val _tabs = MutableStateFlow(TabSet())
+    val tabs: StateFlow<TabSet> = _tabs.asStateFlow()
+
+    /**
+     * FIX7 (review #19 finding 1): keys whose stream events may mint a map
+     * entry — the live tab set plus the keys being opened/restoring right
+     * now. Seeded BEFORE the core call so a resume's Reset+rows racing tab
+     * registration still land; drained once the tab is registered.
+     */
+    private val pendingKeys: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /**
+     * FIX7-r2 (review round 2, should 2): transcript changes that arrive for
+     * a key OUTSIDE the tab set / [pendingKeys] while an `open_session` is
+     * in flight. The core can deliver Reset+rows before `open_session`
+     * answers (picker-open / mint have no pre-seeded key) — parking instead
+     * of dropping keeps that history; re-applied at registration, dropped
+     * for good when no open is in flight.
+     */
+    private val parkedChanges: java.util.concurrent.ConcurrentLinkedQueue<TranscriptChangeDto> =
+        java.util.concurrent.ConcurrentLinkedQueue()
+
+    /** Count of in-flight `open_session` calls (see [parkedChanges]). */
+    private val inFlightOpens = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Park capacity (FIX7-r3 nit): bounded so a runaway key cannot grow it. */
+    private val PARKED_CHANGES_MAX = 512
 
     /** Last error, surfaced as one line of text in whatever phase is shown. */
     private val _errorText = MutableStateFlow("")
@@ -112,34 +146,101 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         }
     }
 
+    private fun kindOf(change: TranscriptChangeDto): String = when (change.kind) {
+        TranscriptChangeKind.ROW_APPENDED -> "rowAppended"
+        TranscriptChangeKind.ROW_UPDATED -> "rowUpdated"
+        TranscriptChangeKind.RESET -> "reset"
+        TranscriptChangeKind.HEADER_UPDATED -> "headerUpdated"
+    }
+
+    /** FIX7-r2: one predicate for "the map may grow for this key". */
+    private fun isOpenOrRestoring(key: String): Boolean =
+        key in _tabs.value.keys || key in pendingKeys
+
     private fun onTranscriptChange(change: TranscriptChangeDto) {
-        val current = _sessions.value[change.key] ?: SessionUiState(key = change.key)
-        val updated = when (change.kind) {
-            uniffi.hermes_core.TranscriptChangeKind.ROW_APPENDED ->
-                current.copy(rows = applyTranscriptChange(current.rows, "rowAppended", change.index.toLong(), change.rowJson))
-            uniffi.hermes_core.TranscriptChangeKind.ROW_UPDATED ->
-                current.copy(rows = applyTranscriptChange(current.rows, "rowUpdated", change.index.toLong(), change.rowJson))
-            uniffi.hermes_core.TranscriptChangeKind.RESET -> {
-                // The Reset clears the transcript; the rebuilt rows follow
-                // immediately as one RowAppended each (T7c: the core emits
-                // `Reset` first, then the rows of the resumed history, and the
-                // stream is the single source of rows — no app-side snapshot
-                // replay; it would duplicate the core's rows).
-                current.copy(rows = applyTranscriptChange(current.rows, "reset", change.index.toLong(), change.rowJson))
+        if (!isOpenOrRestoring(change.key)) {
+            // FIX7-r2 (round 2, should 2): during an in-flight open_session
+            // the core may deliver Reset+rows for the session being opened
+            // (picker-open / mint have no pre-seeded key). Park those and
+            // re-apply them at registration; with NO open in flight an
+            // unknown-key change is dropped — no phantoms, no resurrection.
+            // FIX7-r3 (round 3, nit): bounded queue — a runaway key must
+            // not grow the park without limit; oldest entries give way.
+            if (inFlightOpens.get() > 0) {
+                while (parkedChanges.size >= PARKED_CHANGES_MAX) parkedChanges.poll()
+                parkedChanges.add(change)
             }
-            uniffi.hermes_core.TranscriptChangeKind.HEADER_UPDATED -> {
-                // The DTO carries no header payload (`row_json` is empty for
-                // this kind), so the header must be re-read — off the drain
-                // loop, never inline on the main thread.
-                scope.launch { refreshHeader(change.key) }
-                current
+            return
+        }
+        _sessions.value = applySessionChange(
+            _sessions.value, change.key, kindOf(change), change.index.toLong(), change.rowJson,
+            knownKeys = _tabs.value.keys.toSet() + pendingKeys,
+        )
+        if (change.kind == TranscriptChangeKind.HEADER_UPDATED) {
+            // FIX7-r2 (round 2, should 1): the header RPC sits behind the
+            // SAME open-or-restoring predicate as the map write above —
+            // refreshHeader writes map entries too.
+            scope.launch { refreshHeader(change.key) }
+        }
+    }
+
+    /**
+     * Run one core `open_session` shape, then add the key as a tab.
+     * Rows the stream already delivered for that key are kept (ensureSession
+     * must not clobber them with an empty SessionUiState). FIX7-r2 (round 2,
+     * should 2): the in-flight window is COVERED — changes parked by
+     * [onTranscriptChange] while `openCall` was on the stack are re-applied
+     * before registration, so no history is lost for picker-open / mint
+     * either (only the restore path has pre-seeded keys).
+     */
+    private suspend fun openAndRegister(openCall: suspend () -> String): String? {
+        inFlightOpens.incrementAndGet()
+        try {
+            val key = openCall()
+            // FIX7: the key is known from the moment open_session answers —
+            // cover the sink race until the tab registration below.
+            pendingKeys.add(key)
+            drainParked(key)
+            _sessions.value = ensureSession(_sessions.value, key)
+            _tabs.value = _tabs.value.add(key)
+            pendingKeys.remove(key)
+            return key
+        } catch (t: Throwable) {
+            applyError(t)
+            return null
+        } finally {
+            if (inFlightOpens.decrementAndGet() == 0) {
+                // No open in flight anymore: whatever is still parked belongs
+                // to keys that never opened — dropped, per the unknown-key
+                // contract.
+                parkedChanges.clear()
             }
         }
-        _sessions.value = _sessions.value + (change.key to updated)
-        // A transcript change for a key nobody opened must not steal the
-        // screen; but if no session is current yet, the first real transcript
-        // claims it (header/open races).
-        if (_currentKey.value == null) _currentKey.value = change.key
+    }
+
+    /** Re-apply the changes parked during the in-flight open of [key]. */
+    private fun drainParked(key: String) {
+        if (parkedChanges.isEmpty()) return
+        val known = _tabs.value.keys.toSet() + pendingKeys + key
+        var sessions = _sessions.value
+        // FIX7-r3 (round 3, should 1): opens can OVERLAP (each picker/+ tap
+        // launches its own coroutine) — changes parked for another open's
+        // key must be RE-QUEUED, never discarded, or that open registers
+        // with a truncated transcript.
+        val otherKeys = ArrayList<TranscriptChangeDto>()
+        while (true) {
+            val parked = parkedChanges.poll() ?: break
+            if (parked.key != key) {
+                otherKeys.add(parked)
+                continue
+            }
+            sessions = applySessionChange(
+                sessions, key, kindOf(parked), parked.index.toLong(), parked.rowJson,
+                knownKeys = known,
+            )
+        }
+        for (change in otherKeys) parkedChanges.add(change)
+        _sessions.value = sessions
     }
 
     private fun applyError(t: Throwable) {
@@ -191,52 +292,122 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         }
     }
 
+    /**
+     * T16b restore (T5 contract): resume EVERY registry tab, not just the
+     * last-active one. The plan is pure (SessionTabs.kt, JVM-tested); this
+     * is its adapter side: `open_session` per registry key, skip failures,
+     * current = last-active if IT resumed, else the last one that did. A
+     * failed `open_sessions()` is NOT an empty registry (FIX7, review #19
+     * finding 2): it surfaces the error and opens nothing. An empty registry
+     * that was READ successfully (or all-resumes-failed, guarded below)
+     * still routes to the mint / Closed paths as before.
+     */
     private suspend fun openMainSession(cols: Int) {
-        val key = resumeLastOrCreate(cols)
-        _currentKey.value = key
-        // Register the tab immediately: the Ready screen's Send guard reads
-        // this map, so an entry must exist before any header arrives.
-        if (_sessions.value[key] == null) {
-            _sessions.value = _sessions.value + (key to SessionUiState(key = key))
+        val summaries: List<SessionSummary>? = try {
+            core.openSessions()
+        } catch (t: Throwable) {
+            // FIX7 (review #19 finding 2): a failed list RPC is NOT an empty
+            // registry — the pre-fix `emptyList()` conflated the two and
+            // minted a brand-new session on every failed launch. Surface the
+            // error and open nothing.
+            applyError(t)
+            null
         }
-        // Header (model name) arrives via open_sessions — pull it once here;
-        // the HEADER_UPDATED change triggers the same read when it lands.
-        refreshHeader(key)
+        if (summaries == null) {
+            _phase.value = PhaseMachine.reduce(
+                _phase.value,
+                PhaseMachine.ConnEvent.Closed("error: session registry unreachable"),
+                endpointText,
+            )
+            return
+        }
+        val lastActive = try {
+            core.lastActiveSession()
+        } catch (_: Throwable) {
+            // Tolerant on purpose: null only demotes the plan's current
+            // choice to "last successfully resumed" — it never mints anything.
+            null
+        }
+        val plan = when (val step = launchStep(summaries.map { it.key }, lastActive)) {
+            is LaunchStep.RunPlan -> step.plan
+            // Unreachable by construction (summaries != null above) — fail
+            // loudly rather than silently swallow a future real ListFailed
+            // (FIX7-r2 nit 1).
+            LaunchStep.ListFailed ->
+                error("launchStep returned ListFailed for a non-null registry")
+        }
+        // FIX7: pre-register the restore keys so resume Reset+rows that land
+        // before tab registration are still applied (finding 1's race).
+        pendingKeys.addAll(plan.resumeKeys)
+        val resumed = mutableListOf<String>()
+        for (key in plan.resumeKeys) {
+            val opened = openAndRegister { core.openSession(key, cols.toLong()) }
+            if (opened != null) resumed.add(opened)
+        }
+        pendingKeys.removeAll(plan.resumeKeys.toSet())
+        // Titles/profiles/running flags from the registry snapshot we took
+        // (refreshHeader only covers the current tab).
+        applySummaries(summaries)
+        val key = if (resumed.isEmpty()) {
+            if (plan.resumeKeys.isNotEmpty()) {
+                // Registry had tabs but every resume failed: do NOT mint a
+                // blank chat (08_restart_restore looked like a successful
+                // empty New session). Leave the error from the last failure.
+                _phase.value = PhaseMachine.reduce(
+                    _phase.value,
+                    PhaseMachine.ConnEvent.Closed("error: no session could be resumed"),
+                    endpointText,
+                )
+                return
+            }
+            val minted = openAndRegister { core.openSession(null, cols.toLong()) }
+            if (minted == null) {
+                // Everything failed (connection up, open_session down): say so
+                // instead of sticking on Connecting — the Offline banner + Retry.
+                _phase.value = PhaseMachine.reduce(
+                    _phase.value,
+                    PhaseMachine.ConnEvent.Closed("error: no session could be resumed"),
+                    endpointText,
+                )
+                return
+            }
+            minted
+        } else if (plan.current != null && plan.current in resumed) {
+            plan.current
+        } else {
+            resumed.last()
+        }
+        _tabs.value = TabSet(keys = _tabs.value.keys, current = key)
+        _currentKey.value = key
+        afterOpen(key)
         _errorText.value = ""
-        _phase.value = PhaseMachine.ready(headerModel(key) ?: "")
     }
 
-    /**
-     * Resume the tab that was active when the app last ran, falling back to a
-     * fresh session.
-     *
-     * Passing `null` unconditionally minted a new session on every launch: the
-     * durable tab list was written and never read, so `sessions.json` grew by
-     * a record per launch and every reconnect then spent two RPCs per stale
-     * record resuming sessions nobody had open.
-     */
-    private suspend fun resumeLastOrCreate(cols: Int): String {
-        val last = core.lastActiveSession()
-        if (last != null) {
-            try {
-                return core.openSession(last, cols.toLong())
-            } catch (t: Throwable) {
-                // The server may have dropped it (pruned, expired, restarted):
-                // a new session is the right answer, not a dead screen.
-                applyError(t)
-            }
+    /** Seed title/profile/running from an `open_sessions()` snapshot. */
+    private fun applySummaries(summaries: List<SessionSummary>) {
+        if (summaries.isEmpty()) return
+        val updates = _sessions.value.toMutableMap()
+        for (s in summaries) {
+            val existing = updates[s.key] ?: continue
+            updates[s.key] = existing.copy(title = s.title, profile = s.profileName, running = s.running)
         }
-        return core.openSession(null, cols.toLong())
+        _sessions.value = updates
     }
 
     private suspend fun refreshHeader(key: String) {
+        // FIX7-r2 (round 2, should 1): the SAME open-or-restoring predicate
+        // as the map gate — a header RPC for a closed/unknown key must
+        // neither resurrect a phantom entry (the write below mints one) nor
+        // spend the round trip.
+        if (!isOpenOrRestoring(key)) return
         val summary: SessionSummary? = core.openSessions().firstOrNull { it.key == key }
         if (summary != null) {
             val model = headerModelOf(summary.headerJson) ?: ""
             val s = _sessions.value[key] ?: SessionUiState(key = key)
             _sessions.value = _sessions.value +
-                (key to s.copy(title = summary.title, model = model, running = summary.running))
-            if (_currentKey.value == null) _currentKey.value = key
+                (key to s.copy(title = summary.title, model = model, running = summary.running, profile = summary.profileName))
+            // T16b: no current claim here — refreshHeader runs after the
+            // caller has selected the tab (open/switch/restore own current).
             // A header that lands after Ready must reach the screen.
             if (model.isNotEmpty()) {
                 _phase.value =
@@ -290,37 +461,76 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     }
 
     /**
-     * Picker tap on an existing session: resume it and make it current.
-     * `false` on failure (the error text says why; the sheet stays open).
+     * T16b picker tap: a session already open as a tab is SWITCHED to —
+     * `open_session` is NOT re-issued (it would rebuild the LiveSession,
+     * bump `history_epoch` and RESET-clear the transcript). Only a not-open
+     * id goes through the core.
      */
-    suspend fun openExistingSession(storedId: String, cols: Int): Boolean = try {
-        val key = core.openSession(storedId, cols.toLong())
-        setCurrentSession(key)
-        true
-    } catch (t: Throwable) {
-        applyError(t)
-        false
-    }
-
-    /** Picker "New chat": `open_session(null)` mints a fresh session. */
-    suspend fun openNewSession(cols: Int): Boolean = try {
-        val key = core.openSession(null, cols.toLong())
-        setCurrentSession(key)
-        true
-    } catch (t: Throwable) {
-        applyError(t)
-        false
-    }
-
-    /** Shared tail of the two picker opens: current key + Ready refresh. */
-    private suspend fun setCurrentSession(key: String) {
-        _currentKey.value = key
-        if (_sessions.value[key] == null) {
-            _sessions.value = _sessions.value + (key to SessionUiState(key = key))
+    suspend fun openExistingSession(storedId: String, cols: Int): Boolean {
+        if (storedId in _tabs.value.keys) {
+            switchTab(storedId)
+            return true
         }
+        val key = openAndRegister { core.openSession(storedId, cols.toLong()) } ?: return false
+        _currentKey.value = key
+        afterOpen(key)
+        return true
+    }
+
+    /** Picker "New chat" / strip `+`: `open_session(null)` mints a fresh
+     *  session, which [TabSet.add] appends and selects. */
+    suspend fun openNewSession(cols: Int): Boolean {
+        val key = openAndRegister { core.openSession(null, cols.toLong()) } ?: return false
+        _currentKey.value = key
+        afterOpen(key)
+        return true
+    }
+
+    /** Shared tail of the picker opens / tab switch: Ready refresh. */
+    private suspend fun afterOpen(key: String) {
         refreshHeader(key)
         _errorText.value = ""
         _phase.value = PhaseMachine.ready(headerModel(key) ?: "")
+    }
+
+    /**
+     * T16b strip tap: switching a tab changes `currentKey` ONLY — the core
+     * is not called for a key already in the open set. `select` no-ops on a
+     * key outside the set, so a stale tap cannot steal the screen.
+     */
+    suspend fun switchTab(key: String) {
+        // FIX7 (review #19 nit 3): a tap on the already-current tab is a
+        // no-op — no header RPC, no phase churn. `tabTap` also rejects keys
+        // outside the set, so a stale tap cannot steal the screen.
+        val next = tabTap(_tabs.value, _currentKey.value, key) ?: return
+        _tabs.value = next
+        val current = next.current ?: return
+        _currentKey.value = current
+        afterOpen(current)
+    }
+
+    /**
+     * T16b strip ×: `close_session` in the core, drop the tab and the entry.
+     * The last remaining tab is UNCLOSEABLE (the strip omits the ×, and this
+     * guard backs it); closing the current tab selects the neighbour per the
+     * pure `close` verb.
+     */
+    suspend fun closeTab(key: String) {
+        if (_tabs.value.keys.size <= 1) return
+        try {
+            core.closeSession(key)
+        } catch (t: Throwable) {
+            applyError(t)
+            return
+        }
+        val next = _tabs.value.close(key)
+        _tabs.value = next
+        _sessions.value = _sessions.value - key
+        val current = next.current
+        if (current != null && current != _currentKey.value) {
+            _currentKey.value = current
+            afterOpen(current)
+        }
     }
 
     /** True when an endpoint is paired (the picker/lifecycle guards). */

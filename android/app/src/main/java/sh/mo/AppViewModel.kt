@@ -26,6 +26,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val sessions: StateFlow<Map<String, SessionUiState>> = repo.sessions
     val currentKey: StateFlow<String?> = repo.currentKey
     val errorText: StateFlow<String> = repo.errorText
+    /** T16b: the ordered open-tab set behind the session strip. */
+    val tabs: StateFlow<TabSet> = repo.tabs
 
     /** Text typed/pasted into the manual fallback field. */
     private val _pairingPayload = MutableStateFlow("")
@@ -186,6 +188,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             if (repo.openNewSession(cols())) _pickerOpen.value = false
         }
+    }
+
+    // ── T16b: the session tab strip ─────────────────────────────────────
+
+    /** Strip tap: switch current tab (repository-side no-op if unknown). */
+    fun selectTab(key: String) {
+        viewModelScope.launch { repo.switchTab(key) }
+    }
+
+    /** Strip ×: close the tab (the repository guards the last-tab rule). */
+    fun closeTab(key: String) {
+        viewModelScope.launch { repo.closeTab(key) }
     }
 
     /** Decision 3's local branch: phone-native equivalents, declared. */
