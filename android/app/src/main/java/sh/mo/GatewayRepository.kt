@@ -510,7 +510,19 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
      * identity — the core verb owns create-vs-resume.
      */
     suspend fun openBotChat(profile: String, cols: Int): Boolean {
+        // T16c review blocker 1: an already-open bot tab is a SWITCH (the
+        // T16b picker contract) — re-issuing the core verb would rebuild the
+        // LiveSession and RESET-clear the transcript. The profile is stamped
+        // on the entry at open time (withProfile), so the common re-tap
+        // matches even before the header lands; a still-blank profile field
+        // falls through to the core verb (create-or-resume: still correct,
+        // just costlier).
+        openTabForProfile(_sessions.value, profile)?.let { open ->
+            switchTab(open)
+            return true
+        }
         val key = openAndRegister { core.openBotChat(profile, cols.toLong()) } ?: return false
+        _sessions.value = withProfile(_sessions.value, key, profile)
         _currentKey.value = key
         afterOpen(key)
         return true

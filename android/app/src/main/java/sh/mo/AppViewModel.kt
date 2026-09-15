@@ -215,7 +215,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * [onProfilesLoaded].
      */
     fun openBotDrawer() {
-        _drawerState.value = DrawerUiState.Loading
+        // T16c review nit 2: a Ready drawer is NOT reset to Loading — the
+        // known rows stay on screen while the background reload runs (no
+        // progress flash); Loading only on the first open / after a failure.
+        if (_drawerState.value !is DrawerUiState.Ready) {
+            _drawerState.value = DrawerUiState.Loading
+        }
         viewModelScope.launch {
             val rows = repo.profiles()
             _drawerState.value = _drawerState.value.onProfilesLoaded(
@@ -235,10 +240,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * Drawer tap on a profile: open that bot's canonical chat through the
      * core verb; [onOpened] (the composable closes the drawer) only fires on
      * success — a failed open keeps the drawer with the surfaced error.
+     * T16c review nit 3: re-entrancy guard — rapid double taps must not
+     * launch two overlapping opens.
      */
+    private var botOpenInFlight = false
+
     fun openBotChat(profile: String, onOpened: () -> Unit) {
+        if (botOpenInFlight) return
+        botOpenInFlight = true
         viewModelScope.launch {
-            if (repo.openBotChat(profile, cols())) onOpened()
+            try {
+                if (repo.openBotChat(profile, cols())) onOpened()
+            } finally {
+                botOpenInFlight = false
+            }
         }
     }
 

@@ -74,3 +74,35 @@ fun DrawerUiState.onRetry(): DrawerUiState =
         is DrawerUiState.Failed, DrawerUiState.Loading -> DrawerUiState.Loading
         is DrawerUiState.Ready -> this
     }
+
+/**
+ * T16c review blocker 1: the ALREADY-OPEN tab whose session belongs to
+ * [profile], if any. A drawer tap on an open bot must SWITCH (the T16b
+ * picker contract) — re-issuing the core verb would rebuild the LiveSession,
+ * bump `history_epoch` and RESET-clear the transcript. A blank [profile]
+ * argument matches nothing (falls through to the core verb, which is still
+ * correct: create-or-resume).
+ */
+fun openTabForProfile(
+    sessions: Map<String, SessionUiState>,
+    profile: String,
+): String? =
+    if (profile.isEmpty()) null
+    else sessions.entries.firstOrNull { it.value.profile == profile }?.key
+
+/**
+ * Stamp the profile we JUST opened onto its (still header-less) session
+ * entry, so a re-tap before the header lands already matches
+ * [openTabForProfile]. Never clobbers a non-empty value — the wire's
+ * `info.profile_name` wins once it arrives (T16b).
+ */
+fun withProfile(
+    sessions: Map<String, SessionUiState>,
+    key: String,
+    profile: String,
+): Map<String, SessionUiState> {
+    if (profile.isEmpty()) return sessions
+    val current = sessions[key] ?: return sessions
+    if (current.profile.isNotEmpty()) return sessions
+    return sessions + (key to current.copy(profile = profile))
+}

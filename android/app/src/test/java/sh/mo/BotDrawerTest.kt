@@ -1,6 +1,7 @@
 package sh.mo
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -88,5 +89,46 @@ class BotDrawerTest {
         val rows = listOf(botDrawerRow("jn-core", "", ""))
         val next = DrawerUiState.Ready(rows).onRetry()
         assertEquals(DrawerUiState.Ready(rows), next)
+    }
+
+    // ── T16c review blocker 1: already-open bot tab is a SWITCH ─────────
+
+    @Test
+    fun `openTabForProfile finds the open tab by profile`() {
+        // Broken version: no lookup — the adapter re-issued the core verb for
+        // an open bot, rebuilding the LiveSession and RESET-clearing the
+        // transcript (the exact T16b defect class).
+        val sessions = mapOf(
+            "k-launch" to SessionUiState(key = "k-launch"),
+            "k-bot" to SessionUiState(key = "k-bot", profile = "jn-core"),
+        )
+        assertEquals("k-bot", openTabForProfile(sessions, "jn-core"))
+    }
+
+    @Test
+    fun `openTabForProfile misses unknown and blank profiles`() {
+        val sessions = mapOf(
+            "k-bot" to SessionUiState(key = "k-bot", profile = "jn-core"),
+        )
+        assertNull("no tab owns it", openTabForProfile(sessions, "jn-android"))
+        assertNull("blank falls through to the core verb", openTabForProfile(sessions, ""))
+    }
+
+    @Test
+    fun `withProfile stamps a fresh entry but never clobbers the wire value`() {
+        // Broken version: blank profile at open time — the re-tap before the
+        // header lands would miss the switch and re-issue the core verb.
+        // The entry EXISTS at stamp time (openAndRegister ran ensureSession);
+        // withProfile never MINTS one.
+        val seeded = mapOf("k-bot" to SessionUiState(key = "k-bot"))
+        val fresh = withProfile(seeded, "k-bot", "jn-core")
+        assertEquals("jn-core", fresh.getValue("k-bot").profile)
+        // The wire's info.profile_name wins once it arrived (T16b).
+        val landed = mapOf("k-bot" to SessionUiState(key = "k-bot", profile = "wire"))
+        assertEquals(landed, withProfile(landed, "k-bot", "jn-core"))
+        // An empty profile stamps nothing; an unknown key is a no-op (and
+        // mints nothing).
+        assertEquals(landed, withProfile(landed, "k-bot", ""))
+        assertEquals(emptyMap<String, SessionUiState>(), withProfile(emptyMap(), "k-x", "jn-core"))
     }
 }
