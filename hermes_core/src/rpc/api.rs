@@ -19,6 +19,9 @@ pub struct CreatedSession {
     /// The durable id — persist this; it is what `session.list` returns.
     pub stored_session_id: String,
     pub message_count: i64,
+    /// The owning profile, defensively read from `info.profile_name` when
+    /// the server sent one (T16a); empty when absent — never a guess.
+    pub profile_name: String,
 }
 
 impl CreatedSession {
@@ -27,6 +30,8 @@ impl CreatedSession {
             session_id: json::str_at(value, "session_id").to_string(),
             stored_session_id: json::str_at(value, "stored_session_id").to_string(),
             message_count: json::i64_at(value, "message_count"),
+            profile_name: json::str_at(value.get("info").unwrap_or(&Value::Null), "profile_name")
+                .to_string(),
         }
     }
 }
@@ -51,7 +56,6 @@ pub struct SessionEntry {
 pub struct SessionList {
     pub sessions: Vec<SessionEntry>,
 }
-
 // ── session.resume ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -67,6 +71,9 @@ pub struct ResumedSession {
     pub running: bool,
     /// Un-acked events existed server-side (`messages_omitted` / inflight).
     pub inflight: bool,
+    /// The owning profile, defensively read from `info.profile_name` (T16a);
+    /// empty when absent — never a guess.
+    pub profile_name: String,
 }
 
 impl ResumedSession {
@@ -82,6 +89,8 @@ impl ResumedSession {
                 .unwrap_or_default(),
             running: json::bool_at(value, "running"),
             inflight: json::bool_at(value, "inflight"),
+            profile_name: json::str_at(value.get("info").unwrap_or(&Value::Null), "profile_name")
+                .to_string(),
         }
     }
 }
@@ -216,19 +225,52 @@ pub struct EventsSince {
 
 // ── wrappers ────────────────────────────────────────────────────────────
 
-/// `session.create {cols}` — mint a fresh chat session.
-pub async fn create_session(client: &GatewayClient, cols: i64) -> Result<CreatedSession, ClientError> {
-    let result = client
-        .call("session.create", json!({ "cols": cols }))
-        .await?;
+/// `session.create {cols[, profile][, title]}` — mint a fresh chat session.
+/// `profile`/`title` are T16a additions (the Bot Chat verb); `None` (or an
+/// empty string) OMITS the JSON key entirely, so a bare create is byte-for-
+/// byte what it always was.
+pub async fn create_session(
+    client: &GatewayClient,
+    cols: i64,
+    profile: Option<&str>,
+    title: Option<&str>,
+) -> Result<CreatedSession, ClientError> {
+    let mut params = json!({ "cols": cols });
+    if let Some(p) = profile.filter(|s| !s.is_empty()) {
+        params["profile"] = json!(p);
+    }
+    if let Some(t) = title.filter(|s| !s.is_empty()) {
+        params["title"] = json!(t);
+    }
+    let result = client.call("session.create", params).await?;
     Ok(CreatedSession::from_value(&result))
 }
 
-/// `session.list {limit}` — durable sessions for the picker.
-pub async fn list_sessions(client: &GatewayClient, limit: i64) -> Result<SessionList, ClientError> {
-    let result = client
-        .call("session.list", json!({ "limit": limit }))
-        .await?;
+/// `session.list {limit[, include_hidden][, title][, profile]}` — durable
+/// sessions for the picker, with the T16a filters: `include_hidden`/`title`
+/// (the Bot Chat lookup needs both — hidden-at-birth rows are invisible
+/// without the flag) and `profile` (T16a FIX1: the gateway scopes the list
+/// to that profile's db — `tui_gateway` `_profile_db` — falling back to the
+/// LAUNCH profile's db when the key is absent). Default-valued keys are
+/// omitted.
+pub async fn list_sessions(
+    client: &GatewayClient,
+    limit: i64,
+    include_hidden: bool,
+    title: Option<&str>,
+    profile: Option<&str>,
+) -> Result<SessionList, ClientError> {
+    let mut params = json!({ "limit": limit });
+    if include_hidden {
+        params["include_hidden"] = json!(true);
+    }
+    if let Some(t) = title.filter(|s| !s.is_empty()) {
+        params["title"] = json!(t);
+    }
+    if let Some(p) = profile.filter(|s| !s.is_empty()) {
+        params["profile"] = json!(p);
+    }
+    let result = client.call("session.list", params).await?;
     let sessions = result
         .get("sessions")
         .and_then(Value::as_array)
@@ -249,14 +291,20 @@ pub async fn list_sessions(client: &GatewayClient, limit: i64) -> Result<Session
     Ok(SessionList { sessions })
 }
 
-/// `session.resume {session_id}` — stored id in, live sid out.
+/// `session.resume {session_id[, profile]}` — stored id in, live sid out.
+/// `profile` (T16a FIX1) scopes the resume to that profile's db on the
+/// gateway (`_Resume.profile`); `None`/empty OMITS the key, so a bare
+/// resume stays byte-for-byte what it always sent.
 pub async fn resume_session(
     client: &GatewayClient,
     stored_id: &str,
+    profile: Option<&str>,
 ) -> Result<ResumedSession, ClientError> {
-    let result = client
-        .call("session.resume", json!({ "session_id": stored_id }))
-        .await?;
+    let mut params = json!({ "session_id": stored_id });
+    if let Some(p) = profile.filter(|s| !s.is_empty()) {
+        params["profile"] = json!(p);
+    }
+    let result = client.call("session.resume", params).await?;
     Ok(ResumedSession::from_value(&result))
 }
 
@@ -570,5 +618,135 @@ mod tests {
         let c = complete_slash(&gw, "/d").await.expect("complete_slash");
         assert_eq!(c.replace_from, -1);
         assert!(c.items.is_empty());
+    }
+
+    // ── T16a: profile/title forwarding, wire-verified ────────────────────
+
+    /// A `&'static` log of (method, params) the fake gateway received —
+    /// server-side evidence, not client-side bookkeeping.
+    fn leak_log() -> &'static std::sync::Mutex<Vec<(String, Value)>> {
+        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    /// The create wrapper must send `profile` and `title` EXACTLY when they
+    /// are non-empty, and omit both keys on a bare create (T16a decision 2:
+    /// `open_session(None)` stays byte-for-byte what it always was).
+    #[tokio::test]
+    async fn create_forwards_profile_and_title_and_omits_when_absent() {
+        let log = leak_log();
+        // `for_fixture_tests` wants a `&'static` handler and a capturing
+        // closure cannot be static-promoted: leak the concrete closure.
+        let handler = Box::leak(Box::new(move |m: String, p: Value| {
+            log.lock().unwrap().push((m, p));
+            async { Ok(json!({"session_id": "live", "stored_session_id": "stored"})) }
+        }));
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(handler).await;
+
+        create_session(&gw, 80, Some("jn-core"), Some("Bot Chat")).await.unwrap();
+        create_session(&gw, 80, None, None).await.unwrap();
+        // An empty string is treated as absent: no key, not "".
+        create_session(&gw, 80, Some(""), Some("")).await.unwrap();
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        let (m, p) = &calls[0];
+        assert_eq!(m, "session.create");
+        assert_eq!(p["profile"], "jn-core", "profile forwarded on the wire");
+        assert_eq!(p["title"], "Bot Chat", "title forwarded on the wire");
+        assert_eq!(p["cols"], 80);
+        let (_, p) = &calls[1];
+        assert!(p.get("profile").is_none(), "bare create omits profile: {p}");
+        assert!(p.get("title").is_none(), "bare create omits title: {p}");
+        let (_, p) = &calls[2];
+        assert!(p.get("profile").is_none() && p.get("title").is_none(), "empty == absent: {p}");
+    }
+
+    /// The list wrapper must send `include_hidden: true` and `title` when the
+    /// Bot Chat lookup asks for them, and a default list keeps working with
+    /// only `limit` (T16a decision 3).
+    #[tokio::test]
+    async fn list_sends_include_hidden_and_title_only_when_needed() {
+        let log = leak_log();
+        let handler = Box::leak(Box::new(move |m: String, p: Value| {
+            log.lock().unwrap().push((m, p));
+            async { Ok(json!({"sessions": []})) }
+        }));
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(handler).await;
+
+        list_sessions(&gw, 200, true, Some("Bot Chat"), None).await.unwrap();
+        list_sessions(&gw, 200, false, None, None).await.unwrap();
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let (m, p) = &calls[0];
+        assert_eq!(m, "session.list");
+        assert_eq!(p["include_hidden"], true, "hidden rows are invisible without the flag");
+        assert_eq!(p["title"], "Bot Chat");
+        assert_eq!(p["limit"], 200);
+        let (_, p) = &calls[1];
+        assert!(p.get("include_hidden").is_none(), "default list omits the flag: {p}");
+        assert!(p.get("title").is_none(), "default list omits title: {p}");
+        assert_eq!(p["limit"], 200);
+    }
+
+    /// T16a FIX1: `session.list` and `session.resume` forward `profile`
+    /// when non-empty and OMIT the key otherwise (same rule as create):
+    /// the gateway scopes both methods to `params["profile"]` and an
+    /// omitted key means the LAUNCH profile's db, so a bare list/resume
+    /// must stay byte-for-byte what it always sent.
+    #[tokio::test]
+    async fn list_and_resume_forward_profile_and_omit_when_absent() {
+        let log = leak_log();
+        let handler = Box::leak(Box::new(move |m: String, p: Value| {
+            log.lock().unwrap().push((m, p));
+            async { Ok(json!({})) }
+        }));
+        let gw = crate::rpc::client::GatewayClient::for_fixture_tests(handler).await;
+
+        list_sessions(&gw, 200, true, Some("Bot Chat"), Some("jn-core")).await.unwrap();
+        resume_session(&gw, "stored-bot", Some("jn-core")).await.unwrap();
+        // Absent and empty are the same: no key, not "".
+        list_sessions(&gw, 200, false, None, None).await.unwrap();
+        resume_session(&gw, "stored-bare", None).await.unwrap();
+        list_sessions(&gw, 200, false, None, Some("")).await.unwrap();
+        resume_session(&gw, "stored-bare", Some("")).await.unwrap();
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 6);
+        let (m, p) = &calls[0];
+        assert_eq!(m, "session.list");
+        assert_eq!(p["profile"], "jn-core", "profile forwarded on the list");
+        let (m, p) = &calls[1];
+        assert_eq!(m, "session.resume");
+        assert_eq!(p["profile"], "jn-core", "profile forwarded on the resume");
+        assert_eq!(p["session_id"], "stored-bot");
+        for (m, p) in &calls[2..] {
+            assert!(
+                p.get("profile").is_none(),
+                "bare/empty {m} omits profile: {p}"
+            );
+        }
+    }
+
+    /// `info.profile_name` is parsed defensively from both create and resume
+    /// results (T16a decision 6): present → carried, absent/mistyped → "".
+    #[test]
+    fn profile_name_parsed_defensively_from_info() {
+        let created = CreatedSession::from_value(&json!({
+            "session_id": "s", "stored_session_id": "k",
+            "info": {"profile_name": "jn-core", "unrelated": {"deep": [1]}}
+        }));
+        assert_eq!(created.profile_name, "jn-core");
+        let bare = CreatedSession::from_value(&json!({"session_id": "s"}));
+        assert!(bare.profile_name.is_empty(), "no info block: empty, not a panic");
+        let mistyped = CreatedSession::from_value(&json!({"info": {"profile_name": 7}}));
+        assert!(mistyped.profile_name.is_empty(), "mistyped degrades to empty");
+
+        let resumed = ResumedSession::from_value(&json!({
+            "session_id": "live", "info": {"profile_name": "jn-review"}
+        }));
+        assert_eq!(resumed.profile_name, "jn-review");
+        let resumed_bare = ResumedSession::from_value(&json!({}));
+        assert!(resumed_bare.profile_name.is_empty());
     }
 }
