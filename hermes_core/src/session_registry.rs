@@ -32,6 +32,10 @@ pub struct SessionRecord {
     pub cols: i64,
     /// Display title, when known (`session.title` / `session.list`).
     pub title: String,
+    /// Which Hermes profile owns the chat, when known — the create/resume
+    /// `info.profile_name` (T16a: tabs must know which bot a chat belongs
+    /// to). Empty when unknown; never a guess.
+    pub profile_name: String,
 }
 
 /// The durable tab list: ordered records + the active tab.
@@ -118,6 +122,7 @@ impl SessionRegistry {
                     "replay_epoch": r.replay_epoch,
                     "cols": r.cols,
                     "title": r.title,
+                    "profile_name": r.profile_name,
                 })
             })
             .collect();
@@ -153,6 +158,9 @@ impl SessionRegistry {
                     replay_epoch: json::str_at(item, "replay_epoch").to_string(),
                     cols: json::i64_at(item, "cols"),
                     title: json::str_at(item, "title").to_string(),
+                    // Written only since T16a: an older sessions.json has no
+                    // such key and degrades to "" (unknown), never an error.
+                    profile_name: json::str_at(item, "profile_name").to_string(),
                 });
             }
         }
@@ -175,6 +183,7 @@ mod tests {
             replay_epoch: epoch.to_string(),
             cols: 48,
             title: format!("title of {id}"),
+            profile_name: String::new(),
         }
     }
 
@@ -208,6 +217,20 @@ mod tests {
         let beta = parsed.get("s-beta").expect("beta present");
         assert_eq!(beta.last_seen_seq, 7, "per-session watermarks are independent");
         assert_eq!(parsed.sessions().len(), 3);
+
+        // profile_name round-trips too (T16a), and an OLD file without the
+        // key degrades to "" instead of failing the parse.
+        let mut bot = record("s-bot", 1, "e");
+        bot.profile_name = "jn-core".into();
+        let mut reg2 = SessionRegistry::new();
+        reg2.upsert(bot);
+        let parsed2 = SessionRegistry::from_json(&reg2.to_json()).expect("round trip");
+        assert_eq!(parsed2.get("s-bot").unwrap().profile_name, "jn-core");
+        let legacy = SessionRegistry::from_json(
+            r#"{"sessions":[{"stored_id":"old","cols":80,"title":"t"}]}"#,
+        )
+        .expect("legacy shape parses");
+        assert_eq!(legacy.get("old").unwrap().profile_name, "", "old file: unknown profile");
     }
 
     /// Rule pinned: `touch` never moves a watermark backwards and never

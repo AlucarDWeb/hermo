@@ -34,6 +34,7 @@ pub const EP_LOGIN: &str = "/auth/password-login";
 pub const EP_WS_TICKET: &str = "/api/auth/ws-ticket";
 pub const EP_ME: &str = "/api/auth/me";
 pub const EP_LOGOUT: &str = "/auth/logout";
+pub const EP_PROFILES: &str = "/api/profiles";
 
 /// `GET /api/status` payload, tolerantly parsed.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -47,6 +48,18 @@ pub struct GatewayStatus {
 pub struct WsTicket {
     pub ticket: String,
     pub ttl_seconds: i64,
+}
+
+/// One Hermes profile of `GET /api/profiles` (T16a, verified against
+/// `hermes_cli/web_routers/profiles.py`): `name`, `is_default`, `model`,
+/// `description` — the blurb Desktop shows. Extra JSON keys (the wire
+/// carries more) are ignored; there is NO `hidden` key on this route.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProfileDto {
+    pub name: String,
+    pub is_default: bool,
+    pub model: String,
+    pub description: String,
 }
 
 /// HTTP auth client. Clone is cheap (shared reqwest handle + jar).
@@ -228,6 +241,28 @@ impl AuthClient {
     pub async fn me(&self, base: &str) -> Result<Value, CoreError> {
         let url = self.base(base, EP_ME)?;
         self.send(self.http.get(url), ErrorCtx::Cookie).await
+    }
+
+    /// `GET /api/profiles` — the bot profiles (T16a). Authenticated with the
+    /// cookie jar exactly like [`AuthClient::me`]: a 401 here is the same
+    /// cookie-expired situation (re-login), not a generic HTTP error.
+    pub async fn profiles(&self, base: &str) -> Result<Vec<ProfileDto>, CoreError> {
+        let url = self.base(base, EP_PROFILES)?;
+        let value = self.send(self.http.get(url), ErrorCtx::Cookie).await?;
+        Ok(value
+            .get("profiles")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|p| ProfileDto {
+                        name: json::str_at(p, "name").to_string(),
+                        is_default: json::bool_at(p, "is_default"),
+                        model: json::str_at(p, "model").to_string(),
+                        description: json::str_at(p, "description").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// `POST /auth/logout`.
@@ -536,5 +571,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CoreError::Network(_)));
+    }
+
+    // ── T16a: GET /api/profiles ────────────────────────────────────
+
+    #[tokio::test]
+    async fn profiles_parse_defensively_and_ignore_extra_keys() {
+        // The verified wire shape carries extra keys (the DTO must ignore
+        // them) and a second entry missing optional fields (degrade, never
+        // panic). No `hidden` key exists on this route — none is read.
+        let server = HttpTestServer::spawn(vec![Route {
+            kind: RouteKind::Profiles,
+            status: StatusCode::OK,
+            body: json!({
+                "profiles": [
+                    {"name": "jn-core", "is_default": true, "model": "m-1",
+                     "description": "core bot", "hidden": true,
+                     "icon": "x", "extra": {"nested": [1, 2]}},
+                    {"name": "bare"},
+                    {"model": 42, "is_default": "yes"}
+                ]
+            }),
+            set_cookie: None,
+            require_cookie: None,
+        }])
+        .await;
+        let client = AuthClient::new(None).unwrap();
+        let profiles = client.profiles(server.base_url()).await.unwrap();
+        assert_eq!(server.count(RouteKind::Profiles), 1, "one authenticated GET");
+        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles[0].name, "jn-core");
+        assert!(profiles[0].is_default);
+        assert_eq!(profiles[0].model, "m-1");
+        assert_eq!(profiles[0].description, "core bot");
+        assert_eq!(profiles[1].name, "bare");
+        assert!(!profiles[1].is_default, "missing is_default degrades to false");
+        assert!(profiles[1].model.is_empty() && profiles[1].description.is_empty());
+        // Mistyped fields degrade to defaults too, and the entry survives.
+        assert_eq!(profiles[2].name, "");
+        assert!(!profiles[2].is_default);
+        assert!(profiles[2].model.is_empty());
+    }
+
+    #[tokio::test]
+    async fn profiles_401_maps_to_session_expired() {
+        // Same cookie-expired mapping as every other cookie GET (T16a
+        // decision 4): the UI must trigger re-login, not a generic error.
+        let server = HttpTestServer::spawn(vec![Route::profiles_status(StatusCode::UNAUTHORIZED)])
+            .await;
+        let client = AuthClient::new(None).unwrap();
+        let err = client.profiles(server.base_url()).await.unwrap_err();
+        assert!(matches!(err, CoreError::SessionExpired), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn profiles_missing_key_yields_empty_list_not_panic() {
+        let server = HttpTestServer::spawn(vec![Route::profiles_ok()]).await;
+        let client = AuthClient::new(None).unwrap();
+        let profiles = client.profiles(server.base_url()).await.unwrap();
+        assert!(profiles.is_empty(), "no profiles key: empty vec");
     }
 }

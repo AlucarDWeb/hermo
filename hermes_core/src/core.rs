@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use crate::auth::client::AuthClient;
 use crate::auth::endpoint::{GatewayEndpoint, parse_qr_payload, ws_url};
+use crate::bot_chat::{self, BotChatResolution};
 use crate::error::CoreError;
 use crate::json;
 use crate::protocol::EventParams;
@@ -50,6 +51,9 @@ const SESSIONS_FILE: &str = "sessions.json";
 const LOCAL_CLOSE_REASON: &str = "user logout";
 /// Terminal cols used when a session is created without a UI-provided value.
 const DEFAULT_COLS: i64 = 80;
+/// `session.list` limit when the caller has no opinion (the picker's page
+/// size — what `list_remote_sessions` always sent before T16a).
+const DEFAULT_LIST_LIMIT: i64 = 200;
 /// How often the supervisor flushes a dirty session registry to disk. The
 /// watermark moves with every streamed event, so writing the file inline
 /// rewrote it hundreds of times per turn; the writes are coalesced and the
@@ -117,6 +121,21 @@ pub struct SessionSummary {
     pub title: String,
     pub running: bool,
     pub header_json: String,
+    /// Which Hermes profile owns the chat, when known (T16a: create/resume
+    /// `info.profile_name`, or the profile the Bot Chat verb was called
+    /// with). Empty when unknown — never a guess.
+    pub profile_name: String,
+}
+
+/// One Hermes profile (`GET /api/profiles`, T16a) — a drawer bot entry
+/// (T16c). `name` is the profile the Bot Chat verb takes; there is NO
+/// `hidden` flag on the wire (T16c gap, declared in the PLAN).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProfileSummaryDto {
+    pub name: String,
+    pub is_default: bool,
+    pub model: String,
+    pub description: String,
 }
 
 /// One entry of the gateway's `session.list` (the remote picker).
@@ -576,8 +595,11 @@ impl HermesCore {
         cols: i64,
     ) -> Result<String, CoreError> {
         let handle = self.handle.clone();
-        joined(handle.spawn(async move { self.open_session_inner(stored_id, cols).await })
-        )
+        joined(handle.spawn(async move {
+            // A plain open stays a BARE create/resume: no profile, no title —
+            // byte-for-byte what it always sent (T16a decision 2).
+            self.open_session_inner(stored_id, cols, None, None).await
+        }))
         .await
     }
 
@@ -585,21 +607,45 @@ impl HermesCore {
         self: Arc<Self>,
         stored_id: Option<String>,
         cols: i64,
+        // T16a: `profile` is sent on CREATE (the Bot Chat verb) and doubles
+        // as a fallback label when the wire's `info.profile_name` is absent;
+        // `title` is sent on CREATE only. `None`/`None` = the bare create.
+        profile: Option<String>,
+        title: Option<String>,
     ) -> Result<String, CoreError> {
         let client = {
             let state = self.inner.lock();
             state.client.clone().ok_or(CoreError::NotConnected)?
         };
         let cols = if cols <= 0 { DEFAULT_COLS } else { cols };
-        let (key, live_sid, messages) = match &stored_id {
+        let (key, live_sid, messages, wire_profile) = match &stored_id {
             None => {
-                let created = api::create_session(&client, cols).await?;
-                (created.stored_session_id, created.session_id, Vec::new())
+                let created = api::create_session(
+                    &client,
+                    cols,
+                    profile.as_deref(),
+                    title.as_deref(),
+                )
+                .await?;
+                (
+                    created.stored_session_id,
+                    created.session_id,
+                    Vec::new(),
+                    created.profile_name,
+                )
             }
             Some(id) => {
                 let resumed = api::resume_session(&client, id).await?;
-                (id.clone(), resumed.session_id, resumed.messages)
+                (id.clone(), resumed.session_id, resumed.messages, resumed.profile_name)
             }
+        };
+        // The wire's `info.profile_name` wins (defensively parsed upstream);
+        // the Bot Chat verb knows the profile it was called with, so it can
+        // fill the gap instead of leaving an ownerless chat.
+        let profile_name = if wire_profile.is_empty() {
+            profile.unwrap_or_default()
+        } else {
+            wire_profile
         };
         let mut changes = Vec::new();
         let mut state = self.inner.lock();
@@ -624,10 +670,10 @@ impl HermesCore {
         // leaving the titlebar empty until a `session.title` event happened to
         // land. The transcript IS rebuilt from `messages` here, so the
         // watermark does reset; the epoch and title do not.
-        let (title, replay_epoch) = state
+        let (title, replay_epoch, prev_profile) = state
             .registry
             .get(&key)
-            .map(|rec| (rec.title.clone(), rec.replay_epoch.clone()))
+            .map(|rec| (rec.title.clone(), rec.replay_epoch.clone(), rec.profile_name.clone()))
             .unwrap_or_default();
         state.registry.upsert(SessionRecord {
             stored_id: key.clone(),
@@ -635,6 +681,9 @@ impl HermesCore {
             replay_epoch,
             cols,
             title,
+            // Re-opening a tab must not un-label it: keep the previous owner
+            // when this open learned nothing new (same rule as `title`).
+            profile_name: if profile_name.is_empty() { prev_profile } else { profile_name },
         });
         state.registry.set_active(Some(&key));
         let _ = Self::save_registry(&self.data_dir, &state.registry);
@@ -653,6 +702,79 @@ impl HermesCore {
             }
         }
         Ok(key)
+    }
+
+    /// Open the canonical Bot Chat of `profile` (T16a, the Desktop Bot Mode
+    /// invariant): list-before-create with `session.list {title: "Bot Chat",
+    /// include_hidden: true}` — a row titled EXACTLY "Bot Chat" is resumed
+    /// (never a second identity; recency never wins), an empty answer mints
+    /// it with `session.create {profile, title: "Bot Chat", cols}`. Returns
+    /// the session key. The resolver is the pure [`bot_chat::resolve_bot_chat`].
+    pub async fn open_bot_chat(self: Arc<Self>, profile: String, cols: i64) -> Result<String, CoreError> {
+        let handle = self.handle.clone();
+        joined(handle.spawn(async move {
+            let client = {
+                let state = self.inner.lock();
+                state.client.clone().ok_or(CoreError::NotConnected)?
+            };
+            // Hidden-at-birth rows are invisible without `include_hidden`.
+            let list = api::list_sessions(
+                &client,
+                DEFAULT_LIST_LIMIT,
+                true,
+                Some(bot_chat::BOT_CHAT_TITLE),
+            )
+            .await?;
+            let rows = list.sessions.iter().map(|s| (s.title.as_str(), s.id.as_str()));
+            match bot_chat::resolve_bot_chat(rows) {
+                BotChatResolution::Resume { stored_id } => {
+                    // Resume THAT id; the profile is only the fallback label.
+                    self.open_session_inner(Some(stored_id), cols, Some(profile), None).await
+                }
+                BotChatResolution::Create => {
+                    self.open_session_inner(
+                        None,
+                        cols,
+                        Some(profile),
+                        Some(bot_chat::BOT_CHAT_TITLE.to_string()),
+                    )
+                    .await
+                }
+            }
+        }))
+        .await
+    }
+
+    /// The gateway's bot profiles (`GET /api/profiles`, T16a) — the drawer's
+    /// entries (T16c). Authenticated with the cookie jar: a 401 surfaces as
+    /// [`CoreError::SessionExpired`] so the UI asks for the password.
+    pub async fn list_profiles(self: Arc<Self>) -> Result<Vec<ProfileSummaryDto>, CoreError> {
+        let handle = self.handle.clone();
+        joined(handle.spawn(async move {
+            let (base, auth) = {
+                let state = self.inner.lock();
+                let base = state
+                    .endpoint
+                    .as_ref()
+                    .map(|e| e.base_url.to_string())
+                    .ok_or(CoreError::NotConnected)?;
+                // Same rule as `connect_inner`: no auth client means the
+                // cookie is gone — re-login, not a generic failure.
+                let auth = state.auth.clone().ok_or(CoreError::SessionExpired)?;
+                (base, auth)
+            };
+            let profiles = auth.profiles(&base).await?;
+            Ok(profiles
+                .into_iter()
+                .map(|p| ProfileSummaryDto {
+                    name: p.name,
+                    is_default: p.is_default,
+                    model: p.model,
+                    description: p.description,
+                })
+                .collect())
+        }))
+        .await
     }
 
     /// Close a tab: remove it from the core state and the registry. The
@@ -703,6 +825,7 @@ impl HermesCore {
                                     }))
                                 })
                                 .unwrap_or_default(),
+                            profile_name: rec.profile_name.clone(),
                         }
                     })
                     .collect()
@@ -1032,7 +1155,13 @@ impl HermesCore {
                     let state = self.inner.lock();
                     state.client.clone().ok_or(CoreError::NotConnected)?
                 };
-                let list = api::list_sessions(&client, 200).await?;
+                let list = api::list_sessions(
+                    &client,
+                    DEFAULT_LIST_LIMIT,
+                    false,
+                    None,
+                )
+                .await?;
                 Ok(list
                     .sessions
                     .into_iter()
@@ -2071,6 +2200,7 @@ mod tests {
             replay_epoch: String::new(),
             cols: DEFAULT_COLS,
             title: String::new(),
+            profile_name: String::new(),
         });
     }
 
@@ -3154,5 +3284,105 @@ mod tests {
             }
             other => panic!("an alias cycle must error at the cap, got {other:?}"),
         }
+    }
+
+    // ── T16a: open_bot_chat — create-or-resume, wire-counted ─────────────
+
+    /// `&'static` log of (method, params) the fake gateway received: the
+    /// counters are SERVER-side evidence, not client bookkeeping.
+    fn leak_rpc_log() -> &'static StdMutex<Vec<(String, Value)>> {
+        Box::leak(Box::new(StdMutex::new(Vec::new())))
+    }
+
+    /// Rule pinned (T16a decision 5): when `session.list {title: "Bot Chat",
+    /// include_hidden: true}` answers with the canonical row, `open_bot_chat`
+    /// RESUMES that id — exactly one resume, ZERO creates (recency must not
+    /// win; no second identity). The registry labels the chat with the
+    /// profile so the tabs know which bot owns it.
+    #[tokio::test]
+    async fn open_bot_chat_resumes_the_canonical_row_and_never_creates() {
+        let log = leak_rpc_log();
+        let gw = FakeGw::spawn(move |m, p| {
+            log.lock().unwrap().push((m.clone(), p));
+            async move {
+                match m.as_str() {
+                    "session.list" => Ok(json!({
+                        "sessions": [
+                            {"id": "stored-recent", "title": "Daily work", "message_count": 2},
+                            {"id": "stored-bot", "title": "Bot Chat", "message_count": 4}
+                        ]
+                    })),
+                    "session.resume" => Ok(json!({
+                        "session_id": "live-bot", "resumed": true,
+                        "message_count": 4, "messages": []
+                    })),
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let dir = temp_dir("bot-resume");
+        let (core, _sink) = connected_core(&dir, &gw).await;
+
+        let key = core.clone().open_bot_chat("jn-core".into(), 80).await.expect("open_bot_chat");
+        assert_eq!(key, "stored-bot", "the canonical row's durable id, not the recent chat");
+
+        // Server-side counters, scoped so the lock guard never reaches an
+        // await point.
+        {
+            let calls = log.lock().unwrap();
+            let count = |m: &str| calls.iter().filter(|(mm, _)| mm == m).count();
+            assert_eq!(count("session.list"), 1);
+            let (_, list_params) = calls.iter().find(|(m, _)| m == "session.list").unwrap();
+            assert_eq!(list_params["title"], "Bot Chat", "lookup by the exact title");
+            assert_eq!(list_params["include_hidden"], true, "hidden-at-birth is invisible otherwise");
+            assert_eq!(count("session.resume"), 1, "the canonical chat is resumed");
+            let (_, resume_params) = calls.iter().find(|(m, _)| m == "session.resume").unwrap();
+            assert_eq!(resume_params["session_id"], "stored-bot");
+            assert_eq!(count("session.create"), 0, "NEVER a second identity");
+        }
+
+        // The tab is labeled with the profile even though the fake resume
+        // `info` carried none (the verb knows the profile it was called with).
+        let summary = core.open_sessions().await.into_iter().find(|s| s.key == "stored-bot").expect("tab");
+        assert_eq!(summary.profile_name, "jn-core");
+    }
+
+    /// Rule pinned: an empty list means CREATE, with `profile` and
+    /// `title: "Bot Chat"` on the wire exactly once, and no resume RPC at
+    /// all. Fails if the resolver always resumed or the create dropped the
+    /// profile/title keys.
+    #[tokio::test]
+    async fn open_bot_chat_creates_with_profile_and_exact_title_when_absent() {
+        let log = leak_rpc_log();
+        let gw = FakeGw::spawn(move |m, p| {
+            log.lock().unwrap().push((m.clone(), p));
+            async move {
+                match m.as_str() {
+                    "session.list" => Ok(json!({"sessions": []})),
+                    "session.create" => Ok(created("live-new", "stored-new")),
+                    _ => Ok(json!({})),
+                }
+            }
+        });
+        let dir = temp_dir("bot-create");
+        let (core, _sink) = connected_core(&dir, &gw).await;
+
+        let key = core.clone().open_bot_chat("jn-worker".into(), 48).await.expect("open_bot_chat");
+        assert_eq!(key, "stored-new");
+
+        {
+            let calls = log.lock().unwrap();
+            let count = |m: &str| calls.iter().filter(|(mm, _)| mm == m).count();
+            assert_eq!(count("session.list"), 1);
+            assert_eq!(count("session.resume"), 0, "nothing to resume");
+            assert_eq!(count("session.create"), 1);
+            let (_, create_params) = calls.iter().find(|(m, _)| m == "session.create").unwrap();
+            assert_eq!(create_params["profile"], "jn-worker", "the bot rides session.create");
+            assert_eq!(create_params["title"], "Bot Chat", "the exact canonical title");
+            assert_eq!(create_params["cols"], 48);
+        }
+
+        let summary = core.open_sessions().await.into_iter().find(|s| s.key == "stored-new").expect("tab");
+        assert_eq!(summary.profile_name, "jn-worker");
     }
 }

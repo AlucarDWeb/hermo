@@ -42,6 +42,10 @@ fn guarded_sources() -> Vec<(PathBuf, &'static str)> {
         // core.rs). Policy without I/O — the guard keeps them that way.
         src.join("reconnect.rs"),
         src.join("session_registry.rs"),
+        // T16a pure policy: the Bot Chat list-before-create resolution
+        // (Desktop Bot Mode invariant, `(profile, "Bot Chat")`). Pure rules
+        // over (title, id) pairs — no I/O, no clock, no framework.
+        src.join("bot_chat.rs"),
     ];
     let neutral = [src.join("protocol.rs"), src.join("json.rs")];
     let mut files: Vec<(PathBuf, &'static str)> = entity
@@ -416,7 +420,7 @@ fn classification_covers_the_real_tree() {
     assert!(!guarded_sources().iter().any(|(p, _)| *p == core));
     assert!(!adapter_allowlist().contains(&core));
     // Pure helpers keep the entity-grade guard: policy without I/O.
-    for expected in ["reconnect.rs", "session_registry.rs"] {
+    for expected in ["reconnect.rs", "session_registry.rs", "bot_chat.rs"] {
         let path = src.join(expected);
         assert!(
             guarded_sources().iter().any(|(p, _)| *p == path),

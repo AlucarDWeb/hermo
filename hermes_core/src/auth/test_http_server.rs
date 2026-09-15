@@ -26,6 +26,8 @@ pub enum RouteKind {
     Logout,
     /// A request a gated route refused for a missing cookie.
     Denied,
+    /// `GET /api/profiles` (T16a).
+    Profiles,
 }
 
 /// Static route config: kind → (status, body, optional Set-Cookie).
@@ -114,6 +116,29 @@ impl Route {
             require_cookie: None,
         }
     }
+
+    /// `GET /api/profiles` with the verified wire shape (extra keys included
+    /// on purpose: the DTO must ignore them).
+    pub fn profiles_ok() -> Self {
+        Self {
+            kind: RouteKind::Profiles,
+            status: StatusCode::OK,
+            body: json!({"profiles": []}),
+            set_cookie: None,
+            require_cookie: None,
+        }
+    }
+
+    /// Profiles with an explicit status (error mapping tests).
+    pub fn profiles_status(status: StatusCode) -> Self {
+        Self {
+            kind: RouteKind::Profiles,
+            status,
+            body: json!({"detail": "unauthorized"}),
+            set_cookie: None,
+            require_cookie: None,
+        }
+    }
 }
 
 /// Handle to a running fake backend.
@@ -172,6 +197,7 @@ fn kind_for_path(path: &str) -> Option<RouteKind> {
         "/api/auth/ws-ticket" => Some(RouteKind::Ticket),
         "/api/auth/me" => Some(RouteKind::Me),
         "/auth/logout" => Some(RouteKind::Logout),
+        "/api/profiles" => Some(RouteKind::Profiles),
         _ => None,
     }
 }
