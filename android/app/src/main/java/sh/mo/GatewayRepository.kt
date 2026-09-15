@@ -75,6 +75,20 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     private val pendingKeys: MutableSet<String> =
         java.util.concurrent.ConcurrentHashMap.newKeySet()
 
+    /**
+     * FIX7-r2 (review round 2, should 2): transcript changes that arrive for
+     * a key OUTSIDE the tab set / [pendingKeys] while an `open_session` is
+     * in flight. The core can deliver Reset+rows before `open_session`
+     * answers (picker-open / mint have no pre-seeded key) — parking instead
+     * of dropping keeps that history; re-applied at registration, dropped
+     * for good when no open is in flight.
+     */
+    private val parkedChanges: java.util.concurrent.ConcurrentLinkedQueue<TranscriptChangeDto> =
+        java.util.concurrent.ConcurrentLinkedQueue()
+
+    /** Count of in-flight `open_session` calls (see [parkedChanges]). */
+    private val inFlightOpens = java.util.concurrent.atomic.AtomicInteger(0)
+
     /** Last error, surfaced as one line of text in whatever phase is shown. */
     private val _errorText = MutableStateFlow("")
     val errorText: StateFlow<String> = _errorText.asStateFlow()
@@ -129,24 +143,35 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         }
     }
 
+    private fun kindOf(change: TranscriptChangeDto): String = when (change.kind) {
+        TranscriptChangeKind.ROW_APPENDED -> "rowAppended"
+        TranscriptChangeKind.ROW_UPDATED -> "rowUpdated"
+        TranscriptChangeKind.RESET -> "reset"
+        TranscriptChangeKind.HEADER_UPDATED -> "headerUpdated"
+    }
+
+    /** FIX7-r2: one predicate for "the map may grow for this key". */
+    private fun isOpenOrRestoring(key: String): Boolean =
+        key in _tabs.value.keys || key in pendingKeys
+
     private fun onTranscriptChange(change: TranscriptChangeDto) {
-        // FIX7 (review #19 finding 1): the map may only grow for a key the
-        // repository considers open-or-restoring — live tabs plus
-        // [pendingKeys], which a key enters BEFORE its open_session call.
-        // That covers the resume race (Reset+rows landing before tab
-        // registration) without resurrecting closed tabs. currentKey and
-        // the strip still come only from open/switch/restore.
-        val kind = when (change.kind) {
-            TranscriptChangeKind.ROW_APPENDED -> "rowAppended"
-            TranscriptChangeKind.ROW_UPDATED -> "rowUpdated"
-            TranscriptChangeKind.RESET -> "reset"
-            TranscriptChangeKind.HEADER_UPDATED -> "headerUpdated"
+        if (!isOpenOrRestoring(change.key)) {
+            // FIX7-r2 (round 2, should 2): during an in-flight open_session
+            // the core may deliver Reset+rows for the session being opened
+            // (picker-open / mint have no pre-seeded key). Park those and
+            // re-apply them at registration; with NO open in flight an
+            // unknown-key change is dropped — no phantoms, no resurrection.
+            if (inFlightOpens.get() > 0) parkedChanges.add(change)
+            return
         }
         _sessions.value = applySessionChange(
-            _sessions.value, change.key, kind, change.index.toLong(), change.rowJson,
+            _sessions.value, change.key, kindOf(change), change.index.toLong(), change.rowJson,
             knownKeys = _tabs.value.keys.toSet() + pendingKeys,
         )
         if (change.kind == TranscriptChangeKind.HEADER_UPDATED) {
+            // FIX7-r2 (round 2, should 1): the header RPC sits behind the
+            // SAME open-or-restoring predicate as the map write above —
+            // refreshHeader writes map entries too.
             scope.launch { refreshHeader(change.key) }
         }
     }
@@ -154,22 +179,51 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     /**
      * Run one core `open_session` shape, then add the key as a tab.
      * Rows the stream already delivered for that key are kept (ensureSession
-     * must not clobber them with an empty SessionUiState).
+     * must not clobber them with an empty SessionUiState). FIX7-r2 (round 2,
+     * should 2): the in-flight window is COVERED — changes parked by
+     * [onTranscriptChange] while `openCall` was on the stack are re-applied
+     * before registration, so no history is lost for picker-open / mint
+     * either (only the restore path has pre-seeded keys).
      */
     private suspend fun openAndRegister(openCall: suspend () -> String): String? {
-        return try {
+        inFlightOpens.incrementAndGet()
+        try {
             val key = openCall()
             // FIX7: the key is known from the moment open_session answers —
-            // cover the sink race until the tab registration two lines down.
+            // cover the sink race until the tab registration below.
             pendingKeys.add(key)
+            drainParked(key)
             _sessions.value = ensureSession(_sessions.value, key)
             _tabs.value = _tabs.value.add(key)
             pendingKeys.remove(key)
-            key
+            return key
         } catch (t: Throwable) {
             applyError(t)
-            null
+            return null
+        } finally {
+            if (inFlightOpens.decrementAndGet() == 0) {
+                // No open in flight anymore: whatever is still parked belongs
+                // to keys that never opened — dropped, per the unknown-key
+                // contract.
+                parkedChanges.clear()
+            }
         }
+    }
+
+    /** Re-apply the changes parked during the in-flight open of [key]. */
+    private fun drainParked(key: String) {
+        if (parkedChanges.isEmpty()) return
+        val known = _tabs.value.keys.toSet() + pendingKeys + key
+        var sessions = _sessions.value
+        while (true) {
+            val parked = parkedChanges.poll() ?: break
+            if (parked.key != key) continue
+            sessions = applySessionChange(
+                sessions, key, kindOf(parked), parked.index.toLong(), parked.rowJson,
+                knownKeys = known,
+            )
+        }
+        _sessions.value = sessions
     }
 
     private fun applyError(t: Throwable) {
@@ -259,8 +313,11 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         }
         val plan = when (val step = launchStep(summaries.map { it.key }, lastActive)) {
             is LaunchStep.RunPlan -> step.plan
-            // Unreachable here: summaries != null was checked above.
-            LaunchStep.ListFailed -> return
+            // Unreachable by construction (summaries != null above) — fail
+            // loudly rather than silently swallow a future real ListFailed
+            // (FIX7-r2 nit 1).
+            LaunchStep.ListFailed ->
+                error("launchStep returned ListFailed for a non-null registry")
         }
         // FIX7: pre-register the restore keys so resume Reset+rows that land
         // before tab registration are still applied (finding 1's race).
@@ -321,6 +378,11 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     }
 
     private suspend fun refreshHeader(key: String) {
+        // FIX7-r2 (round 2, should 1): the SAME open-or-restoring predicate
+        // as the map gate — a header RPC for a closed/unknown key must
+        // neither resurrect a phantom entry (the write below mints one) nor
+        // spend the round trip.
+        if (!isOpenOrRestoring(key)) return
         val summary: SessionSummary? = core.openSessions().firstOrNull { it.key == key }
         if (summary != null) {
             val model = headerModelOf(summary.headerJson) ?: ""

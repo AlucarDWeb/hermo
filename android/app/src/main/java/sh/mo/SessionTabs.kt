@@ -106,4 +106,6 @@ fun launchStep(registryKeys: List<String>?, lastActive: String?): LaunchStep =
  * (`select`'s invariant — a stale tap cannot steal the screen).
  */
 fun tabTap(tabs: TabSet, currentKey: String?, key: String): TabSet? =
-    if (key == currentKey) null else tabs.select(key).takeIf { it != tabs }
+    // FIX7-r2 nit 2: explicit predicate instead of data-class equality —
+    // self-documenting and immune to any future normalization in `select`.
+    if (key == currentKey || key !in tabs.keys) null else tabs.select(key)
