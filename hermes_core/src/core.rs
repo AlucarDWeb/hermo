@@ -1714,10 +1714,11 @@ impl HermesCore {
                 state.registry.get(&key).cloned()
             };
             let Some(record) = record else { continue };
-            // `session.resume` reattaches the durable session and returns
-            // the live sid it now answers to (it may differ after a
-            // reconnect — the sid_index MUST follow it).
-            let resumed = match api::resume_session(client, &key, None).await {
+            // Review #18 follow-up: a stored profile scopes the resume to
+            // THAT profile's db on the gateway — `None` here silently
+            // resumed every bot chat inside the launch profile's db.
+            let profile = record.resume_profile();
+            let resumed = match api::resume_session(client, &key, profile).await {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("resume of session {key} failed: {e}");

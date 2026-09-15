@@ -38,6 +38,17 @@ pub struct SessionRecord {
     pub profile_name: String,
 }
 
+impl SessionRecord {
+    /// The profile to forward on `session.resume` (review #18 follow-up):
+    /// a known profile scopes the resume to THAT profile's db on the
+    /// gateway; an unknown one (old registry file, launch-profile chat)
+    /// stays a bare resume — `None` OMITS the wire key, byte-for-byte what
+    /// the pre-T16a client sent.
+    pub fn resume_profile(&self) -> Option<&str> {
+        (!self.profile_name.is_empty()).then_some(self.profile_name.as_str())
+    }
+}
+
 /// The durable tab list: ordered records + the active tab.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionRegistry {
@@ -185,6 +196,21 @@ mod tests {
             title: format!("title of {id}"),
             profile_name: String::new(),
         }
+    }
+
+    /// Pins the review-#18 follow-up decision at the seam: a record with a
+    /// known profile forwards THAT profile on resume (scoped db), a record
+    /// with an unknown profile (old registry file, launch-profile chat)
+    /// forwards NONE — `None` omits the wire key, the pre-T16a bare resume.
+    /// The call site is `resume_all` (core.rs); this helper is the only
+    /// profile decision it makes.
+    #[test]
+    fn resume_profile_known_forwards_none_for_unknown() {
+        let mut bot = record("s-bot", 1, "e");
+        bot.profile_name = "jn-core".into();
+        assert_eq!(bot.resume_profile(), Some("jn-core"));
+        bot.profile_name = String::new();
+        assert_eq!(bot.resume_profile(), None, "unknown profile stays a bare resume");
     }
 
     /// Round-trip rule pinned: two instances over the same JSON see the same
