@@ -528,6 +528,27 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         return true
     }
 
+    /**
+     * T14 dead-end escape hatch ("Reset sessions" on the offline surface):
+     * wipe the LOCAL session registry — the stored ids that keep failing —
+     * and every tab, then mint a fresh session. The core verb touches only
+     * the registry/live sessions, so the PAIRING (endpoint + cookie jar)
+     * survives; the remote chats are not deleted.
+     */
+    suspend fun resetSessionsAndRestart(cols: Int): Boolean {
+        try {
+            core.clearSessions()
+        } catch (t: Throwable) {
+            applyError(t)
+            return false
+        }
+        _tabs.value = TabSet()
+        _sessions.value = emptyMap()
+        _currentKey.value = null
+        _errorText.value = ""
+        return openNewSession(cols)
+    }
+
     /** Shared tail of the picker opens / tab switch: Ready refresh. */
     private suspend fun afterOpen(key: String) {
         refreshHeader(key)

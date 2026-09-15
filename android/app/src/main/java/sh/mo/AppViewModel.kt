@@ -257,6 +257,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * T14 dead-end: "Reset sessions" on the offline surface — wipes the
+     * local session registry (the pairing survives) and mints one fresh
+     * chat. The only way out when every stored resume fails.
+     */
+    fun resetSessionsAndRestart() {
+        viewModelScope.launch { repo.resetSessionsAndRestart(cols()) }
+    }
+
     /** Decision 3's local branch: phone-native equivalents, declared. */
     private fun handleLocalCommand(command: String) {
         when (command) {

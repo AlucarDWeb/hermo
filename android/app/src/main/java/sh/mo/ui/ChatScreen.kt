@@ -39,6 +39,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
@@ -526,6 +527,7 @@ private fun ErrorBanner(text: String) {
             .padding(horizontal = 16.dp, vertical = 6.dp),
     )
 }
+
 
 @Composable
 private fun TranscriptList(

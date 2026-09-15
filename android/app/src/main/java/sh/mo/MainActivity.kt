@@ -188,7 +188,12 @@ fun AppScreen(
                 themeMode = themeMode,
                 onThemeModeChange = onThemeModeChange,
             )
-        is AppPhase.Offline -> OfflineScreen(reason = p.reason, onRetry = { viewModel.retryResume() })
+        is AppPhase.Offline ->
+            OfflineScreen(
+                reason = p.reason,
+                onRetry = { viewModel.retryResume() },
+                onResetSessions = { viewModel.resetSessionsAndRestart() },
+            )
     }
 }
 
