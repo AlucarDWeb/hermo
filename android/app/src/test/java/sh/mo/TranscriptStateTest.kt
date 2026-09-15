@@ -86,4 +86,29 @@ class TranscriptStateTest {
         val again = applyTranscriptChange(rows, "rowAppended", 0, """{"kind":"user","text":"q"}""")
         assertEquals(1, again.size)
     }
+
+    // T16b restart: resume Reset+rows can land BEFORE the tab is registered.
+    // Dropping unknown-key changes left the strip on an empty transcript
+    // (08_restart_restore.png). The map may hold rows for a key that is not
+    // yet a tab; currentKey/tabs stay untouched here.
+
+    @Test
+    fun `applySessionChange keeps resume rows for a key nobody has tabbed yet`() {
+        val user = """{"kind":"user","text":"pong"}"""
+        var sessions = emptyMap<String, SessionUiState>()
+        sessions = applySessionChange(sessions, "k", "reset", 0, "")
+        sessions = applySessionChange(sessions, "k", "rowAppended", 0, user)
+        assertEquals(listOf(user), sessions.getValue("k").rows)
+    }
+
+    @Test
+    fun `ensureSession does not wipe rows already applied`() {
+        val user = """{"kind":"user","text":"pong"}"""
+        var sessions = applySessionChange(emptyMap(), "k", "rowAppended", 0, user)
+        sessions = ensureSession(sessions, "k")
+        assertEquals(listOf(user), sessions.getValue("k").rows)
+        sessions = ensureSession(sessions, "other")
+        assertEquals(listOf(user), sessions.getValue("k").rows)
+        assertEquals(emptyList<String>(), sessions.getValue("other").rows)
+    }
 }

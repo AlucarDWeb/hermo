@@ -31,6 +31,12 @@ data class SessionUiState(
     val rows: List<String> = emptyList(),
     /** True while the session's turn is streaming (SessionSummary.running). */
     val running: Boolean = false,
+    /**
+     * T16b: which Hermes profile owns the chat (SessionSummary.profile_name),
+     * carried on the tab model for T16c's drawer — NOT rendered this layer.
+     * Empty when unknown — never a guess.
+     */
+    val profile: String = "",
 ) {
     fun withRows(rows: List<String>) = copy(rows = rows)
 }
@@ -52,6 +58,27 @@ data class RemoteSessionRow(
     /** The one-line preview, blank when the session has no text yet. */
     val displayPreview: String get() = preview.trim()
 }
+
+/**
+ * Apply one change-stream event to the per-key map. Unknown keys are
+ * created — the strip's open set is a different structure ([TabSet]), so a
+ * resume that races tab registration must not drop its rows.
+ */
+fun applySessionChange(
+    sessions: Map<String, SessionUiState>,
+    key: String,
+    kind: String,
+    index: Long,
+    rowJson: String,
+): Map<String, SessionUiState> {
+    val current = sessions[key] ?: SessionUiState(key = key)
+    if (kind == "headerUpdated") return sessions + (key to current)
+    return sessions + (key to current.copy(rows = applyTranscriptChange(current.rows, kind, index, rowJson)))
+}
+
+/** Register a tab's key without clobbering rows the stream already delivered. */
+fun ensureSession(sessions: Map<String, SessionUiState>, key: String): Map<String, SessionUiState> =
+    if (key in sessions) sessions else sessions + (key to SessionUiState(key = key))
 
 /**
  * Apply one transcript change to `rows`. `rowJson` is the core's row JSON

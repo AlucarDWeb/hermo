@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -61,6 +63,7 @@ import sh.mo.ApprovalCopy
 import sh.mo.AppViewModel
 import sh.mo.ChatRow
 import sh.mo.SessionUiState
+import sh.mo.TabSet
 import sh.mo.SlashCompletionRow
 import sh.mo.SlashPolicy
 import sh.mo.ThemeMode
@@ -104,6 +107,8 @@ fun ChatScreen(
     val t = LocalHermoTokens.current
     val sessions by viewModel.sessions.collectAsState()
     val currentKey by viewModel.currentKey.collectAsState()
+    // T16b: the ordered open-tab set (repository-owned entity, not Map.keys).
+    val tabs by viewModel.tabs.collectAsState()
     // The repository's last message (errors, and the "Answered elsewhere"
     // copy a 4009/4018 approval/clarify response produces) — surfaced here
     // too, not only on Pairing/Password: on the Ready/chat surface it was
@@ -150,6 +155,15 @@ fun ChatScreen(
                     title = state.title,
                     onTitleTap = { viewModel.openSessionPicker() },
                     onAppearanceTap = { appearanceOpen = true },
+                )
+                // T16b: the ordered open-tab strip UNDER the titlebar — the
+                // title tap still opens the picker, Aa still opens appearance.
+                SessionTabStrip(
+                    tabs = tabs,
+                    sessions = sessions,
+                    onSelect = viewModel::selectTab,
+                    onClose = viewModel::closeTab,
+                    onNew = { viewModel.newChat() },
                 )
                 ErrorBanner(text = errorText)
                 TranscriptList(
@@ -269,6 +283,169 @@ private fun ChatTitlebar(title: String, onTitleTap: () -> Unit, onAppearanceTap:
                 .fillMaxWidth()
                 .height(1.dp)
                 .background(t.strokeTertiary),
+        )
+    }
+}
+
+/**
+ * T16b: the session tab strip (framework layer — it renders the [TabSet]
+ * it is handed; every decision lives in the pure entity / the repository).
+ * Desktop contract: DESIGN.md "Panel titlebars" + `pane-tab.tsx` — active tab
+ * = 2px bottom accent underline, idle label = `--ui-text-tertiary`, hairline
+ * `strokeTertiary` between tabs; `+` is a trailing control; the label is the
+ * session title, or "New session" when blank; a running turn is a small
+ * `midground` dot, no extra copy. Tokens only — no invented colors.
+ *
+ * DECLARED phone-native divergences (vs Desktop `pane-tab.tsx`, not bugs to
+ * fix):
+ *  - × is ALWAYS visible (no hover fade — the phone has no hover) and its
+ *    touch target is ≥ 40dp;
+ *  - no middle-click, no ⌘W, no split panes, no slot numbers, no tab drag;
+ *  - the tab row scrolls HORIZONTALLY instead of squeezing every tab into
+ *    the viewport; `+` stays fixed so it is reachable with many tabs;
+ *  - the picker (title tap) stays a bottom sheet (T11), not Desktop's
+ *    centered dialog.
+ */
+@Composable
+private fun SessionTabStrip(
+    tabs: TabSet,
+    sessions: Map<String, SessionUiState>,
+    onSelect: (String) -> Unit,
+    onClose: (String) -> Unit,
+    onNew: () -> Unit,
+) {
+    val t = LocalHermoTokens.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            tabs.keys.forEachIndexed { index, key ->
+                if (index > 0) {
+                    // Hairline strokeTertiary between tabs (pane-tab.tsx).
+                    Box(
+                        Modifier
+                            .width(1.dp)
+                            .height(t.tabStripHairlineHeightDp.dp)
+                            .background(t.strokeTertiary),
+                    )
+                }
+                SessionTabItem(
+                    key = key,
+                    state = sessions[key],
+                    active = key == tabs.current,
+                    closeable = tabs.keys.size > 1, // last tab is uncloseable
+                    onSelect = { onSelect(key) },
+                    onClose = { onClose(key) },
+                )
+            }
+        }
+        // Trailing `+`: `open_session(null)` — same verb as picker "New chat".
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clickable(onClick = onNew),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "+",
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = LocalFonts.current.sans,
+                    fontSize = t.convFontSize.sp,
+                    fontWeight = FontWeight.Medium,
+                ),
+                color = t.textTertiary,
+            )
+        }
+    }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .background(t.strokeTertiary),
+    )
+}
+
+/**
+ * One tab (pane-tab.tsx shape): label + optional running dot + close, with
+ * the 2px accent underline when active. Idle label = textTertiary, active =
+ * `--ui-text` (the pane-tab title color). The close × is always visible —
+ * phone-native divergence declared above.
+ */
+@Composable
+private fun SessionTabItem(
+    key: String,
+    state: SessionUiState?,
+    active: Boolean,
+    closeable: Boolean,
+    onSelect: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val t = LocalHermoTokens.current
+    Column(
+        modifier = Modifier
+            .heightIn(min = 40.dp)
+            // Fixed width so tabs overflow into the horizontal scroller
+            // instead of shrinking (02_two_tabs: third label clipped against +).
+            .width(t.tabStripTabMaxWidthDp.dp)
+            .clickable(onClick = onSelect),
+    ) {
+        // Wrap-content height (NO weight): a weight inside the screen Column's
+        // leftover max inflated the tab to the whole transcript area.
+        Row(
+            modifier = Modifier.padding(start = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (state?.running == true) {
+                Box(
+                    Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(t.midground),
+                )
+            }
+            Text(
+                // Tab label: the session title, or "New session" when blank.
+                text = (state?.title ?: "").ifBlank { "New session" },
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = LocalFonts.current.sans,
+                    fontSize = t.convToolFontSize.sp,
+                ),
+                color = if (active) t.text else t.textTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            if (closeable) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clickable(onClick = onClose),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "×",
+                        style = androidx.compose.ui.text.TextStyle(
+                            fontFamily = LocalFonts.current.sans,
+                            fontSize = t.convFontSize.sp,
+                        ),
+                        color = t.textTertiary,
+                    )
+                }
+            }
+        }
+        // Active = 2px bottom accent underline (pane-tab.tsx).
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(2.dp)
+                .background(if (active) t.midground else Color.Transparent),
         )
     }
 }
