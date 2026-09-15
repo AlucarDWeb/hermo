@@ -14,6 +14,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import sh.mo.ThemeMode
+import sh.mo.resolve
 
 /**
  * hermo theme — Hermes Desktop's tokens (`apps/desktop/src/styles.css` +
@@ -46,11 +48,19 @@ import androidx.compose.ui.unit.sp
  *     and the LOUD primary: `ensureContrast(primary, #fcfcfc, 4.5)` → #2369fe.
  *
  * Which mode paints: Desktop resolves light/dark from the user's choice with
- * `system` as the default — the phone's equivalent is `isSystemInDarkTheme()`
- * (T7 divergence 1). Not reproducible on the phone (stated, not silently
- * dropped): the translucent "window glass" chrome (backdrop blur), hover-only
- * fills (`--chrome-action-hover`), and theme skins — the phone pins the
- * default `nous` skin's resolved values for the mode it paints.
+ * `system` as the default (`resolveMode`, themes/context.tsx:51) — the phone
+ * carries the SAME selector (T13): the chosen [ThemeMode] is handed in and
+ * resolved against `isSystemInDarkTheme()` by the pure policy in `ThemeMode.kt`
+ * (never a bare `isSystemInDarkTheme()` call with the selector ignored).
+ * Not reproducible on the phone (stated, not silently dropped): the
+ * translucent "window glass" chrome (backdrop blur), hover-only fills
+ * (`--chrome-action-hover`), and theme skins — the phone pins the default
+ * `nous` skin's resolved values for the mode it paints.
+ *
+ * T13 type scale (declared divergence vs Desktop's rem values): 13sp/11sp are
+ * too small on a phone, so every typography size below is a TOKEN, read by
+ * `hermoTypography` from here ONLY — the conversation sizes and the Material
+ * slot sizes are bumped once, centrally, never in a composable.
  */
 
 // ── light seeds (styles.css :root lines 172-200; nous light, presets 178-204) ─
@@ -151,10 +161,20 @@ interface HermoTokens {
      *  hardcoded — the platform's mono face stands in for Menlo/Monaco/SF Mono). */
     val monoFont: FontFamily
 
-    // Conversation typography/spacing knobs (styles.css 474-496).
-    val convFontSize: Float get() = 13f         // --conversation-text-font-size: 0.8125rem
-    val convToolFontSize: Float get() = 11f     // --conversation-tool-font-size: 0.6875rem
-    val convLineHeight: Float get() = 18f       // --conversation-line-height: 1.125rem
+    // Conversation typography/spacing knobs (styles.css 474-496). T13: the
+    // type scale is bumped ONE step here (declared divergence vs Desktop's
+    // 13px/11px rem values — too small on a phone) and every size
+    // `hermoTypography` draws lives in tokens, never as a literal.
+    val convFontSize: Float get() = 15f         // --conversation-text-font-size: 0.8125rem
+    val convToolFontSize: Float get() = 12f     // --conversation-tool-font-size: 0.6875rem
+    val convLineHeight: Float get() = 21f       // --conversation-line-height: 1.125rem
+    // Material slot sizes hermoTypography uses (T13: moved off hardcoded
+    // literals onto tokens, bumped in the same pass: 28→30, 16→18, 14→16).
+    val headlineLargeFontSize: Float get() = 30f
+    val headlineLargeLineHeight: Float get() = 36f
+    val titleMediumFontSize: Float get() = 18f
+    val titleMediumLineHeight: Float get() = 22f
+    val labelSmallLineHeight: Float get() = 16f
     val turnGapDp: Float get() = 6f             // --conversation-turn-gap: 0.375rem
     val turnBlockGapDp: Float get() = 12f       // --turn-block-gap: 0.75rem
     val scaffoldBlockGapDp: Float get() = 4f    // --scaffold-block-gap: turn-block-gap/3
@@ -231,18 +251,18 @@ private fun Color.luminanceCompat(): Float =
 
 /** --dt-base-size 1rem / --dt-line-height 1.5; conversation sizes per token. */
 private fun hermoTypography(t: HermoTokens, fonts: Fonts): Typography = Typography(
-    headlineLarge = TextStyle(fontFamily = fonts.sans, fontWeight = FontWeight.SemiBold, fontSize = 28.sp, lineHeight = 36.sp),
-    titleMedium = TextStyle(fontFamily = fonts.sans, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, lineHeight = 22.sp),
+    headlineLarge = TextStyle(fontFamily = fonts.sans, fontWeight = FontWeight.SemiBold, fontSize = t.headlineLargeFontSize.sp, lineHeight = t.headlineLargeLineHeight.sp),
+    titleMedium = TextStyle(fontFamily = fonts.sans, fontWeight = FontWeight.SemiBold, fontSize = t.titleMediumFontSize.sp, lineHeight = t.titleMediumLineHeight.sp),
     bodyMedium = TextStyle(fontFamily = fonts.sans, fontSize = t.convFontSize.sp, lineHeight = t.convLineHeight.sp),
-    labelSmall = TextStyle(fontFamily = fonts.sans, fontWeight = FontWeight.Medium, fontSize = t.convToolFontSize.sp, lineHeight = 14.sp),
+    labelSmall = TextStyle(fontFamily = fonts.sans, fontWeight = FontWeight.Medium, fontSize = t.convToolFontSize.sp, lineHeight = t.labelSmallLineHeight.sp),
 )
 
 @Composable
-fun HermoTheme(content: @Composable () -> Unit) {
-    // Desktop resolves light/dark from the user's choice, defaulting to
-    // `system` (themes/context.tsx resolveMode) — the phone equivalent is the
-    // system dark setting (T7 divergence 1).
-    val tokens = if (isSystemInDarkTheme()) DarkTokens else LightTokens
+fun HermoTheme(mode: ThemeMode = ThemeMode.System, content: @Composable () -> Unit) {
+    // Desktop's resolveMode: the USER's choice, `system` default — the mode
+    // is handed in (selector at the chat titlebar), the pure policy resolves
+    // it against the OS setting, and the tokens paint from the RESULT.
+    val tokens = if (resolve(mode, isSystemInDarkTheme())) DarkTokens else LightTokens
     val fonts = Fonts(sans = FontFamily.SansSerif, mono = tokens.monoFont)
     CompositionLocalProvider(LocalHermoTokens provides tokens, LocalFonts provides fonts) {
         MaterialTheme(

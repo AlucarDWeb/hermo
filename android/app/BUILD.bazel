@@ -210,6 +210,7 @@ TEST_CLASSES = [
     "ThinkingLabelTest",
     "PromptCardsTest",
     "SlashPolicyTest",
+    "ThemeModeTest",
 ]
 
 [
@@ -247,6 +248,7 @@ kt_jvm_library(
         "src/main/java/sh/mo/ToolCardModel.kt",
         "src/main/java/sh/mo/PromptCards.kt",
         "src/main/java/sh/mo/SlashPolicy.kt",
+        "src/main/java/sh/mo/ThemeMode.kt",
     ],
     deps = ["@maven//:org_json_json"],
 )
