@@ -175,6 +175,8 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         _sessions.value = applySessionChange(
             _sessions.value, change.key, kindOf(change), change.index.toLong(), change.rowJson,
             knownKeys = _tabs.value.keys.toSet() + pendingKeys,
+            // FIX8 item 5: the auto-titling rename now rides the change.
+            title = change.title,
         )
         if (change.kind == TranscriptChangeKind.HEADER_UPDATED) {
             // FIX7-r2 (round 2, should 1): the header RPC sits behind the
@@ -237,6 +239,7 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             sessions = applySessionChange(
                 sessions, key, kindOf(parked), parked.index.toLong(), parked.rowJson,
                 knownKeys = known,
+                title = parked.title,
             )
         }
         for (change in otherKeys) parkedChanges.add(change)
@@ -593,6 +596,28 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         if (current != null && current != _currentKey.value) {
             _currentKey.value = current
             afterOpen(current)
+        }
+    }
+
+    /**
+     * FIX8 item 1: name the current session (titlebar edit dialog). The
+     * core RPC is `session.title` SET; the LOCAL header is then re-synced
+     * through [refreshHeader] (the synthetic `session.title` event the core
+     * routes arrives via the sink too — the refresh is the reconciliation).
+     */
+    suspend fun setSessionTitle(title: String): Boolean {
+        val key: String = _currentKey.value ?: run {
+            _errorText.value = "No open session to rename"
+            return false
+        }
+        return try {
+            core.setSessionTitle(key, title)
+            _errorText.value = ""
+            refreshHeader(key)
+            true
+        } catch (t: Throwable) {
+            applyError(t)
+            false
         }
     }
 

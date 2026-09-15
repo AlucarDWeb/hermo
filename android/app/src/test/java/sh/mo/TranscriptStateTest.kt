@@ -123,6 +123,50 @@ class TranscriptStateTest {
     }
 
     @Test
+    fun `applySessionChange headerUpdated with a title updates SessionUiState title`() {
+        // Pins FIX8 item 5: the core's HeaderUpdated DTO now carries the
+        // auto-titling rename (core FIX8 A1), and the headerUpdated branch
+        // copies it into the session state. BROKEN behaviour pinned here:
+        // the pre-FIX8 branch returned the entry UNCHANGED, so the tab and
+        // the titlebar stayed "New session" forever — the app never saw
+        // the rename the core had already applied.
+        var sessions = applySessionChange(emptyMap(), "k", "rowAppended", 0, "{\"kind\":\"user\",\"text\":\"q\"}", knownKeys = setOf("k"))
+        sessions = applySessionChange(
+            sessions, "k", "headerUpdated", 0, "", knownKeys = setOf("k"),
+            title = "my chat",
+        )
+        assertEquals("my chat", sessions.getValue("k").title)
+    }
+
+    @Test
+    fun `applySessionChange headerUpdated with an empty title keeps the old one`() {
+        // Pins FIX8 item 5's blank guard: an empty title must never BLANK a
+        // known one (a header event without the rename must be a no-op on
+        // the title). BROKEN behaviour pinned here: an unguarded
+        // `copy(title = title)` would blank the tab label whenever the core
+        // delivered a headerUpdated without a title.
+        var sessions = applySessionChange(
+            emptyMap(), "k", "headerUpdated", 0, "", knownKeys = setOf("k"),
+            title = "my chat",
+        )
+        sessions = applySessionChange(sessions, "k", "headerUpdated", 0, "", knownKeys = setOf("k"), title = "")
+        assertEquals("my chat", sessions.getValue("k").title)
+    }
+
+    @Test
+    fun `applySessionChange headerUpdated leaves the row list untouched`() {
+        // Headers are not rows: the title change must not disturb the
+        // transcript the change stream built.
+        val user = """{"kind":"user","text":"q"}"""
+        var sessions = applySessionChange(emptyMap(), "k", "rowAppended", 0, user, knownKeys = setOf("k"))
+        sessions = applySessionChange(
+            sessions, "k", "headerUpdated", 0, "", knownKeys = setOf("k"),
+            title = "my chat",
+        )
+        assertEquals(listOf(user), sessions.getValue("k").rows)
+    }
+
+    @Test
     fun `ensureSession does not wipe rows already applied`() {
         val user = """{"kind":"user","text":"pong"}"""
         var sessions = applySessionChange(emptyMap(), "k", "rowAppended", 0, user, knownKeys = setOf("k"))

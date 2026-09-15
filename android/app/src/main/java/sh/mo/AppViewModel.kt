@@ -202,6 +202,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.closeTab(key) }
     }
 
+    /**
+     * FIX8 item 1: name the current session (titlebar edit dialog). The
+     * dialog refuses the empty name; the VM guards blank too so a whitespace
+     * submit never reaches the core.
+     */
+    fun setSessionTitle(title: String) {
+        if (title.isBlank()) return
+        viewModelScope.launch { repo.setSessionTitle(title.trim()) }
+    }
+
     // ── T16c: the bot drawer ───────────────────────────────────────────
 
     /** The drawer's rows / loading / error state (the pure [DrawerUiState]). */
