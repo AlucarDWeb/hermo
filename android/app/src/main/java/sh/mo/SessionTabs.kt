@@ -73,3 +73,37 @@ fun restorePlan(keys: List<String>, lastActive: String?): RestorePlan =
         resumeKeys = keys,
         current = lastActive?.takeIf { it in keys } ?: keys.lastOrNull(),
     )
+
+/**
+ * FIX7 (review 5214081721, finding 2): the launch's FIRST decision, pure so
+ * the JVM suite can pin it. A failed `open_sessions()` RPC is NOT an empty
+ * registry — the pre-fix adapter conflated the two, swallowed the error and
+ * fell through to `open_session(null)`: a brand-new session minted on every
+ * failed launch. Only a SUCCESSFUL read of an empty registry may reach the
+ * mint path (the legitimate fresh-install path).
+ */
+sealed interface LaunchStep {
+    /** The registry list failed: surface the error, open NOTHING. */
+    object ListFailed : LaunchStep
+
+    /** The registry list succeeded: run the plan (empty → the caller mints). */
+    data class RunPlan(val plan: RestorePlan) : LaunchStep
+}
+
+/**
+ * @param registryKeys the `open_sessions()` keys, or `null` when the RPC
+ *   FAILED (null is failure, an empty list is a genuinely empty registry).
+ */
+fun launchStep(registryKeys: List<String>?, lastActive: String?): LaunchStep =
+    if (registryKeys == null) LaunchStep.ListFailed
+    else LaunchStep.RunPlan(restorePlan(registryKeys, lastActive))
+
+/**
+ * FIX7 (finding 3): the strip-tap policy — `null` when the tap must do
+ * NOTHING. The pre-fix `switchTab` fell through to `afterOpen` even when the
+ * tapped key was already current: a header RPC re-issued and the phase
+ * machine churned on every re-tap. A key outside the set stays a no-op too
+ * (`select`'s invariant — a stale tap cannot steal the screen).
+ */
+fun tabTap(tabs: TabSet, currentKey: String?, key: String): TabSet? =
+    if (key == currentKey) null else tabs.select(key).takeIf { it != tabs }

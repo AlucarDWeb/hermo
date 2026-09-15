@@ -2,6 +2,7 @@ package sh.mo
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -125,5 +126,47 @@ class SessionTabsTest {
         val plan = restorePlan(keys = emptyList(), lastActive = null)
         assertEquals(emptyList<String>(), plan.resumeKeys)
         assertNull(plan.current)
+    }
+
+    // ── FIX7 (review #19 findings 2, 3) ─────────────────────────────────
+
+    @Test
+    fun `launchStep treats a failed registry read as ListFailed, not empty`() {
+        // Pins FIX7 finding 2: null (the RPC FAILED) must not collapse to an
+        // empty plan — the pre-fix adapter minted a brand-new session on
+        // every failed launch. An empty LIST is the genuine fresh-install.
+        assertEquals(LaunchStep.ListFailed, launchStep(null, null))
+        val step = launchStep(emptyList(), null)
+        assertTrue(step is LaunchStep.RunPlan)
+        assertEquals(emptyList<String>(), (step as LaunchStep.RunPlan).plan.resumeKeys)
+    }
+
+    @Test
+    fun `launchStep plans a successful registry read`() {
+        val step = launchStep(listOf("a", "b"), "b")
+        assertTrue(step is LaunchStep.RunPlan)
+        val plan = (step as LaunchStep.RunPlan).plan
+        assertEquals(listOf("a", "b"), plan.resumeKeys)
+        assertEquals("b", plan.current)
+    }
+
+    @Test
+    fun `tabTap on the current tab is a no-op`() {
+        // Pins FIX7 nit 3: the pre-fix switchTab re-ran afterOpen (header
+        // RPC + phase churn) on every re-tap of the active tab.
+        val tabs = TabSet(keys = listOf("a", "b"), current = "a")
+        assertNull(tabTap(tabs, "a", "a"))
+    }
+
+    @Test
+    fun `tabTap outside the set is a no-op too`() {
+        val tabs = TabSet(keys = listOf("a", "b"), current = "a")
+        assertNull(tabTap(tabs, "a", "zzz"))
+    }
+
+    @Test
+    fun `tabTap on another open tab selects it`() {
+        val tabs = TabSet(keys = listOf("a", "b"), current = "a")
+        assertEquals("b", tabTap(tabs, "a", "b")?.current)
     }
 }

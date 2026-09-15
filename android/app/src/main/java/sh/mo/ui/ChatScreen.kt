@@ -331,7 +331,7 @@ private fun SessionTabStrip(
                     Box(
                         Modifier
                             .width(1.dp)
-                            .height(t.tabStripHairlineHeightDp.dp)
+                            .height(t.tabStripSeparatorHeightDp.dp)
                             .background(t.strokeTertiary),
                     )
                 }

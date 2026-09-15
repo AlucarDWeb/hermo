@@ -60,9 +60,21 @@ data class RemoteSessionRow(
 }
 
 /**
- * Apply one change-stream event to the per-key map. Unknown keys are
- * created — the strip's open set is a different structure ([TabSet]), so a
- * resume that races tab registration must not drop its rows.
+ * Apply one change-stream event to the per-key map.
+ *
+ * FIX7 (review 5214081721, finding 1): the map may only GROW for a key the
+ * repository considers open-or-restoring ([knownKeys] = the live `TabSet.keys`
+ * union the keys the launch restore plan pre-registered). The pre-fix code
+ * minted a [SessionUiState] for EVERY arriving key — contradicting this
+ * file's own contract and letting a late transcript change for a key closed
+ * via `closeTab` resurrect the phantom entry. Unknown and closed keys are
+ * now DROPPED.
+ *
+ * The resume race stays covered at the adapter: the repository puts the
+ * restore keys into `knownKeys` BEFORE the sink is allowed to deliver
+ * (register, then consume), so a resume's Reset+rows still land even when
+ * they race tab registration. `currentKey` is never set by an arriving
+ * change — that invariant is untouched.
  */
 fun applySessionChange(
     sessions: Map<String, SessionUiState>,
@@ -70,7 +82,11 @@ fun applySessionChange(
     kind: String,
     index: Long,
     rowJson: String,
+    knownKeys: Set<String>,
 ): Map<String, SessionUiState> {
+    // The header branch (finding 4) sits behind the same gate: a header for
+    // an unknown/closed key must not mint an empty entry either.
+    if (key !in knownKeys) return sessions
     val current = sessions[key] ?: SessionUiState(key = key)
     if (kind == "headerUpdated") return sessions + (key to current)
     return sessions + (key to current.copy(rows = applyTranscriptChange(current.rows, kind, index, rowJson)))

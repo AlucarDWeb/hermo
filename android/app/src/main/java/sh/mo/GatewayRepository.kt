@@ -66,6 +66,15 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     private val _tabs = MutableStateFlow(TabSet())
     val tabs: StateFlow<TabSet> = _tabs.asStateFlow()
 
+    /**
+     * FIX7 (review #19 finding 1): keys whose stream events may mint a map
+     * entry — the live tab set plus the keys being opened/restoring right
+     * now. Seeded BEFORE the core call so a resume's Reset+rows racing tab
+     * registration still land; drained once the tab is registered.
+     */
+    private val pendingKeys: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
     /** Last error, surfaced as one line of text in whatever phase is shown. */
     private val _errorText = MutableStateFlow("")
     val errorText: StateFlow<String> = _errorText.asStateFlow()
@@ -121,9 +130,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     }
 
     private fun onTranscriptChange(change: TranscriptChangeDto) {
-        // Always apply — resume Reset+rows can land before the tab is in
-        // `_tabs`. Phantom map entries do not steal the screen: currentKey
-        // and the strip come only from open/switch/restore.
+        // FIX7 (review #19 finding 1): the map may only grow for a key the
+        // repository considers open-or-restoring — live tabs plus
+        // [pendingKeys], which a key enters BEFORE its open_session call.
+        // That covers the resume race (Reset+rows landing before tab
+        // registration) without resurrecting closed tabs. currentKey and
+        // the strip still come only from open/switch/restore.
         val kind = when (change.kind) {
             TranscriptChangeKind.ROW_APPENDED -> "rowAppended"
             TranscriptChangeKind.ROW_UPDATED -> "rowUpdated"
@@ -132,6 +144,7 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         }
         _sessions.value = applySessionChange(
             _sessions.value, change.key, kind, change.index.toLong(), change.rowJson,
+            knownKeys = _tabs.value.keys.toSet() + pendingKeys,
         )
         if (change.kind == TranscriptChangeKind.HEADER_UPDATED) {
             scope.launch { refreshHeader(change.key) }
@@ -146,8 +159,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     private suspend fun openAndRegister(openCall: suspend () -> String): String? {
         return try {
             val key = openCall()
+            // FIX7: the key is known from the moment open_session answers —
+            // cover the sink race until the tab registration two lines down.
+            pendingKeys.add(key)
             _sessions.value = ensureSession(_sessions.value, key)
             _tabs.value = _tabs.value.add(key)
+            pendingKeys.remove(key)
             key
         } catch (t: Throwable) {
             applyError(t)
@@ -208,26 +225,52 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
      * T16b restore (T5 contract): resume EVERY registry tab, not just the
      * last-active one. The plan is pure (SessionTabs.kt, JVM-tested); this
      * is its adapter side: `open_session` per registry key, skip failures,
-     * current = last-active if IT resumed, else the last one that did; an
-     * empty registry (or all failures) mints `open_session(null)`.
+     * current = last-active if IT resumed, else the last one that did. A
+     * failed `open_sessions()` is NOT an empty registry (FIX7, review #19
+     * finding 2): it surfaces the error and opens nothing. An empty registry
+     * that was READ successfully (or all-resumes-failed, guarded below)
+     * still routes to the mint / Closed paths as before.
      */
     private suspend fun openMainSession(cols: Int) {
-        val summaries = try {
+        val summaries: List<SessionSummary>? = try {
             core.openSessions()
-        } catch (_: Throwable) {
-            emptyList()
+        } catch (t: Throwable) {
+            // FIX7 (review #19 finding 2): a failed list RPC is NOT an empty
+            // registry — the pre-fix `emptyList()` conflated the two and
+            // minted a brand-new session on every failed launch. Surface the
+            // error and open nothing.
+            applyError(t)
+            null
+        }
+        if (summaries == null) {
+            _phase.value = PhaseMachine.reduce(
+                _phase.value,
+                PhaseMachine.ConnEvent.Closed("error: session registry unreachable"),
+                endpointText,
+            )
+            return
         }
         val lastActive = try {
             core.lastActiveSession()
         } catch (_: Throwable) {
+            // Tolerant on purpose: null only demotes the plan's current
+            // choice to "last successfully resumed" — it never mints anything.
             null
         }
-        val plan = restorePlan(summaries.map { it.key }, lastActive)
+        val plan = when (val step = launchStep(summaries.map { it.key }, lastActive)) {
+            is LaunchStep.RunPlan -> step.plan
+            // Unreachable here: summaries != null was checked above.
+            LaunchStep.ListFailed -> return
+        }
+        // FIX7: pre-register the restore keys so resume Reset+rows that land
+        // before tab registration are still applied (finding 1's race).
+        pendingKeys.addAll(plan.resumeKeys)
         val resumed = mutableListOf<String>()
         for (key in plan.resumeKeys) {
             val opened = openAndRegister { core.openSession(key, cols.toLong()) }
             if (opened != null) resumed.add(opened)
         }
+        pendingKeys.removeAll(plan.resumeKeys.toSet())
         // Titles/profiles/running flags from the registry snapshot we took
         // (refreshHeader only covers the current tab).
         applySummaries(summaries)
@@ -377,7 +420,10 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
      * key outside the set, so a stale tap cannot steal the screen.
      */
     suspend fun switchTab(key: String) {
-        val next = _tabs.value.select(key)
+        // FIX7 (review #19 nit 3): a tap on the already-current tab is a
+        // no-op — no header RPC, no phase churn. `tabTap` also rejects keys
+        // outside the set, so a stale tap cannot steal the screen.
+        val next = tabTap(_tabs.value, _currentKey.value, key) ?: return
         _tabs.value = next
         val current = next.current ?: return
         _currentKey.value = current

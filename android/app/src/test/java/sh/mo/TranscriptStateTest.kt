@@ -87,24 +87,45 @@ class TranscriptStateTest {
         assertEquals(1, again.size)
     }
 
-    // T16b restart: resume Reset+rows can land BEFORE the tab is registered.
-    // Dropping unknown-key changes left the strip on an empty transcript
-    // (08_restart_restore.png). The map may hold rows for a key that is not
-    // yet a tab; currentKey/tabs stay untouched here.
+    // FIX7 (review #19 finding 1): the map may only grow for a key the
+    // repository considers open-or-restoring. The resume race itself is
+    // covered by the ADAPTER, which seeds pendingKeys BEFORE the core call —
+    // the pure function only sees the resulting knownKeys set.
 
     @Test
-    fun `applySessionChange keeps resume rows for a key nobody has tabbed yet`() {
+    fun `applySessionChange keeps resume rows for a restoring key`() {
         val user = """{"kind":"user","text":"pong"}"""
         var sessions = emptyMap<String, SessionUiState>()
-        sessions = applySessionChange(sessions, "k", "reset", 0, "")
-        sessions = applySessionChange(sessions, "k", "rowAppended", 0, user)
+        sessions = applySessionChange(sessions, "k", "reset", 0, "", knownKeys = setOf("k"))
+        sessions = applySessionChange(sessions, "k", "rowAppended", 0, user, knownKeys = setOf("k"))
         assertEquals(listOf(user), sessions.getValue("k").rows)
+    }
+
+    @Test
+    fun `applySessionChange drops events for a key outside knownKeys`() {
+        // Pins FIX7 finding 1: the pre-fix code minted a SessionUiState for
+        // EVERY arriving key, so a late change for a key closed via closeTab
+        // resurrected the phantom entry. Both events below target "k", which
+        // is not in knownKeys — the map must stay empty.
+        val user = """{"kind":"user","text":"pong"}"""
+        var sessions = applySessionChange(emptyMap(), "k", "reset", 0, "", knownKeys = setOf("open"))
+        assertTrue(sessions.isEmpty())
+        sessions = applySessionChange(sessions, "k", "rowAppended", 0, user, knownKeys = setOf("open"))
+        assertTrue(sessions.isEmpty())
+    }
+
+    @Test
+    fun `applySessionChange drops headerUpdated for an unknown key`() {
+        // Pins FIX7 finding 4: a header for an unknown key must not mint an
+        // empty entry either (same gate as finding 1).
+        val sessions = applySessionChange(emptyMap(), "k", "headerUpdated", 0, "", knownKeys = setOf("open"))
+        assertTrue(sessions.isEmpty())
     }
 
     @Test
     fun `ensureSession does not wipe rows already applied`() {
         val user = """{"kind":"user","text":"pong"}"""
-        var sessions = applySessionChange(emptyMap(), "k", "rowAppended", 0, user)
+        var sessions = applySessionChange(emptyMap(), "k", "rowAppended", 0, user, knownKeys = setOf("k"))
         sessions = ensureSession(sessions, "k")
         assertEquals(listOf(user), sessions.getValue("k").rows)
         sessions = ensureSession(sessions, "other")
