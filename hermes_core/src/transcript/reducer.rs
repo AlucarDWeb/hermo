@@ -1205,7 +1205,7 @@ mod tests {
         // app decodes the row from it — an empty row_json is an empty row).
         let rebuilt = r.transcript().rows.clone();
         for (i, change) in changes[1..].iter().enumerate() {
-            let dto = crate::core::change_to_dto("s-resume", &change.change, &rebuilt);
+            let dto = crate::core::change_to_dto("s-resume", &change.change, &rebuilt, "");
             assert_eq!(dto.index as usize, i);
             assert!(!dto.row_json.is_empty(), "row {} must render its row_json", i);
         }
@@ -1214,7 +1214,7 @@ mod tests {
         // same index and could only pass). Row 0 of the rebuilt history is
         // the user message "hi there"; its delivered payload must be exactly
         // the serialized user row — nothing else can pass.
-        let first = crate::core::change_to_dto("s-resume", &changes[1].change, &rebuilt);
+        let first = crate::core::change_to_dto("s-resume", &changes[1].change, &rebuilt, "");
         assert_eq!(first.row_json, r#"{"kind":"user","text":"hi there"}"#);
         let t = r.transcript();
         // Non-object entries are skipped, the four objects become rows in

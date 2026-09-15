@@ -94,12 +94,15 @@ pub enum TranscriptChangeKind {
 /// One routable transcript change, as delivered to [`EventSink::on_transcript`].
 /// `index` is the affected row (`u32::MAX` for `Reset`/`HeaderUpdated`);
 /// `row_json` carries the full row as compact JSON for append/update.
+/// `title` carries the NEW session title on `HeaderUpdated` (the
+/// auto-titling `session.title` event, FIX8 A1) — empty on every other kind.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TranscriptChangeDto {
     pub key: String,
     pub kind: TranscriptChangeKind,
     pub index: u32,
     pub row_json: String,
+    pub title: String,
 }
 
 /// Connection state as seen by the app (PLAN §4 T6 phases).
@@ -224,24 +227,32 @@ struct LiveSession {
 
 /// Convert an entity [`TranscriptChange`] into its FFI DTO, stamping the
 /// session key. Pure helper (testable without a socket).
-pub(crate) fn change_to_dto(key: &str, change: &TranscriptChange, transcript_rows: &[Row]) -> TranscriptChangeDto {
-    let (kind, index, row_json) = match change {
+pub(crate) fn change_to_dto(
+    key: &str,
+    change: &TranscriptChange,
+    transcript_rows: &[Row],
+    title: &str,
+) -> TranscriptChangeDto {
+    let (kind, index, row_json, title) = match change {
         TranscriptChange::RowAppended { index } => {
             let idx = *index;
-            (TranscriptChangeKind::RowAppended, idx, row_json(transcript_rows.get(idx)))
+            (TranscriptChangeKind::RowAppended, idx, row_json(transcript_rows.get(idx)), String::new())
         }
         TranscriptChange::RowUpdated { index } => {
             let idx = *index;
-            (TranscriptChangeKind::RowUpdated, idx, row_json(transcript_rows.get(idx)))
+            (TranscriptChangeKind::RowUpdated, idx, row_json(transcript_rows.get(idx)), String::new())
         }
-        TranscriptChange::Reset => (TranscriptChangeKind::Reset, usize::MAX, String::new()),
-        TranscriptChange::HeaderUpdated => (TranscriptChangeKind::HeaderUpdated, usize::MAX, String::new()),
+        TranscriptChange::Reset => (TranscriptChangeKind::Reset, usize::MAX, String::new(), String::new()),
+        TranscriptChange::HeaderUpdated => {
+            (TranscriptChangeKind::HeaderUpdated, usize::MAX, String::new(), title.to_string())
+        }
     };
     TranscriptChangeDto {
         key: key.to_string(),
         kind,
         index: u32::try_from(index).unwrap_or(u32::MAX),
         row_json,
+        title,
     }
 }
 
@@ -413,8 +424,14 @@ impl HermesCore {
         if ev.session_id.is_empty() {
             return Vec::new();
         }
-        let Some(key) = state.sid_index.get(&ev.session_id).cloned() else {
-            return Vec::new();
+        // FIX8 item 5: turn events carry the LIVE sid, but the auto-titling
+        // `session.title` event carries the STORED key (wire
+        // contracts/events.py:213 — "session_id is the stored key"). Resolve
+        // both, or the rename event dies here and A1 never delivers it.
+        let key = match state.sid_index.get(&ev.session_id).cloned() {
+            Some(key) => key,
+            None if state.sessions.contains_key(&ev.session_id) => ev.session_id.clone(),
+            None => return Vec::new(),
         };
         let Some(live) = state.sessions.get_mut(&key) else {
             return Vec::new();
@@ -700,7 +717,7 @@ impl HermesCore {
         if let Some(sink) = sink {
             for change in &changes {
                 // Durable key (see deliver_event): the entity stamps the live sid.
-                sink.on_transcript(change_to_dto(&key, &change.change, &rows));
+                sink.on_transcript(change_to_dto(&key, &change.change, &rows, ""));
             }
         }
         Ok(key)
@@ -799,6 +816,51 @@ impl HermesCore {
                 Ok(())
             })
         )
+        .await
+    }
+
+    /// Name a chat tab (FIX8 item 1): RPC `session.title` with `title`
+    /// PRESENT = set (the gateway resolves a live runtime id or a stored id,
+    /// contracts/sessions.py:268). After a successful RPC the LOCAL state is
+    /// updated by routing the synthetic `session.title` event through the
+    /// SAME fan-out the event loop uses (`route_event` → DTOs → sink), so
+    /// the header change reaches the app exactly like an auto-titling event.
+    pub async fn set_session_title(
+        self: Arc<Self>,
+        key: String,
+        title: String,
+    ) -> Result<(), CoreError> {
+        let handle = self.handle.clone();
+        joined(handle.spawn(async move {
+            // `session_id`: the live sid when a live session exists for
+            // `key`, else the stored key (the gateway resolves both). Sink
+            // cloned OUT of the lock — deliver_event keeps its own lock
+            // scope and never calls a foreign callback under it.
+            let (client, session_id, sink) = {
+                let state = self.inner.lock();
+                let session_id = state
+                    .sessions
+                    .get(&key)
+                    .map(|l| l.live_sid.clone())
+                    .unwrap_or_else(|| key.clone());
+                (
+                    state.client.clone().ok_or(CoreError::NotConnected)?,
+                    session_id,
+                    state.sink.clone(),
+                )
+            };
+            api::session_title(&client, &session_id, Some(&title)).await?;
+            if let Some(sink) = sink {
+                let params = EventParams {
+                    event_type: "session.title".into(),
+                    session_id,
+                    seq: None,
+                    payload: json!({ "title": title }),
+                };
+                self.deliver_event(&params, &sink);
+            }
+            Ok(())
+        }))
         .await
     }
 
@@ -953,7 +1015,7 @@ impl HermesCore {
                     for change in &changes {
                         // Durable key (see deliver_event): the reducer stamps
                         // the key it was given, the UI routes on the tab key.
-                        sink.on_transcript(change_to_dto(&key, &change.change, &rows));
+                        sink.on_transcript(change_to_dto(&key, &change.change, &rows, ""));
                     }
                 }
                 Ok(())
@@ -1024,7 +1086,7 @@ impl HermesCore {
                     for change in &changes {
                         // Durable key, not `change.key`: the entity stamps the
                         // live sid, the UI routes on the tab key (T5 fan-out).
-                        sink.on_transcript(change_to_dto(&key, &change.change, &rows));
+                        sink.on_transcript(change_to_dto(&key, &change.change, &rows, ""));
                     }
                 }
                 Ok(())
@@ -1082,7 +1144,7 @@ impl HermesCore {
                 };
                 if let Some(sink) = sink {
                     for change in &changes {
-                        sink.on_transcript(change_to_dto(&key, &change.change, &rows));
+                        sink.on_transcript(change_to_dto(&key, &change.change, &rows, ""));
                     }
                 }
                 Ok(())
@@ -1433,7 +1495,7 @@ impl HermesCore {
         };
         if let Some(sink) = sink {
             for change in &changes {
-                sink.on_transcript(change_to_dto(key, &change.change, &rows));
+                sink.on_transcript(change_to_dto(key, &change.change, &rows, ""));
             }
         }
         Ok(())
@@ -1654,7 +1716,7 @@ impl HermesCore {
             let mut state = self.inner.lock();
             let routed = Self::route_event(&mut state, params);
             let mut deliveries = Vec::with_capacity(routed.len());
-            for (key, changes, _title) in &routed {
+            for (key, changes, title) in &routed {
                 let rows = state
                     .sessions
                     .get(key)
@@ -1663,13 +1725,28 @@ impl HermesCore {
                 deliveries.push(
                     changes
                         // Durable key, not `c.key` (the entity stamps the live
-                        // sid; the UI routes on the tab key).
+                        // sid; the UI routes on the tab key). `title` rides on
+                        // HeaderUpdated so the app sees the auto-titling rename.
                         .iter()
-                        .map(|c| change_to_dto(key, &c.change, &rows))
+                        .map(|c| change_to_dto(key, &c.change, &rows, title))
                         .collect::<Vec<_>>(),
                 );
                 if let Some(seq) = params.seq {
                     state.registry.touch(key, seq, "");
+                }
+                // FIX8 item 5: a HeaderUpdated IS a rename — persist the new
+                // title in the registry record too. The registry is the title
+                // source `open_sessions()` serves (and what survives a
+                // restart), so leaving it stale would make the very next
+                // header refresh hand the app the OLD title back (the rename
+                // visibly reverts). The reducer's ingest path is untouched.
+                if changes
+                    .iter()
+                    .any(|c| matches!(c.change, TranscriptChange::HeaderUpdated))
+                {
+                    if let Some(rec) = state.registry.get_mut(key) {
+                        rec.title = title.clone();
+                    }
                 }
             }
             (deliveries, !routed.is_empty())
@@ -1827,7 +1904,7 @@ impl HermesCore {
         changes
             .into_iter()
             // Durable key, not `c.key` (see deliver_event).
-            .map(|c| change_to_dto(key, &c.change, &rows))
+            .map(|c| change_to_dto(key, &c.change, &rows, ""))
             .collect()
     }
 
@@ -1955,7 +2032,7 @@ impl HermesCore {
                     continue;
                 }
                 for change in &changes {
-                    sink.on_transcript(change_to_dto(&key, &change.change, &rows));
+                    sink.on_transcript(change_to_dto(&key, &change.change, &rows, ""));
                 }
             }
         }
@@ -2287,7 +2364,55 @@ mod tests {
             "a session-less seq must not move the watermark");
     }
 
-    // ── test 3: registry round-trip through the core ────────────────────────
+    /// FIX8 item 5 (A1): the auto-titling `session.title` event carries the
+    /// STORED key as its session_id (wire contracts/events.py:213), and its
+    /// rename must reach the sink ON the HeaderUpdated DTO (`title` field).
+    /// Broken behaviour pinned: the DTO carried an empty `row_json` and no
+    /// title, so the rename died in the core and the app's tab and titlebar
+    /// stayed "New session". Also pins the registry leg: the title is
+    /// persisted in the record, or `open_sessions()` would serve the stale
+    /// title to the next header refresh and the rename would visibly revert.
+    #[tokio::test]
+    async fn session_title_event_routes_by_stored_key_and_updates_the_registry() {
+        let dir = temp_dir("fix8-title");
+        let gw = FakeGw::spawn(|_m, _p| async { Ok(json!({})) });
+        let (core, sink) = connected_core(&dir, &gw).await;
+        attach_session(&core, "stored-alpha", "live-A");
+
+        // The event's session_id is the STORED key, not the live sid.
+        core.deliver_event(
+            &ev("session.title", "stored-alpha", 9, json!({"title": "renamed by auto-titling"})),
+            &(sink.clone() as Arc<dyn EventSink>),
+        );
+
+        let deliveries = sink.transcript();
+        let header = deliveries
+            .iter()
+            .find(|d| matches!(d.kind, crate::core::TranscriptChangeKind::HeaderUpdated))
+            .expect("the rename must reach the sink as a HeaderUpdated");
+        assert_eq!(header.key, "stored-alpha", "delivered under the tab key");
+        assert_eq!(
+            header.title, "renamed by auto-titling",
+            "the DTO must carry the new title"
+        );
+        let state = core.inner.lock();
+        assert_eq!(
+            state.registry.get("stored-alpha").unwrap().title,
+            "renamed by auto-titling",
+            "the registry record is the rename's persistence"
+        );
+        assert_eq!(
+            state
+                .sessions
+                .get("stored-alpha")
+                .map(|l| l.reducer.transcript().header.title.clone())
+                .unwrap_or_default(),
+            "renamed by auto-titling",
+            "the reducer merged the header"
+        );
+    }
+
+    // ── test 3: registry round-trip through the core ───────────────────────
 
     /// Rule pinned (PI_TASK_T5B §3): everything the app needs to restore its
     /// tabs — the tab list, its order, the active tab and the per-session
