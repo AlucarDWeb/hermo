@@ -166,6 +166,11 @@ bazel_dep(name = "rules_apple", version = "5.1.0", repo_name = "build_bazel_rule
 bazel_dep(name = "rules_swift", version = "4.1.0", repo_name = "build_bazel_rules_swift")
 bazel_dep(name = "rules_swift_package_manager", version = "1.23.0")
 
+# cc_library is no longer a native rule on Bazel 9; rules_apple and rules_swift
+# already pull rules_cc in transitively, but a direct bazel_dep is required to
+# make @rules_cc visible under bzlmod's strict deps.
+bazel_dep(name = "rules_cc", version = "0.2.20")
+
 # Apple's cc toolchain, used by the Swift and Objective-C link steps of the iOS app.
 apple_cc_configure = use_extension("@build_bazel_apple_support//crosstool:setup.bzl", "apple_cc_configure_extension")
 use_repo(apple_cc_configure, "local_config_apple_cc")

@@ -4,3 +4,4 @@ cdylib_name = "hermes_core"
 
 [bindings.swift]
 module_name = "HermesCore"
+generate_immutable_records = true

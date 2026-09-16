@@ -1,7 +1,10 @@
 # ── hermes_core native libraries ─────────────────────────────────────
 # All cargo genrules use tags=["local"] to bypass the Bazel sandbox and reuse
 # the crate's own target/ (same boundary just_nutrients_official_app uses —
-# no rules_rust on day 1). iOS genrules are NOT created here (T15).
+# no rules_rust on day 1). Covers Android .so outputs, iOS/macOS .a outputs,
+# and the UniFFI Kotlin and Swift bindings generated from them.
+
+load("//platforms:apple.bzl", "APPLE_ONLY")
 
 CORE_SRCS = glob(
     [
@@ -88,6 +91,100 @@ genrule(
         cp "target/x86_64-linux-android/release/libhermes_core.so" "$$OUT"
     """,
     tags = ["local"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "libhermes_core_ios_sim_arm64",
+    srcs = CORE_SRCS,
+    outs = ["libhermes_core_ios_sim_arm64.a"],
+    target_compatible_with = APPLE_ONLY,
+    cmd = """
+        set -euo pipefail
+        OUT="$$(pwd)/$@"
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        export IPHONEOS_DEPLOYMENT_TARGET=26.0
+        cargo build --release --lib --target aarch64-apple-ios-sim
+        mkdir -p "$$(dirname "$$OUT")"
+        cp "target/aarch64-apple-ios-sim/release/libhermes_core.a" "$$OUT"
+    """,
+    tags = ["local"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "libhermes_core_ios_arm64",
+    srcs = CORE_SRCS,
+    outs = ["libhermes_core_ios_arm64.a"],
+    target_compatible_with = APPLE_ONLY,
+    cmd = """
+        set -euo pipefail
+        OUT="$$(pwd)/$@"
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        export IPHONEOS_DEPLOYMENT_TARGET=26.0
+        cargo build --release --lib --target aarch64-apple-ios
+        mkdir -p "$$(dirname "$$OUT")"
+        cp "target/aarch64-apple-ios/release/libhermes_core.a" "$$OUT"
+    """,
+    tags = ["local"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "libhermes_core_macos_arm64",
+    srcs = CORE_SRCS,
+    outs = ["libhermes_core_macos_arm64.a"],
+    target_compatible_with = APPLE_ONLY,
+    cmd = """
+        set -euo pipefail
+        OUT="$$(pwd)/$@"
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        export MACOSX_DEPLOYMENT_TARGET=26.0
+        cargo build --release --lib --target aarch64-apple-darwin
+        mkdir -p "$$(dirname "$$OUT")"
+        cp "target/aarch64-apple-darwin/release/libhermes_core.a" "$$OUT"
+    """,
+    tags = ["local"],
+    visibility = ["//visibility:public"],
+)
+
+# ── UniFFI Swift bindings ────────────────────────────────────────────
+# Generated from the macOS archive: the exported surface has no
+# cfg(target_os) branches, so the bindings are identical for every Apple
+# target, and the host archive is the one the macOS tests already need.
+# uniffi 0.31.2 names the files after [bindings.swift] module_name, so no
+# renaming is needed. Bindgen runs in a scratch dir because it also writes a
+# .modulemap this rule does not declare (rules_swift synthesizes its own).
+
+genrule(
+    name = "swift_bindings",
+    srcs = CORE_SRCS + [":libhermes_core_macos_arm64"],
+    outs = [
+        "bindings/swift/HermesCore.swift",
+        "bindings/swift/HermesCoreFFI.h",
+    ],
+    cmd = """
+        set -euo pipefail
+        SWIFT_OUT="$$(pwd)/$(location bindings/swift/HermesCore.swift)"
+        HEADER_OUT="$$(pwd)/$(location bindings/swift/HermesCoreFFI.h)"
+        LIB="$$(pwd)/$(location :libhermes_core_macos_arm64)"
+        GEN_DIR="$$(mktemp -d)"
+        trap 'rm -rf "$$GEN_DIR"' EXIT
+        ROOT="$$(dirname $(location Cargo.toml))"
+        cd "$$ROOT"
+        cargo run --bin uniffi-bindgen -- generate \\
+            --library "$$LIB" \\
+            --language swift \\
+            --out-dir "$$GEN_DIR"
+        mkdir -p "$$(dirname "$$SWIFT_OUT")"
+        cp "$$GEN_DIR/HermesCore.swift" "$$SWIFT_OUT"
+        cp "$$GEN_DIR/HermesCoreFFI.h" "$$HEADER_OUT"
+    """,
+    tags = ["local"],
+    target_compatible_with = APPLE_ONLY,
     visibility = ["//visibility:public"],
 )
 
