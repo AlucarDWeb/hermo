@@ -51,7 +51,7 @@ fun SessionPickerSheet(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .clickable(onClick = onDismiss) // the scrim tap dismisses — FIX8-bis: the scrim covers the WHOLE screen (it was width-only: taps above the sheet hit the chat and the sheet was inescapable)
+            .clickable(onClick = onDismiss) // the scrim covers the WHOLE screen: a tap outside the sheet dismisses
             .background(t.background.copy(alpha = 0.55f)),
         contentAlignment = Alignment.BottomCenter,
     ) {

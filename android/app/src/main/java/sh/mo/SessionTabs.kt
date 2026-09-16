@@ -16,10 +16,10 @@ package sh.mo
  *  - `add` of an already-open key only SELECTS it — it never grows the list
  *    (the picker-already-open case; re-issuing `open_session` would rebuild
  *    the LiveSession and RESET-clear the transcript);
- *  - closing the LAST remaining tab EMPTIES the set (FIX8-bis, user
- *    2026-09-15: "no way out of the current session" — a declared divergence
- *    from Desktop `pane-tab.tsx:53-59` where the last tab is uncloseable;
- *    the adapter mints a fresh blank chat after an empty close);
+ *  - closing the LAST remaining tab EMPTIES the set — a declared
+ *    divergence from Desktop `pane-tab.tsx:53-59` (there the last tab is
+ *    uncloseable); the adapter mints a fresh blank chat after an empty
+ *    close, so the user can always leave the current session;
  *  - closing the current tab selects the LEFT neighbour, or the new first
  *    when index 0 closed — never `firstOrNull()` on a map.
  */
@@ -53,8 +53,8 @@ fun TabSet.add(key: String): TabSet =
 
 /**
  * Close a tab. No-ops: unknown key only. Closing the LAST remaining tab
- * empties the set (FIX8-bis — the adapter mints a fresh chat after an empty
- * close; the user must be able to leave the current session). Closing the
+ * empties the set (the adapter mints a fresh chat after an empty close, so
+ * the user can always leave the current session). Closing the
  * current tab selects the left neighbour, or the new first when the closed
  * tab was index 0; the remaining order is preserved.
  */

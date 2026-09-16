@@ -58,9 +58,8 @@ class SessionTabsTest {
 
     @Test
     fun `close of the last remaining tab EMPTIES the set`() {
-        // FIX8-bis (review #29 blocker): the old verb no-opped on the last
-        // tab, so the adapter's fresh-chat mint was unreachable and the user
-        // could never leave the current session.
+        // The close must reach an empty set: the adapter mints a fresh chat
+        // after it, so this is the user's way out of the current session.
         val tabs = TabSet(keys = listOf("only"), current = "only")
         val next = tabs.close("only")
         assertEquals(emptyList<String>(), next.keys)

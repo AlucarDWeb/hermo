@@ -485,7 +485,7 @@ private fun SessionTabStrip(
                     key = key,
                     state = sessions[key],
                     active = key == tabs.current,
-                    closeable = true, // FIX8-bis: the LAST tab is closeable too (user: no way out of the current session) — closing it mints a fresh blank chat
+                    closeable = true, // the last tab is closeable: closing it mints a fresh blank chat
                     onSelect = { onSelect(key) },
                     onClose = { onClose(key) },
                 )
