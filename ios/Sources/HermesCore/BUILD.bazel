@@ -1,0 +1,33 @@
+load("//platforms:apple.bzl", "APPLE_ONLY")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library", "swift_interop_hint")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+swift_interop_hint(
+    name = "hermes_core_ffi_hint",
+    module_name = "HermesCoreFFI",
+)
+
+cc_library(
+    name = "hermes_core_ffi",
+    hdrs = ["//hermes_core:bindings/swift/HermesCoreFFI.h"],
+    srcs = select(
+        {
+            "@build_bazel_apple_support//configs:ios_sim_arm64": ["//hermes_core:libhermes_core_ios_sim_arm64"],
+            "@build_bazel_apple_support//configs:ios_arm64": ["//hermes_core:libhermes_core_ios_arm64"],
+            "@build_bazel_apple_support//configs:darwin_arm64": ["//hermes_core:libhermes_core_macos_arm64"],
+        },
+        no_match_error = "hermes_core ships archives for arm64 iOS simulator, arm64 iOS devices and arm64 macOS only",
+    ),
+    aspect_hints = [":hermes_core_ffi_hint"],
+    target_compatible_with = APPLE_ONLY,
+    visibility = ["//visibility:public"],
+)
+
+swift_library(
+    name = "HermesCore",
+    srcs = ["//hermes_core:bindings/swift/HermesCore.swift"],
+    module_name = "HermesCore",
+    target_compatible_with = APPLE_ONLY,
+    visibility = ["//visibility:public"],
+    deps = [":hermes_core_ffi"],
+)
