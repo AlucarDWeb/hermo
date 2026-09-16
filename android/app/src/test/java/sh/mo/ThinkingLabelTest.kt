@@ -34,29 +34,25 @@ class ThinkingLabelTest {
     }
 
     /**
-     * The latch (message-parts.tsx:144-157): `open` is computed from the
-     * LATCHED flag, not from the live recomputation `wasLive && live` that
-     * snapped the body shut at settle. Mirrors the composable's arithmetic
-     * without Android, so the expression itself stays pinned.
+     * LIVE-ONLY body (user directive 2026-09-15, the declared divergence from
+     * Desktop's latch at message-parts.tsx:144-157): `open` follows the live
+     * flag — at settle the body collapses; the user's toggle wins in both
+     * directions. Mirrors the composable's arithmetic without Android, so the
+     * expression itself stays pinned.
      */
     @Test
-    fun `a body seen live stays open after the turn settles`() {
-        var sawLive = false
+    fun `the body follows the live flag and the user toggle wins`() {
         fun open(live: Boolean, userToggle: Boolean? = null): Boolean =
-            userToggle ?: (live || sawLive)
+            userToggle ?: live
 
-        // A block that mounts already complete never latches, stays collapsed.
-        assertFalse(open(live = false))
-
-        // Live frame: the latch sets, the body is open.
-        sawLive = true
+        // Streaming: the body is open.
         assertTrue(open(live = true))
 
-        // Settle: `live` flips false, the latch KEEPS the body open —
-        // the pre-fix expression `wasLive && live` returned false here.
-        assertTrue(open(live = false))
+        // Settle: `live` flips false and the body COLLAPSES — no latch keeps
+        // it open (the removed Desktop behaviour this pin replaces).
+        assertFalse(open(live = false))
 
-        // The user's explicit toggle outranks the latch, both ways.
+        // The user's explicit toggle outranks the live flag, both ways.
         assertTrue(open(live = false, userToggle = true))
         assertFalse(open(live = true, userToggle = false))
     }
