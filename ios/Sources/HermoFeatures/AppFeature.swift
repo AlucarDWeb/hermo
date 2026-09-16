@@ -29,6 +29,7 @@ public struct AppFeature: Sendable {
         public var pendingKeys: Set<String>
         public var parkedChanges: [TranscriptChangeDto]
         public var inFlightOpens: Int
+        public var chat: ChatFeature.State
 
         public init(
             phase: AppPhase = .unpaired,
@@ -41,7 +42,8 @@ public struct AppFeature: Sendable {
             currentKey: String? = nil,
             pendingKeys: Set<String> = [],
             parkedChanges: [TranscriptChangeDto] = [],
-            inFlightOpens: Int = 0
+            inFlightOpens: Int = 0,
+            chat: ChatFeature.State = ChatFeature.State()
         ) {
             self.phase = phase
             self.endpointText = endpointText
@@ -54,6 +56,7 @@ public struct AppFeature: Sendable {
             self.pendingKeys = pendingKeys
             self.parkedChanges = parkedChanges
             self.inFlightOpens = inFlightOpens
+            self.chat = chat
         }
 
         /// Every phase change is routed through here so `lastReadyModel` (the T11 re-login overlay's fallback) tracks Ready the same way `AppViewModel`'s separate collector did.
@@ -112,9 +115,14 @@ public struct AppFeature: Sendable {
         case tabCloseFailed(errorText: String)
         case sessionTitleSet(key: String)
         case sessionTitleFailed(errorText: String)
+
+        case chat(ChatFeature.Action)
     }
 
     public var body: some ReducerOf<Self> {
+        Scope(state: \.chat, action: \.chat) {
+            ChatFeature()
+        }
         Reduce { state, action in
             switch action {
             case .task:
@@ -454,6 +462,19 @@ public struct AppFeature: Sendable {
 
             case let .sessionTitleFailed(errorText):
                 state.errorText = errorText
+                return .none
+
+            case .chat(.delegate(let delegate)):
+                switch delegate {
+                case let .reportError(text):
+                    state.errorText = text
+                case .openSessionPicker:
+                    // The picker sheet arrives in T17.
+                    break
+                }
+                return .none
+
+            case .chat:
                 return .none
             }
         }

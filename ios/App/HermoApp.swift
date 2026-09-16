@@ -12,7 +12,7 @@ struct HermoApp: App {
 
     var body: some Scene {
         WindowGroup {
-            // T13 replaces the fixed mode with AppearanceFeature's persisted one.
+            // Fixed until AppearanceFeature is composed into AppFeature (T17).
             RootView(store: Self.store)
                 .hermoTheme(.system)
         }
@@ -55,9 +55,9 @@ struct RootView: View {
 
             case let .needsPassword(endpoint, overlay):
                 if overlay {
-                    // The ask arrived mid-session: the sheet opens over the still-mounted ready screen.
+                    // The ask arrived mid-session: the sheet opens over the still-mounted chat screen.
                     ZStack {
-                        ReadyPlaceholder(model: store.lastReadyModel)
+                        chatScreen(model: store.lastReadyModel)
                         tokens.scrim.ignoresSafeArea()
                         PasswordSheet(
                             endpoint: endpoint,
@@ -80,7 +80,7 @@ struct RootView: View {
                 ConnectingScreen()
 
             case let .ready(model):
-                ReadyPlaceholder(model: model)
+                chatScreen(model: model)
 
             case let .offline(reason):
                 OfflineScreen(
@@ -114,21 +114,43 @@ struct RootView: View {
             if !text.isEmpty { lastOpenedURL = nil }
         }
     }
-}
 
-/// Stands in for the Ready phase until T13 builds the real chat screen.
-private struct ReadyPlaceholder: View {
-    let model: String
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Text("hermo")
-                .font(.largeTitle.weight(.semibold))
-                .accessibilityIdentifier("hermo.shell.title")
-            Text(model.isEmpty ? "Ready" : "Ready, model: \(model)")
-                .foregroundStyle(.secondary)
-                .accessibilityIdentifier("hermo.shell.subtitle")
+    /// Builds the chat screen's display value from `AppFeature.State` and wires its closures to
+    /// the actions that exist today. The bot drawer and appearance sheet have no reducer
+    /// composed into `AppFeature` yet (T17), so their taps are no-ops until then.
+    private func chatScreen(model: String) -> ChatScreen {
+        let tabs = store.tabs.keys.map { key in
+            SessionTabStrip.Tab(
+                key: key,
+                title: store.sessions[key]?.title ?? "",
+                running: store.sessions[key]?.running ?? false
+            )
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        let session = store.currentKey.flatMap { store.sessions[$0] } ?? SessionUiState(key: "")
+        let value = ChatScreen.Value(
+            themeMode: .system,
+            model: model,
+            tabs: tabs,
+            currentKey: store.currentKey,
+            errorText: store.errorText,
+            session: session,
+            draft: store.chat.draft
+        )
+        return ChatScreen(
+            value: value,
+            onMenuTap: {},
+            onTitleTap: { store.send(.chat(.delegate(.openSessionPicker))) },
+            onAppearanceTap: {},
+            onRename: { store.send(.setSessionTitle(title: $0)) },
+            onSelectTab: { store.send(.switchTab(key: $0)) },
+            onCloseTab: { store.send(.closeTab(key: $0)) },
+            onAddTab: { store.send(.openNewSession) },
+            onDraftChanged: { store.send(.chat(.draftChanged($0))) },
+            onSend: { _ in store.send(.chat(.send(key: store.currentKey))) },
+            onStop: {
+                guard let key = store.currentKey else { return }
+                store.send(.chat(.interrupt(key: key)))
+            }
+        )
     }
 }
