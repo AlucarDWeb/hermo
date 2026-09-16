@@ -57,11 +57,13 @@ class SessionTabsTest {
     // ── close ───────────────────────────────────────────────────────────
 
     @Test
-    fun `close of the last remaining tab is a no-op`() {
+    fun `close of the last remaining tab EMPTIES the set`() {
+        // The close must reach an empty set: the adapter mints a fresh chat
+        // after it, so this is the user's way out of the current session.
         val tabs = TabSet(keys = listOf("only"), current = "only")
         val next = tabs.close("only")
-        assertEquals(listOf("only"), next.keys)
-        assertEquals("only", next.current)
+        assertEquals(emptyList<String>(), next.keys)
+        assertEquals(null, next.current)
     }
 
     @Test

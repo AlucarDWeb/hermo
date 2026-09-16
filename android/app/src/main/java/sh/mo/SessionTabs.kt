@@ -16,9 +16,10 @@ package sh.mo
  *  - `add` of an already-open key only SELECTS it — it never grows the list
  *    (the picker-already-open case; re-issuing `open_session` would rebuild
  *    the LiveSession and RESET-clear the transcript);
- *  - `close` of the last remaining tab is a no-op (the strip omits the ×
- *    instead — Desktop `pane-tab.tsx:53-59` makes a tab uncloseable the
- *    same way);
+ *  - closing the LAST remaining tab EMPTIES the set — a declared
+ *    divergence from Desktop `pane-tab.tsx:53-59` (there the last tab is
+ *    uncloseable); the adapter mints a fresh blank chat after an empty
+ *    close, so the user can always leave the current session;
  *  - closing the current tab selects the LEFT neighbour, or the new first
  *    when index 0 closed — never `firstOrNull()` on a map.
  */
@@ -51,18 +52,20 @@ fun TabSet.add(key: String): TabSet =
     else copy(keys = keys + key, current = key)
 
 /**
- * Close a tab. No-ops: unknown key, or the last remaining tab (uncloseable).
- * Closing the current tab selects the left neighbour, or the new first when
- * the closed tab was index 0; the remaining order is preserved.
+ * Close a tab. No-ops: unknown key only. Closing the LAST remaining tab
+ * empties the set (the adapter mints a fresh chat after an empty close, so
+ * the user can always leave the current session). Closing the
+ * current tab selects the left neighbour, or the new first when the closed
+ * tab was index 0; the remaining order is preserved.
  */
 fun TabSet.close(key: String): TabSet {
     val index = keys.indexOf(key)
-    if (index < 0 || keys.size <= 1) return this
+    if (index < 0) return this
     val remaining = keys.filterIndexed { i, _ -> i != index }
     val nextCurrent = when {
         current != key -> current
         index > 0 -> remaining[index - 1]
-        else -> remaining.first()
+        else -> remaining.firstOrNull()
     }
     return TabSet(keys = remaining, current = nextCurrent)
 }

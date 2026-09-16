@@ -577,12 +577,14 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
 
     /**
      * T16b strip ×: `close_session` in the core, drop the tab and the entry.
-     * The last remaining tab is UNCLOSEABLE (the strip omits the ×, and this
-     * guard backs it); closing the current tab selects the neighbour per the
-     * pure `close` verb.
+     * The LAST tab is closeable too — a declared divergence from Desktop's
+     * uncloseable last tab: closing it drops the user into a fresh blank
+     * chat; the closed chat stays resumable from the picker (it lives on
+     * the gateway, not the local registry).
+     * Closing the current tab selects the neighbour per the pure `close`
+     * verb.
      */
-    suspend fun closeTab(key: String) {
-        if (_tabs.value.keys.size <= 1) return
+    suspend fun closeTab(key: String, cols: Int) {
         try {
             core.closeSession(key)
         } catch (t: Throwable) {
@@ -596,6 +598,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         if (current != null && current != _currentKey.value) {
             _currentKey.value = current
             afterOpen(current)
+        }
+        if (next.keys.isEmpty()) {
+            // If the fresh-chat mint fails (network down), the surface stays
+            // empty with the surfaced error: the picker and + are the retry
+            // paths, and the closed chat remains resumable from the gateway.
+            openNewSession(cols)
         }
     }
 

@@ -485,7 +485,7 @@ private fun SessionTabStrip(
                     key = key,
                     state = sessions[key],
                     active = key == tabs.current,
-                    closeable = tabs.keys.size > 1, // last tab is uncloseable
+                    closeable = true, // the last tab is closeable: closing it mints a fresh blank chat
                     onSelect = { onSelect(key) },
                     onClose = { onClose(key) },
                 )
