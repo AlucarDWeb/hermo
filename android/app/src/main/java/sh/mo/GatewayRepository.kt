@@ -553,12 +553,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
     }
 
     /**
-     * T14 (user: "devo uscire proprio dall'account"): forget the PAIRED
-     * gateway — endpoint file, cookie jar scope and the local tab list all
-     * go (the core verb wipes them) — and drop back to the Unpaired phase
-     * so the pairing screen shows. This is how the app moves to a
-     * DIFFERENT gateway (e.g. the Tailscale one): "Reset sessions" keeps
-     * the pairing on purpose, this does the opposite.
+     * Forget the PAIRED gateway: endpoint file, tab list and live sessions
+     * go (the core verb wipes them) and the phase drops to Unpaired, so the
+     * pairing screen shows and the app can log into a DIFFERENT gateway.
+     * The counterpart to [resetSessionsAndRestart], which keeps the pairing
+     * on purpose. The cookie jar FILE is not removed by the core verb; it
+     * is host-scoped, so the new gateway's login replaces it.
      */
     suspend fun forgetGateway() {
         try {
@@ -568,13 +568,13 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             return
         }
         pendingKeys.clear()
+        inFlightOpens.set(0)
         _tabs.value = TabSet()
         _sessions.value = emptyMap()
         _currentKey.value = null
         _errorText.value = ""
-        // FIX8-bis: the endpoint TEXT too — it fed the NeedsPassword banner;
-        // leaving it would resurrect the old gateway string on the next
-        // password prompt.
+        // The endpoint text feeds the NeedsPassword banner: leaving the old
+        // gateway string here would resurrect it on the next prompt.
         endpointText = ""
         _phase.value = AppPhase.Unpaired
     }
@@ -627,9 +627,6 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             afterOpen(current)
         }
         if (next.keys.isEmpty()) {
-            // If the fresh-chat mint fails (network down), the surface stays
-            // empty with the surfaced error: the picker and + are the retry
-            // paths, and the closed chat remains resumable from the gateway.
             openNewSession(cols)
         }
     }

@@ -128,10 +128,9 @@ fun BotDrawerContent(
                     state.rows.forEach { row -> BotDrawerItem(row = row, onTap = { onProfileTap(row) }) }
                 }
             }
-            // T14 (user, 2026-09-15): the way out of the ACCOUNT — forget the
-            // paired gateway (endpoint + cookies + local tab list) and return
-            // to the pairing screen, so the app can log into a DIFFERENT
-            // gateway (e.g. the Tailscale one). Behind a confirm dialog.
+            // The account-level way out: forget the paired gateway (endpoint,
+            // cookies and local tab list) and return to the pairing screen, so
+            // the app can log into a different gateway. Confirm dialog first.
             HorizontalDivider(
                 modifier = Modifier.padding(vertical = 8.dp),
                 color = t.strokeTertiary,

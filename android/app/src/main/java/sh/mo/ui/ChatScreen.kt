@@ -148,7 +148,7 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val drawerUi by viewModel.drawerState.collectAsState()
-    // T14: the drawer's "Log out" asks before forgetting the paired gateway
+    // The drawer's "Log out" asks before forgetting the paired gateway
     // (endpoint + cookies + local tabs go; the host's chats stay).
     var logoutConfirm by remember { mutableStateOf(false) }
     val openDrawer: () -> Unit = {

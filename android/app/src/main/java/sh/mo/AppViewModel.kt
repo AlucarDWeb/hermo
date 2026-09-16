@@ -277,12 +277,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * T14: "Log out" from the drawer — forget the paired gateway (the core
-     * wipes endpoint + local registry; the pairing must be redone) and drop
-     * to the Unpaired phase. The way to move the app to a DIFFERENT gateway
-     * (e.g. the Tailscale one).
+     * "Log out" from the drawer: forget the paired gateway (the core wipes
+     * endpoint + local registry; the pairing must be redone) and drop to the
+     * Unpaired phase — the way to move the app to a different gateway.
      */
     fun forgetGateway() {
+        _drawerState.value = DrawerUiState.Loading
         viewModelScope.launch { repo.forgetGateway() }
     }
 
