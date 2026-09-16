@@ -64,10 +64,13 @@ extension DrawerUiState {
     }
 }
 
-/// The already-open tab for a profile, so a drawer tap switches to it instead of re-issuing the core verb and resetting the transcript; a blank profile matches nothing.
-public func openTabForProfile(sessions: [String: SessionUiState], profile: String) -> String? {
+/// The already-open tab for a profile, so a drawer tap switches to it instead of re-issuing the core verb and resetting the transcript; a blank profile matches nothing. `order` (the tab strip order) breaks ties when two tabs share a profile, since `sessions` is a `Dictionary` with no stable iteration order.
+public func openTabForProfile(sessions: [String: SessionUiState], order: [String], profile: String) -> String? {
     if profile.isEmpty { return nil }
-    return sessions.first(where: { $0.value.profile == profile })?.key
+    for key in order {
+        if sessions[key]?.profile == profile { return key }
+    }
+    return nil
 }
 
 public func withProfile(sessions: [String: SessionUiState], key: String, profile: String) -> [String: SessionUiState] {

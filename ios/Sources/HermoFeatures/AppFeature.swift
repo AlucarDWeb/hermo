@@ -23,19 +23,37 @@ public struct AppFeature: Sendable {
         public var lastReadyModel: String
         public var errorText: String
         public var pairingPayload: String
+        public var sessions: [String: SessionUiState]
+        public var tabs: TabSet
+        public var currentKey: String?
+        public var pendingKeys: Set<String>
+        public var parkedChanges: [TranscriptChangeDto]
+        public var inFlightOpens: Int
 
         public init(
             phase: AppPhase = .unpaired,
             endpointText: String = "",
             lastReadyModel: String = "",
             errorText: String = "",
-            pairingPayload: String = ""
+            pairingPayload: String = "",
+            sessions: [String: SessionUiState] = [:],
+            tabs: TabSet = TabSet(),
+            currentKey: String? = nil,
+            pendingKeys: Set<String> = [],
+            parkedChanges: [TranscriptChangeDto] = [],
+            inFlightOpens: Int = 0
         ) {
             self.phase = phase
             self.endpointText = endpointText
             self.lastReadyModel = lastReadyModel
             self.errorText = errorText
             self.pairingPayload = pairingPayload
+            self.sessions = sessions
+            self.tabs = tabs
+            self.currentKey = currentKey
+            self.pendingKeys = pendingKeys
+            self.parkedChanges = parkedChanges
+            self.inFlightOpens = inFlightOpens
         }
 
         /// Every phase change is routed through here so `lastReadyModel` (the T11 re-login overlay's fallback) tracks Ready the same way `AppViewModel`'s separate collector did.
@@ -67,12 +85,33 @@ public struct AppFeature: Sendable {
         case connectFailed(errorText: String, isAuthShape: Bool, closedReason: String)
         case mainSessionReady
         case mainSessionClosed(reason: String, errorText: String?)
+        case resumePlanned(keys: [String])
+        case mainSessionRestored(planned: [String], resumed: [String], summaries: [SessionSummary], current: String?)
+        case mainSessionRestoreFailed(planned: [String], errorText: String?)
         case forgotGateway
         case forgetGatewayFailed(errorText: String)
         case resetSessionsFailed(errorText: String)
         case sessionsCleared
         case newSessionFailed(errorText: String)
         case disconnectFailed(errorText: String)
+        case headerRefreshed(key: String, summary: SessionSummary)
+
+        case openNewSession
+        case openExistingSession(storedId: String)
+        case openBotChat(profile: String)
+        case switchTab(key: String)
+        case closeTab(key: String)
+        case setSessionTitle(title: String)
+
+        case newSessionOpened(key: String)
+        case existingSessionOpened(key: String)
+        case botChatOpened(key: String, profile: String)
+        case sessionOpenFailed(errorText: String)
+        case sessionReady(key: String, summary: SessionSummary?)
+        case tabClosed(key: String)
+        case tabCloseFailed(errorText: String)
+        case sessionTitleSet(key: String)
+        case sessionTitleFailed(errorText: String)
     }
 
     public var body: some ReducerOf<Self> {
@@ -91,8 +130,7 @@ public struct AppFeature: Sendable {
                     guard let endpoint = await gatewayClient.savedEndpoint() else { return }
                     await send(.resumeStarted(endpointText: endpoint.displayText))
                     let cols = await screenCols.columns()
-                    let outcome = await Self.connectThenOpenMainSession(cols: cols, gatewayClient: gatewayClient)
-                    await send(outcome)
+                    await Self.connectThenOpenMainSession(cols: cols, gatewayClient: gatewayClient, send: send)
                 }
                 .cancellable(id: CancelID.connect, cancelInFlight: true)
 
@@ -110,10 +148,9 @@ public struct AppFeature: Sendable {
                 state.setPhase(.connecting)
                 return .run { [gatewayClient, screenCols] send in
                     let cols = await screenCols.columns()
-                    let outcome = await Self.loginConnectThenOpenMainSession(
-                        password: password, cols: cols, gatewayClient: gatewayClient
+                    await Self.loginConnectThenOpenMainSession(
+                        password: password, cols: cols, gatewayClient: gatewayClient, send: send
                     )
-                    await send(outcome)
                 }
                 .cancellable(id: CancelID.connect, cancelInFlight: true)
 
@@ -138,8 +175,8 @@ public struct AppFeature: Sendable {
                     await send(.sessionsCleared)
                     let cols = await screenCols.columns()
                     do {
-                        _ = try await gatewayClient.openSession(storedId: nil, cols: Int64(cols))
-                        await send(.mainSessionReady)
+                        let key = try await gatewayClient.openSession(storedId: nil, cols: Int64(cols))
+                        await send(.newSessionOpened(key: key))
                     } catch {
                         await send(.newSessionFailed(errorText: ErrorMessages.of(error)))
                     }
@@ -172,10 +209,13 @@ public struct AppFeature: Sendable {
                 return .none
 
             case let .core(event):
-                if case let .connection(status) = event {
+                switch event {
+                case let .connection(status):
                     Self.onConnectionStatus(status, state: &state)
+                    return .none
+                case let .transcript(change):
+                    return Self.onTranscriptChange(change, state: &state, gatewayClient: gatewayClient)
                 }
-                return .none
 
             case let .resumeStarted(endpointText):
                 state.endpointText = endpointText
@@ -196,7 +236,12 @@ public struct AppFeature: Sendable {
                 // Applied before the shape check, same as the Kotlin: the auth branch below discards `closedReason` but the error line must still land.
                 state.errorText = errorText
                 if isAuthShape {
-                    state.setPhase(PhaseMachine.reduce(phase: state.phase, event: .authFailed, savedEndpoint: state.endpointText))
+                    state.setPhase(
+                        PhaseMachine.reduce(
+                            phase: state.phase, event: .authFailed, savedEndpoint: state.endpointText,
+                            hasLiveSession: state.currentKey != nil
+                        )
+                    )
                 } else {
                     state.setPhase(
                         PhaseMachine.reduce(phase: state.phase, event: .closed(reason: closedReason), savedEndpoint: state.endpointText)
@@ -215,10 +260,48 @@ public struct AppFeature: Sendable {
                 state.setPhase(PhaseMachine.reduce(phase: state.phase, event: .closed(reason: reason), savedEndpoint: state.endpointText))
                 return .none
 
+            case let .resumePlanned(keys):
+                state.pendingKeys.formUnion(keys)
+                state.inFlightOpens += 1
+                return .none
+
+            case let .mainSessionRestored(planned, resumed, summaries, planCurrent):
+                for key in resumed {
+                    Self.drainParked(key: key, state: &state)
+                    state.sessions = ensureSession(state.sessions, key)
+                    state.tabs = state.tabs.add(key)
+                }
+                state.pendingKeys.subtract(planned)
+                Self.applySummaries(summaries, state: &state)
+                let current = planCurrent.flatMap { resumed.contains($0) ? $0 : nil } ?? resumed.last
+                if let current {
+                    state.tabs = TabSet(keys: state.tabs.keys, current: current)
+                    state.currentKey = current
+                }
+                Self.afterOpen(state: &state)
+                Self.finishInFlightOpen(state: &state)
+                return .none
+
+            case let .mainSessionRestoreFailed(planned, errorText):
+                state.pendingKeys.subtract(planned)
+                if let errorText {
+                    state.errorText = errorText
+                }
+                state.setPhase(
+                    PhaseMachine.reduce(
+                        phase: state.phase,
+                        event: .closed(reason: "error: no session could be resumed"),
+                        savedEndpoint: state.endpointText
+                    )
+                )
+                Self.finishInFlightOpen(state: &state)
+                return .none
+
             case .forgotGateway:
                 state.errorText = ""
                 state.endpointText = ""
                 state.pairingPayload = ""
+                Self.clearSessionState(&state)
                 state.setPhase(.unpaired)
                 return .none
 
@@ -232,6 +315,7 @@ public struct AppFeature: Sendable {
 
             case .sessionsCleared:
                 state.errorText = ""
+                Self.clearSessionState(&state)
                 return .none
 
             case let .newSessionFailed(errorText):
@@ -239,6 +323,136 @@ public struct AppFeature: Sendable {
                 return .none
 
             case let .disconnectFailed(errorText):
+                state.errorText = errorText
+                return .none
+
+            case let .headerRefreshed(key, summary):
+                Self.applyHeaderRefresh(key: key, summary: summary, state: &state)
+                return .none
+
+            case .openNewSession:
+                state.inFlightOpens += 1
+                return .run { [gatewayClient, screenCols] send in
+                    let cols = await screenCols.columns()
+                    do {
+                        let key = try await gatewayClient.openSession(storedId: nil, cols: Int64(cols))
+                        await send(.newSessionOpened(key: key))
+                    } catch {
+                        await send(.sessionOpenFailed(errorText: ErrorMessages.of(error)))
+                    }
+                }
+
+            case let .openExistingSession(storedId):
+                if state.tabs.keys.contains(storedId) {
+                    return Self.performSwitchTab(key: storedId, state: &state, gatewayClient: gatewayClient)
+                }
+                state.inFlightOpens += 1
+                return .run { [gatewayClient, screenCols] send in
+                    let cols = await screenCols.columns()
+                    do {
+                        let key = try await gatewayClient.openSession(storedId: storedId, cols: Int64(cols))
+                        await send(.existingSessionOpened(key: key))
+                    } catch {
+                        await send(.sessionOpenFailed(errorText: ErrorMessages.of(error)))
+                    }
+                }
+
+            case let .openBotChat(profile):
+                if let openKey = openTabForProfile(sessions: state.sessions, order: state.tabs.keys, profile: profile) {
+                    return Self.performSwitchTab(key: openKey, state: &state, gatewayClient: gatewayClient)
+                }
+                state.inFlightOpens += 1
+                return .run { [gatewayClient, screenCols] send in
+                    let cols = await screenCols.columns()
+                    do {
+                        let key = try await gatewayClient.openBotChat(profile: profile, cols: Int64(cols))
+                        await send(.botChatOpened(key: key, profile: profile))
+                    } catch {
+                        await send(.sessionOpenFailed(errorText: ErrorMessages.of(error)))
+                    }
+                }
+
+            case let .switchTab(key):
+                return Self.performSwitchTab(key: key, state: &state, gatewayClient: gatewayClient)
+
+            case let .closeTab(key):
+                // A tap on an × that is no longer on screen: closing a key the core never gave us
+                // would answer with an empty strip and mint a second replacement.
+                guard state.tabs.keys.contains(key) else { return .none }
+                return .run { [gatewayClient] send in
+                    do {
+                        try await gatewayClient.closeSession(key: key)
+                        await send(.tabClosed(key: key))
+                    } catch {
+                        await send(.tabCloseFailed(errorText: ErrorMessages.of(error)))
+                    }
+                }
+
+            case let .setSessionTitle(title):
+                guard let key = state.currentKey else {
+                    state.errorText = "No open session to rename"
+                    return .none
+                }
+                return .run { [gatewayClient] send in
+                    do {
+                        try await gatewayClient.setSessionTitle(key: key, title: title)
+                        await send(.sessionTitleSet(key: key))
+                    } catch {
+                        await send(.sessionTitleFailed(errorText: ErrorMessages.of(error)))
+                    }
+                }
+
+            case let .newSessionOpened(key):
+                Self.registerOpenedSession(key: key, state: &state)
+                state.currentKey = key
+                return Self.sessionReadyEffect(key: key, gatewayClient: gatewayClient)
+
+            case let .existingSessionOpened(key):
+                Self.registerOpenedSession(key: key, state: &state)
+                state.currentKey = key
+                return Self.sessionReadyEffect(key: key, gatewayClient: gatewayClient)
+
+            case let .botChatOpened(key, profile):
+                Self.registerOpenedSession(key: key, state: &state)
+                state.sessions = withProfile(sessions: state.sessions, key: key, profile: profile)
+                state.currentKey = key
+                return Self.sessionReadyEffect(key: key, gatewayClient: gatewayClient)
+
+            case let .sessionOpenFailed(errorText):
+                state.errorText = errorText
+                Self.finishInFlightOpen(state: &state)
+                return .none
+
+            case let .sessionReady(key, summary):
+                Self.finishAfterOpen(key: key, summary: summary, state: &state)
+                return .none
+
+            case let .tabClosed(key):
+                state.tabs = state.tabs.close(key)
+                state.sessions.removeValue(forKey: key)
+                if state.currentKey == key {
+                    // Until the replacement registers, nothing is live: leaving the closed key here
+                    // makes `hasLiveSession` true and a re-login would overlay a dead transcript.
+                    state.currentKey = state.tabs.current
+                }
+                if let current = state.tabs.current, current != state.currentKey {
+                    state.currentKey = current
+                    return Self.sessionReadyEffect(key: current, gatewayClient: gatewayClient)
+                }
+                if state.tabs.keys.isEmpty {
+                    return .send(.openNewSession)
+                }
+                return .none
+
+            case let .tabCloseFailed(errorText):
+                state.errorText = errorText
+                return .none
+
+            case let .sessionTitleSet(key):
+                state.errorText = ""
+                return Self.refreshHeaderEffect(key: key, gatewayClient: gatewayClient)
+
+            case let .sessionTitleFailed(errorText):
                 state.errorText = errorText
                 return .none
             }
@@ -254,35 +468,208 @@ public struct AppFeature: Sendable {
         case let .closed(reason):
             state.setPhase(PhaseMachine.reduce(phase: state.phase, event: .closed(reason: reason), savedEndpoint: state.endpointText))
         case .needsPassword:
-            state.setPhase(PhaseMachine.reduce(phase: state.phase, event: .needsPassword, savedEndpoint: state.endpointText))
+            state.setPhase(
+                PhaseMachine.reduce(
+                    phase: state.phase, event: .needsPassword, savedEndpoint: state.endpointText,
+                    hasLiveSession: state.currentKey != nil
+                )
+            )
         }
     }
 
-    /// The connection half owns no session map yet (T09), so the header model is always unknown here.
-    private static func afterOpen(state: inout State) {
-        state.errorText = ""
-        state.setPhase(PhaseMachine.ready(""))
+    private static let parkedChangesMax = 512
+
+    private static func kindOf(_ kind: TranscriptChangeKind) -> String {
+        switch kind {
+        case .rowAppended: return "rowAppended"
+        case .rowUpdated: return "rowUpdated"
+        case .reset: return "reset"
+        case .headerUpdated: return "headerUpdated"
+        }
     }
 
-    private static func connectThenOpenMainSession(cols: Int, gatewayClient: GatewayClient) async -> Action {
+    /// The predicate for "the session map may grow for this key": an open tab, or a key whose open is still registering.
+    private static func isOpenOrRestoring(_ key: String, tabs: TabSet, pendingKeys: Set<String>) -> Bool {
+        tabs.keys.contains(key) || pendingKeys.contains(key)
+    }
+
+    private static func onTranscriptChange(
+        _ change: TranscriptChangeDto, state: inout State, gatewayClient: GatewayClient
+    ) -> Effect<Action> {
+        guard Self.isOpenOrRestoring(change.key, tabs: state.tabs, pendingKeys: state.pendingKeys) else {
+            // An in-flight open_session can deliver a reset plus rows for the session being opened before its key is known, so those changes are parked rather than applied; with no open running an unknown key is dropped, never minted.
+            if state.inFlightOpens > 0 {
+                while state.parkedChanges.count >= Self.parkedChangesMax {
+                    state.parkedChanges.removeFirst()
+                }
+                state.parkedChanges.append(change)
+            }
+            return .none
+        }
+        state.sessions = applySessionChange(
+            sessions: state.sessions,
+            key: change.key,
+            kind: Self.kindOf(change.kind),
+            index: Int64(change.index),
+            rowJson: change.rowJson,
+            knownKeys: Set(state.tabs.keys).union(state.pendingKeys),
+            title: change.title
+        )
+        guard change.kind == .headerUpdated else { return .none }
+        return .run { [gatewayClient] send in
+            let summaries = await gatewayClient.openSessions()
+            guard let summary = summaries.first(where: { $0.key == change.key }) else { return }
+            await send(.headerRefreshed(key: change.key, summary: summary))
+        }
+    }
+
+    /// Re-checked behind the same predicate as the map write above: the RPC this follows is async, so the tab it targets may have closed while it was in flight.
+    private static func applyHeaderRefresh(key: String, summary: SessionSummary, state: inout State) {
+        guard Self.isOpenOrRestoring(key, tabs: state.tabs, pendingKeys: state.pendingKeys) else { return }
+        var current = state.sessions[key] ?? SessionUiState(key: key)
+        current.title = summary.title
+        current.model = LooseJSON(summary.headerJson)?.optString("model") ?? ""
+        current.running = summary.running
+        current.profile = summary.profileName
+        state.sessions[key] = current
+        guard !current.model.isEmpty else { return }
+        state.setPhase(
+            PhaseMachine.reduce(phase: state.phase, event: .header(model: current.model), savedEndpoint: state.endpointText)
+        )
+    }
+
+    /// Reads the just-registered tab's cached header model; `""` before any header has landed, which also covers the connection half's main-session flow, where `currentKey` is never set.
+    private static func afterOpen(state: inout State) {
+        state.errorText = ""
+        state.setPhase(PhaseMachine.ready(state.currentKey.flatMap { state.sessions[$0]?.model } ?? ""))
+    }
+
+    private static func performSwitchTab(key: String, state: inout State, gatewayClient: GatewayClient) -> Effect<Action> {
+        guard let next = tabTap(tabs: state.tabs, currentKey: state.currentKey, key: key) else { return .none }
+        state.tabs = next
+        guard let current = next.current else { return .none }
+        state.currentKey = current
+        return Self.sessionReadyEffect(key: current, gatewayClient: gatewayClient)
+    }
+
+    private static func sessionReadyEffect(key: String, gatewayClient: GatewayClient) -> Effect<Action> {
+        .run { [gatewayClient] send in
+            let summaries = await gatewayClient.openSessions()
+            let summary = summaries.first(where: { $0.key == key })
+            await send(.sessionReady(key: key, summary: summary))
+        }
+    }
+
+    private static func refreshHeaderEffect(key: String, gatewayClient: GatewayClient) -> Effect<Action> {
+        .run { [gatewayClient] send in
+            let summaries = await gatewayClient.openSessions()
+            guard let summary = summaries.first(where: { $0.key == key }) else { return }
+            await send(.headerRefreshed(key: key, summary: summary))
+        }
+    }
+
+    /// Writes the fresh summary into the session map (guarded the same way `applyHeaderRefresh` is, since this also follows an async RPC), then forces the phase to Ready the way `afterOpen` always does, whether or not a header landed.
+    private static func finishAfterOpen(key: String, summary: SessionSummary?, state: inout State) {
+        if Self.isOpenOrRestoring(key, tabs: state.tabs, pendingKeys: state.pendingKeys), let summary {
+            var current = state.sessions[key] ?? SessionUiState(key: key)
+            current.title = summary.title
+            current.model = LooseJSON(summary.headerJson)?.optString("model") ?? ""
+            current.running = summary.running
+            current.profile = summary.profileName
+            state.sessions[key] = current
+        }
+        Self.afterOpen(state: &state)
+    }
+
+    /// Seeds title, profile and running from an `open_sessions()` snapshot; the header refresh only ever covers the current tab.
+    private static func applySummaries(_ summaries: [SessionSummary], state: inout State) {
+        guard !summaries.isEmpty else { return }
+        for summary in summaries {
+            guard var existing = state.sessions[summary.key] else { continue }
+            existing.title = summary.title
+            existing.profile = summary.profileName
+            existing.running = summary.running
+            state.sessions[summary.key] = existing
+        }
+    }
+
+    /// The shared tail of `openNewSession` / `openExistingSession` / `openBotChat`: register the newly opened key as a tab, draining any changes the change stream parked for it while its open was in flight.
+    private static func registerOpenedSession(key: String, state: inout State) {
+        state.pendingKeys.insert(key)
+        Self.drainParked(key: key, state: &state)
+        state.sessions = ensureSession(state.sessions, key)
+        state.tabs = state.tabs.add(key)
+        state.pendingKeys.remove(key)
+        Self.finishInFlightOpen(state: &state)
+    }
+
+    /// Everything the core just invalidated: the tabs, their transcripts, the in-flight bookkeeping.
+    private static func clearSessionState(_ state: inout State) {
+        state.sessions = [:]
+        state.tabs = TabSet()
+        state.currentKey = nil
+        state.pendingKeys = []
+        state.parkedChanges = []
+        state.inFlightOpens = 0
+    }
+
+    private static func finishInFlightOpen(state: inout State) {
+        if state.inFlightOpens > 0 {
+            state.inFlightOpens -= 1
+        }
+        if state.inFlightOpens == 0 {
+            state.parkedChanges = []
+        }
+    }
+
+    /// Re-applies the changes parked for `key` while its open was in flight; a change parked for a different, still-overlapping open is put back so that open can drain it in turn.
+    private static func drainParked(key: String, state: inout State) {
+        guard !state.parkedChanges.isEmpty else { return }
+        let known = Set(state.tabs.keys).union(state.pendingKeys).union([key])
+        var sessions = state.sessions
+        var remaining: [TranscriptChangeDto] = []
+        for change in state.parkedChanges {
+            guard change.key == key else {
+                remaining.append(change)
+                continue
+            }
+            sessions = applySessionChange(
+                sessions: sessions,
+                key: key,
+                kind: Self.kindOf(change.kind),
+                index: Int64(change.index),
+                rowJson: change.rowJson,
+                knownKeys: known,
+                title: change.title
+            )
+        }
+        state.parkedChanges = remaining
+        state.sessions = sessions
+    }
+
+    private static func connectThenOpenMainSession(
+        cols: Int, gatewayClient: GatewayClient, send: Send<Action>
+    ) async {
         do {
             try await gatewayClient.connect()
         } catch {
-            return connectFailure(error)
+            await send(connectFailure(error))
+            return
         }
-        return await openMainSession(cols: cols, gatewayClient: gatewayClient)
+        await openMainSession(cols: cols, gatewayClient: gatewayClient, send: send)
     }
 
     private static func loginConnectThenOpenMainSession(
-        password: String, cols: Int, gatewayClient: GatewayClient
-    ) async -> Action {
+        password: String, cols: Int, gatewayClient: GatewayClient, send: Send<Action>
+    ) async {
         do {
             try await gatewayClient.login(password: password)
             try await gatewayClient.connect()
         } catch {
-            return connectFailure(error)
+            await send(connectFailure(error))
+            return
         }
-        return await openMainSession(cols: cols, gatewayClient: gatewayClient)
+        await openMainSession(cols: cols, gatewayClient: gatewayClient, send: send)
     }
 
     private static func connectFailure(_ error: Error) -> Action {
@@ -294,10 +681,16 @@ public struct AppFeature: Sendable {
     }
 
     /// `GatewayClient.openSessions()` cannot fail on this platform (the core call has no `Result`), so the registry-unreachable branch Android guards against never fires through this dependency.
-    private static func openMainSession(cols: Int, gatewayClient: GatewayClient) async -> Action {
+    ///
+    /// The resume keys are announced BEFORE the first open so the change stream can park the
+    /// reset and rows the core pushes for a session whose tab does not exist yet.
+    private static func openMainSession(
+        cols: Int, gatewayClient: GatewayClient, send: Send<Action>
+    ) async {
         let summaries = await gatewayClient.openSessions()
         let lastActive = await gatewayClient.lastActiveSession()
         let plan = restorePlan(keys: summaries.map(\.key), lastActive: lastActive)
+        await send(.resumePlanned(keys: plan.resumeKeys))
         var resumed: [String] = []
         var lastErrorText: String?
         for key in plan.resumeKeys {
@@ -309,16 +702,22 @@ public struct AppFeature: Sendable {
             }
         }
         if !resumed.isEmpty {
-            return .mainSessionReady
+            await send(
+                .mainSessionRestored(
+                    planned: plan.resumeKeys, resumed: resumed, summaries: summaries, current: plan.current
+                )
+            )
+            return
         }
         if !plan.resumeKeys.isEmpty {
-            return .mainSessionClosed(reason: "error: no session could be resumed", errorText: lastErrorText)
+            await send(.mainSessionRestoreFailed(planned: plan.resumeKeys, errorText: lastErrorText))
+            return
         }
         do {
-            _ = try await gatewayClient.openSession(storedId: nil, cols: Int64(cols))
-            return .mainSessionReady
+            let key = try await gatewayClient.openSession(storedId: nil, cols: Int64(cols))
+            await send(.newSessionOpened(key: key))
         } catch {
-            return .mainSessionClosed(reason: "error: no session could be resumed", errorText: ErrorMessages.of(error))
+            await send(.mainSessionRestoreFailed(planned: [], errorText: ErrorMessages.of(error)))
         }
     }
 }
