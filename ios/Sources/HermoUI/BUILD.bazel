@@ -1,0 +1,13 @@
+load("//platforms:apple.bzl", "IOS_ONLY")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+swift_library(
+    name = "HermoUI",
+    srcs = glob(["*.swift"], allow_empty = True),
+    module_name = "HermoUI",
+    target_compatible_with = IOS_ONLY,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//ios/Sources/HermoLogic",
+    ],
+)
