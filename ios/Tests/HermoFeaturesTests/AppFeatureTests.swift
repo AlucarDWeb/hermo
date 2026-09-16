@@ -464,4 +464,38 @@ final class AppFeatureTests: XCTestCase {
             $0.phase = .ready(model: "")
         }
     }
+
+    // MARK: 13. The composed ChatFeature's reportError delegate surfaces on the parent errorText
+
+    func testChatDelegateReportErrorSurfacesOnAppErrorText() async {
+        let store = TestStore(initialState: AppFeature.State()) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+        }
+
+        await store.send(.chat(.delegate(.reportError("boom")))) {
+            $0.errorText = "boom"
+        }
+    }
+
+    // MARK: 14. Sending through the composed child reaches the gateway client
+
+    func testSendingThroughComposedChatReachesTheClient() async {
+        let store = TestStore(
+            initialState: AppFeature.State(chat: ChatFeature.State(draft: "hello"))
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.send = { _, _ in throw CoreError.NotConnected }
+        }
+
+        await store.send(.chat(.send(key: "s1"))) {
+            $0.chat.draft = ""
+        }
+        await store.receive(.chat(.delegate(.reportError("Not connected to the gateway yet.")))) {
+            $0.errorText = "Not connected to the gateway yet."
+        }
+    }
 }

@@ -22,15 +22,17 @@ pub struct Fixtures {
     scenarios: HashMap<TurnKind, Vec<Value>>,
     ready: Value,
     approval_frame: Option<Value>,
+    session_info: Option<Value>,
 }
 
 impl Fixtures {
     pub fn load(path: &Path) -> io::Result<Fixtures> {
-        let (scenarios, ready) = load_scenarios(path)?;
+        let (scenarios, ready, session_info) = load_scenarios(path)?;
         Ok(Fixtures {
             scenarios,
             ready,
             approval_frame: None,
+            session_info,
         })
     }
 
@@ -41,6 +43,22 @@ impl Fixtures {
     }
 
     pub fn turn(&self, kind: TurnKind) -> Vec<Value> {
+        let mut frames = self.turn_frames(kind);
+        let ends_with_header = frames
+            .last()
+            .and_then(|f| f.get("params"))
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str)
+            == Some("session.info");
+        if !ends_with_header {
+            if let Some(info) = &self.session_info {
+                frames.push(info.clone());
+            }
+        }
+        frames
+    }
+
+    fn turn_frames(&self, kind: TurnKind) -> Vec<Value> {
         match kind {
             TurnKind::Plain => self.plain_frames(),
             TurnKind::Slow => self
@@ -100,7 +118,10 @@ pub fn rewrite(frame: &Value, session_id: &str, seq: i64) -> Value {
     frame
 }
 
-fn load_scenarios(path: &Path) -> io::Result<(HashMap<TurnKind, Vec<Value>>, Value)> {
+/// The cut turns, the `gateway.ready` payload, and a `session.info` frame to close a turn with.
+type LoadedFixtures = (HashMap<TurnKind, Vec<Value>>, Value, Option<Value>);
+
+fn load_scenarios(path: &Path) -> io::Result<LoadedFixtures> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut scenarios: HashMap<TurnKind, Vec<Value>> = HashMap::new();
@@ -109,6 +130,8 @@ fn load_scenarios(path: &Path) -> io::Result<(HashMap<TurnKind, Vec<Value>>, Val
     let mut has_clarify = false;
     let mut ready = Value::Null;
     let mut plain: Vec<Vec<Value>> = Vec::new();
+    let mut complete = false;
+    let mut session_info: Option<Value> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -120,15 +143,21 @@ fn load_scenarios(path: &Path) -> io::Result<(HashMap<TurnKind, Vec<Value>>, Val
             ready = payload;
             continue;
         }
+        if event_type == "session.info" && session_info.is_none() {
+            session_info = Some(value.clone());
+        }
         if event_type == "tool.start" {
             has_tool = true;
         }
         if event_type == "clarify.request" {
             has_clarify = true;
         }
-        current.push(value);
-        if event_type == "message.complete" {
+        // A turn's trailing `session.info` and `session.title` are what clear the
+        // running flag, so a scenario ends at the NEXT turn's start, not at its own
+        // `message.complete`.
+        if complete && event_type == "message.start" {
             let frames = std::mem::take(&mut current);
+            complete = false;
             if has_clarify {
                 scenarios.insert(TurnKind::Clarify, frames);
             } else if has_tool {
@@ -139,6 +168,23 @@ fn load_scenarios(path: &Path) -> io::Result<(HashMap<TurnKind, Vec<Value>>, Val
             has_tool = false;
             has_clarify = false;
         }
+        current.push(value);
+        if event_type == "message.complete" {
+            complete = true;
+        }
+    }
+    // Only a turn that actually reached `message.complete` becomes a scenario: a fixture
+    // truncated mid-turn would otherwise be served as one, and the client's running flag
+    // would never clear.
+    if complete {
+        let frames = std::mem::take(&mut current);
+        if has_clarify {
+            scenarios.insert(TurnKind::Clarify, frames);
+        } else if has_tool {
+            scenarios.insert(TurnKind::Tool, frames);
+        } else if !frames.is_empty() {
+            plain.push(frames);
+        }
     }
 
     if let Some(first) = plain.first() {
@@ -148,7 +194,7 @@ fn load_scenarios(path: &Path) -> io::Result<(HashMap<TurnKind, Vec<Value>>, Val
         scenarios.insert(TurnKind::Slow, longest.clone());
     }
 
-    Ok((scenarios, ready))
+    Ok((scenarios, ready, session_info))
 }
 
 fn parse_event_frame(line: &str) -> Option<(Value, String, Value)> {
