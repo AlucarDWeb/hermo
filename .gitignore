@@ -21,6 +21,7 @@
 
 # Bazel
 /bazel-*
+user.bazelrc
 **/bazel-*
 
 # Local tooling
@@ -33,3 +34,6 @@
 # Python
 __pycache__/
 *.pyc
+
+# SwiftPM scratch from `swift package resolve` in ios/
+ios/.build/

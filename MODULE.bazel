@@ -151,8 +151,29 @@ android_ndk_repository_extension = use_extension(
 )
 use_repo(android_ndk_repository_extension, "androidndk")
 
-register_toolchains("@androidndk//:all")
+# The NDK toolchains are registered per Android config in .bazelrc
+# (--extra_toolchains) instead of here: a global register_toolchains
+# forces the NDK repo fetch for every target, and iOS builds on a Mac
+# without an NDK would fail before analysis.
 
 # NDK path comes from ANDROID_NDK_HOME (per-host; /opt/android-ndk here).
 # API 24 matches the app minSdk; the toolchain defaults to 31 otherwise.
 android_ndk_repository_extension.configure(api_level = 24)
+
+# Apple and Swift toolchain rules for the iOS app.
+bazel_dep(name = "apple_support", version = "2.8.2", repo_name = "build_bazel_apple_support")
+bazel_dep(name = "rules_apple", version = "5.1.0", repo_name = "build_bazel_rules_apple")
+bazel_dep(name = "rules_swift", version = "4.1.0", repo_name = "build_bazel_rules_swift")
+bazel_dep(name = "rules_swift_package_manager", version = "1.23.0")
+
+# Apple's cc toolchain, used by the Swift and Objective-C link steps of the iOS app.
+apple_cc_configure = use_extension("@build_bazel_apple_support//crosstool:setup.bzl", "apple_cc_configure_extension")
+use_repo(apple_cc_configure, "local_config_apple_cc")
+
+# Swift package resolution for TCA, driven by ios/Package.swift and its resolved lockfile.
+swift_deps = use_extension("@rules_swift_package_manager//:extensions.bzl", "swift_deps")
+swift_deps.from_package(
+    resolved = "//ios:Package.resolved",
+    swift = "//ios:Package.swift",
+)
+use_repo(swift_deps, "swift_package", "swiftpkg_swift_composable_architecture")
