@@ -577,12 +577,14 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
 
     /**
      * T16b strip ×: `close_session` in the core, drop the tab and the entry.
-     * The last remaining tab is UNCLOSEABLE (the strip omits the ×, and this
-     * guard backs it); closing the current tab selects the neighbour per the
-     * pure `close` verb.
+     * FIX8-bis (user: "no way out of the current session"): the LAST tab is
+     * closeable too — closing it drops the user into a fresh blank chat
+     * (declared divergence from Desktop's uncloseable last tab; the closed
+     * chat stays resumable from the picker, it lives on the gateway).
+     * Closing the current tab selects the neighbour per the pure `close`
+     * verb.
      */
-    suspend fun closeTab(key: String) {
-        if (_tabs.value.keys.size <= 1) return
+    suspend fun closeTab(key: String, cols: Int) {
         try {
             core.closeSession(key)
         } catch (t: Throwable) {
@@ -596,6 +598,12 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         if (current != null && current != _currentKey.value) {
             _currentKey.value = current
             afterOpen(current)
+        }
+        if (next.keys.isEmpty()) {
+            // FIX8-bis (user: no way out of the current session): closing the
+            // LAST tab drops the user into a fresh blank chat — the closed
+            // chat stays resumable from the picker (it lives on the gateway).
+            openNewSession(cols)
         }
     }
 

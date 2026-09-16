@@ -199,7 +199,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Strip ×: close the tab (the repository guards the last-tab rule). */
     fun closeTab(key: String) {
-        viewModelScope.launch { repo.closeTab(key) }
+        viewModelScope.launch { repo.closeTab(key, cols()) }
     }
 
     /**
