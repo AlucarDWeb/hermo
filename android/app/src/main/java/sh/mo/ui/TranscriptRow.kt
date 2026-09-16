@@ -229,27 +229,24 @@ internal fun ScaffoldGlyph(glyph: String? = null, tint: androidx.compose.ui.grap
  * brief asked for it; Desktop shows a timestamp there, no count) — the
  * header here names it instead of passing it off as parity.
  *
- * Desktop's latch (message-parts.tsx:144-157): once a live preview has been
- * shown, `sawLivePreview` stays true — the body remains mounted after the
- * block settles, so nothing jumps when the turn completes. The old phone
- * code recomputed `wasLive && live` instead of latching, which snapped the
- * body shut at settle (reviewed on PR #9). Blocks that mount already
- * complete never latch and stay collapsed, like Desktop's.
+ * Body visibility is LIVE-ONLY (user directive 2026-09-15, a DECLARED
+ * divergence from Desktop's `sawLivePreview` latch at message-parts.tsx:
+ * 144-157): the body streams open while the turn runs, and at settle it
+ * collapses to the label — only the output (and the tool cards) remain in
+ * the transcript. The user can still expand a settled block by tapping the
+ * label; the toggle wins over the live state.
  */
 @Composable
 private fun ThinkingRow(text: String) {
     val t = LocalHermoTokens.current
     var userToggledOpen by rememberSaveable(rowIdKey(text)) { mutableStateOf<Boolean?>(null) }
-    // Desktop's `sawLivePreview` latch: set on the first live recomposition,
-    // never cleared — a body seen live stays open after the turn settles.
-    var sawLive by rememberSaveable(rowIdKey(text)) { mutableStateOf(false) }
+    // LIVE-ONLY body (user directive 2026-09-15): open while streaming,
+    // collapsed at settle. No Desktop sawLive latch — see the KDoc above.
     val live = rowStreaming
-    if (live) sawLive = true
-    // Desktop's showPreview without the collapsed-by-default opt-out
-    // (message-parts.tsx:156): `pending || sawLivePreview` — the latch alone
-    // holds the body open at settle, which `sawLive && live` (the reviewed
-    // bug) never did: the AND re-collapsed the body the moment `live` fell.
-    val open = userToggledOpen ?: (live || sawLive)
+    // LIVE-ONLY body (user directive 2026-09-15): the Desktop latch above is
+    // deliberately NOT mirrored — `open` follows the live flag, the user's
+    // tap wins over both.
+    val open = userToggledOpen ?: live
     // The block's measured duration (Desktop's useMeasuredDuration): the core
     // re-delivers the thinking row as its text grows and the turn's running
     // flag flips off at settle, so "watched live and now settled" is the
@@ -282,7 +279,7 @@ private fun ThinkingRow(text: String) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { userToggledOpen = !(userToggledOpen ?: (live || sawLive)) }
+                .clickable { userToggledOpen = !(userToggledOpen ?: live) }
                 .padding(vertical = 1.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,

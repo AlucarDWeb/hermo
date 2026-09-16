@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# build_android.sh — build the hermo Android app and deploy to an
-# emulator/device. Full-Bazel build of record: the app is the Bazel
-# android_binary //android/app:app (T6 stream A).
+# simulator_install.sh — build the hermo Android app (x86_64 emulator ABI)
+# and deploy to a booted emulator (boots the default AVD if none is online).
+# For a USB device use scripts/device_install.sh instead.
 #
 # Usage:
-#   ./scripts/build_android.sh              # build only (emulator ABI)
-#   ./scripts/build_android.sh --install    # build + boot emulator (if none online) + install
-#   ./scripts/build_android.sh --run        # build + boot emulator (if needed) + install + launch
-#   DEVICE=1 ...                            # arm64 device ABI; default x86_64 emulator
-#   LOWMEM=1 ...                            # --config=lowmem (jobs=2) anti-freeze profile
-#   AVD=MyAvd ./scripts/build_android.sh --run   # pick a specific AVD
+#   ./scripts/simulator_install.sh              # build only (emulator ABI)
+#   ./scripts/simulator_install.sh --install    # build + boot emulator (if none online) + install
+#   ./scripts/simulator_install.sh --run        # build + boot emulator (if needed) + install + launch
 #
 # Machine-specific defaults below (this box: /opt/android-ndk, Android Studio's
 # JetBrains JDK); override ANDROID_NDK_HOME / JAVA_HOME / ANDROID_HOME for any
 # other setup. Nothing is hard-coded into the Bazel files themselves.
 #   NO_SHUTDOWN=1 ...                       # keep the bazel server alive after the build
+#   AVD=MyAvd ./scripts/simulator_install.sh --run   # pick a specific AVD
 #
 # Exit codes: 0 = ok, non-zero = failure.
 set -euo pipefail
