@@ -1,5 +1,32 @@
 import Foundation
 
+/// One row of the session picker sheet (the phone's view of `session.list`):
+/// `RemoteSessionDto` flattened into a pure value the sheet renders. Pure so the
+/// logic suite can pin the title and preview fallbacks without the gateway.
+public struct RemoteSessionRow: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let title: String
+    public let preview: String
+    public let messageCount: Int64
+
+    public init(id: String, title: String, preview: String, messageCount: Int64) {
+        self.id = id
+        self.title = title
+        self.preview = preview
+        self.messageCount = messageCount
+    }
+
+    /// Titlebar copy: the session's title, or "New session" when unnamed.
+    public var displayTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "New session" : title
+    }
+
+    /// The one-line preview, blank when the session has no text yet.
+    public var displayPreview: String {
+        preview.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 /// Applies one change-stream event to the per-key session map. A key outside
 /// `knownKeys` (not an open-or-restoring tab) is dropped rather than minted,
 /// including for `headerUpdated`, so a late change for a key already closed
