@@ -11,6 +11,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -44,6 +45,7 @@ fun BotDrawerContent(
     state: DrawerUiState,
     onProfileTap: (BotDrawerRow) -> Unit,
     onRetry: () -> Unit,
+    onLogout: () -> Unit,
 ) {
     val t = LocalHermoTokens.current
     ModalDrawerSheet(
@@ -125,6 +127,26 @@ fun BotDrawerContent(
                     }
                     state.rows.forEach { row -> BotDrawerItem(row = row, onTap = { onProfileTap(row) }) }
                 }
+            }
+            // The account-level way out: forget the paired gateway (endpoint,
+            // cookies and local tab list) and return to the pairing screen, so
+            // the app can log into a different gateway. Confirm dialog first.
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 8.dp),
+                color = t.strokeTertiary,
+            )
+            TextButton(
+                onClick = onLogout,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            ) {
+                Text(
+                    text = "Log out / pair another gateway",
+                    style = androidx.compose.ui.text.TextStyle(
+                        fontFamily = LocalFonts.current.sans,
+                        fontSize = t.convToolFontSize.sp,
+                    ),
+                    color = t.destructive,
+                )
             }
         }
     }

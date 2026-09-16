@@ -552,6 +552,33 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         return openNewSession(cols)
     }
 
+    /**
+     * Forget the PAIRED gateway: endpoint file, tab list and live sessions
+     * go (the core verb wipes them) and the phase drops to Unpaired, so the
+     * pairing screen shows and the app can log into a DIFFERENT gateway.
+     * The counterpart to [resetSessionsAndRestart], which keeps the pairing
+     * on purpose. The cookie jar FILE is not removed by the core verb; it
+     * is host-scoped, so the new gateway's login replaces it.
+     */
+    suspend fun forgetGateway() {
+        try {
+            core.forgetGateway()
+        } catch (t: Throwable) {
+            applyError(t)
+            return
+        }
+        pendingKeys.clear()
+        inFlightOpens.set(0)
+        _tabs.value = TabSet()
+        _sessions.value = emptyMap()
+        _currentKey.value = null
+        _errorText.value = ""
+        // The endpoint text feeds the NeedsPassword banner: leaving the old
+        // gateway string here would resurrect it on the next prompt.
+        endpointText = ""
+        _phase.value = AppPhase.Unpaired
+    }
+
     /** Shared tail of the picker opens / tab switch: Ready refresh. */
     private suspend fun afterOpen(key: String) {
         refreshHeader(key)
@@ -600,9 +627,6 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
             afterOpen(current)
         }
         if (next.keys.isEmpty()) {
-            // If the fresh-chat mint fails (network down), the surface stays
-            // empty with the surfaced error: the picker and + are the retry
-            // paths, and the closed chat remains resumable from the gateway.
             openNewSession(cols)
         }
     }

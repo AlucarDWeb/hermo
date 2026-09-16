@@ -276,6 +276,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.resetSessionsAndRestart(cols()) }
     }
 
+    /**
+     * "Log out" from the drawer: forget the paired gateway (the core wipes
+     * endpoint + local registry; the pairing must be redone) and drop to the
+     * Unpaired phase — the way to move the app to a different gateway.
+     */
+    fun forgetGateway() {
+        _drawerState.value = DrawerUiState.Loading
+        viewModelScope.launch { repo.forgetGateway() }
+    }
+
     /** Decision 3's local branch: phone-native equivalents, declared. */
     private fun handleLocalCommand(command: String) {
         when (command) {
