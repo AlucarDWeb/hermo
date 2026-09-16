@@ -1,0 +1,14 @@
+load("//platforms:apple.bzl", "APPLE_ONLY")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+swift_library(
+    name = "HermoGateway",
+    srcs = glob(["*.swift"]),
+    module_name = "HermoGateway",
+    target_compatible_with = APPLE_ONLY,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//ios/Sources/HermesCore",
+        "@swiftpkg_swift_composable_architecture//:ComposableArchitecture",
+    ],
+)

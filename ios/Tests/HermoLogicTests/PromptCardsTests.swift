@@ -1,5 +1,5 @@
 import XCTest
-@testable import HermoLogic
+import HermoLogic
 
 /// `ChatRow` is not part of this port; the row's `choices` field is inlined
 /// as a plain array where the Kotlin fixture used `parseChatRow` to reach it.

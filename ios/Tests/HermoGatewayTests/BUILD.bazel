@@ -1,0 +1,15 @@
+load("//platforms:apple.bzl", "APPLE_ONLY")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_test")
+
+swift_test(
+    name = "HermoGatewayTests",
+    srcs = glob(["*.swift"]),
+    target_compatible_with = APPLE_ONLY,
+    size = "small",
+    module_name = "HermoGatewayTests",
+    deps = [
+        "//ios/Sources/HermoGateway",
+        "//ios/Sources/HermesCore",
+        "@swiftpkg_swift_composable_architecture//:ComposableArchitecture",
+    ],
+)

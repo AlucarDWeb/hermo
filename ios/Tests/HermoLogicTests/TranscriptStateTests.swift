@@ -1,5 +1,5 @@
 import XCTest
-@testable import HermoLogic
+import HermoLogic
 
 /// Pins the transcript-fidelity fix: a `rowUpdated` past the end of the local
 /// list used to be dropped, which desynchronised every later index, and a

@@ -1,5 +1,5 @@
 import XCTest
-@testable import HermoLogic
+import HermoLogic
 
 final class ThinkingLabelTests: XCTestCase {
 
