@@ -121,3 +121,18 @@ final class TranscriptStateTests: XCTestCase {
         XCTAssertEqual(sessions["other"]?.rows, [])
     }
 }
+
+final class RemoteSessionRowTests: XCTestCase {
+
+    func testBlankTitleFallsBackToNewSession() {
+        let row = RemoteSessionRow(id: "s1", title: "   ", preview: "hi", messageCount: 1)
+
+        XCTAssertEqual(row.displayTitle, "New session")
+    }
+
+    func testBlankPreviewTrimsToAnEmptyStringWithNoSubstituteCopy() {
+        let row = RemoteSessionRow(id: "s1", title: "Standup", preview: "   ", messageCount: 1)
+
+        XCTAssertEqual(row.displayPreview, "")
+    }
+}
