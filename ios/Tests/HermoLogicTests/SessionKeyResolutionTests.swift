@@ -1,5 +1,5 @@
 import XCTest
-@testable import HermoLogic
+import HermoLogic
 
 /// Pins the fidelity fix's suspect #2: the screen must render the
 /// repository-owned session key, never `sessions.keys.first`. With more than
