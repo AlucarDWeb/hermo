@@ -2,3 +2,29 @@ package(default_visibility = ["//visibility:public"])
 
 # Android platform() targets for the --platforms / --android_platforms flags.
 # Apple builds select on @build_bazel_apple_support//configs instead.
+# iOS platform targets belong to the Mac mini phase; they will be added with
+# exec_compatible_with = ["@platforms//os:macos"].
+
+platform(
+    name = "android_arm64",
+    constraint_values = [
+        "@platforms//os:android",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+platform(
+    name = "android_armv7",
+    constraint_values = [
+        "@platforms//os:android",
+        "@platforms//cpu:arm",
+    ],
+)
+
+platform(
+    name = "android_x86_64",
+    constraint_values = [
+        "@platforms//os:android",
+        "@platforms//cpu:x86_64",
+    ],
+)

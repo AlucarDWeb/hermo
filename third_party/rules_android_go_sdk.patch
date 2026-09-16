@@ -1,0 +1,19 @@
+rules_android registers a Go SDK for its own tools (jdeps and friends), and
+that SDK is the only one gazelle's go_repository tools can resolve. gazelle
+0.50.0 (pulled in transitively by rules_swift_package_manager) requires
+go >= 1.24.12 and builds with GOTOOLCHAIN=local, so the pinned 1.22.4 fails.
+Bump the SDK: a newer Go still compiles rules_android's tools unchanged.
+
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -30,9 +30,9 @@
+ bazel_dep(name = "abseil-py", version = "2.1.0", repo_name = "py_absl")
+ bazel_dep(name = "bazel_worker_api", version = "0.0.11")
+ bazel_dep(name = "bazel_worker_java", version = "0.0.11")
+
+ go_sdk = use_extension("@io_bazel_rules_go//go:extensions.bzl", "go_sdk")
+-go_sdk.download(version = "1.22.4")
++go_sdk.download(version = "1.24.12")
+
+ go_deps = use_extension("@bazel_gazelle//:extensions.bzl", "go_deps")
+ go_deps.from_file(go_mod = "//:go.mod")
