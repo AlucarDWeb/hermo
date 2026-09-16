@@ -59,13 +59,22 @@ final class BotDrawerTests: XCTestCase {
             "k-launch": SessionUiState(key: "k-launch"),
             "k-bot": SessionUiState(key: "k-bot", profile: "jn-core"),
         ]
-        XCTAssertEqual(openTabForProfile(sessions: sessions, profile: "jn-core"), "k-bot")
+        XCTAssertEqual(openTabForProfile(sessions: sessions, order: ["k-launch", "k-bot"], profile: "jn-core"), "k-bot")
     }
 
     func testOpenTabForProfileMissesUnknownAndBlankProfiles() {
         let sessions = ["k-bot": SessionUiState(key: "k-bot", profile: "jn-core")]
-        XCTAssertNil(openTabForProfile(sessions: sessions, profile: "jn-android"))
-        XCTAssertNil(openTabForProfile(sessions: sessions, profile: ""))
+        XCTAssertNil(openTabForProfile(sessions: sessions, order: ["k-bot"], profile: "jn-android"))
+        XCTAssertNil(openTabForProfile(sessions: sessions, order: ["k-bot"], profile: ""))
+    }
+
+    func testOpenTabForProfileBreaksATieBetweenSharedProfilesByTabOrder() {
+        let sessions = [
+            "k-first": SessionUiState(key: "k-first", profile: "jn-core"),
+            "k-second": SessionUiState(key: "k-second", profile: "jn-core"),
+        ]
+        XCTAssertEqual(openTabForProfile(sessions: sessions, order: ["k-first", "k-second"], profile: "jn-core"), "k-first")
+        XCTAssertEqual(openTabForProfile(sessions: sessions, order: ["k-second", "k-first"], profile: "jn-core"), "k-second")
     }
 
     func testWithProfileStampsAFreshEntryButNeverClobbersTheWireValue() {

@@ -37,7 +37,16 @@ final class AppFeatureTests: XCTestCase {
         await store.send(.loginAndConnect("secret")) {
             $0.phase = .connecting
         }
-        await store.receive(.mainSessionReady) {
+        await store.receive(.resumePlanned(keys: [])) {
+            $0.inFlightOpens = 1
+        }
+        await store.receive(.newSessionOpened(key: "session-1")) {
+            $0.sessions = ["session-1": SessionUiState(key: "session-1")]
+            $0.tabs = TabSet(keys: ["session-1"], current: "session-1")
+            $0.currentKey = "session-1"
+            $0.inFlightOpens = 0
+        }
+        await store.receive(.sessionReady(key: "session-1", summary: nil)) {
             $0.phase = .ready(model: "")
         }
     }
@@ -101,9 +110,15 @@ final class AppFeatureTests: XCTestCase {
         await store.send(.loginAndConnect("secret")) {
             $0.phase = .connecting
         }
+        await store.receive(.resumePlanned(keys: ["s1"])) {
+            $0.pendingKeys = ["s1"]
+            $0.inFlightOpens = 1
+        }
         await store.receive(
-            .mainSessionClosed(reason: "error: no session could be resumed", errorText: "Not connected to the gateway yet.")
+            .mainSessionRestoreFailed(planned: ["s1"], errorText: "Not connected to the gateway yet.")
         ) {
+            $0.pendingKeys = []
+            $0.inFlightOpens = 0
             $0.errorText = "Not connected to the gateway yet."
             $0.phase = .offline(reason: "error: no session could be resumed")
         }
@@ -195,6 +210,258 @@ final class AppFeatureTests: XCTestCase {
 
         await store.send(.pairingPayloadChanged("hermes://connect?payload")) {
             $0.pairingPayload = "hermes://connect?payload"
+        }
+    }
+
+    // MARK: 5. Unknown-key change parked during an in-flight open, then applied
+
+    func testUnknownKeyChangeDuringInFlightOpenIsParkedThenApplied() async {
+        let change = TranscriptChangeDto(key: "new-key", kind: .rowAppended, index: 0, rowJson: "{\"row\":1}", title: "")
+        let store = TestStore(initialState: AppFeature.State(inFlightOpens: 1)) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.openSessions = { [] }
+        }
+
+        await store.send(.core(.transcript(change))) {
+            $0.parkedChanges = [change]
+        }
+
+        await store.send(.newSessionOpened(key: "new-key")) {
+            $0.sessions = ["new-key": SessionUiState(key: "new-key", rows: ["{\"row\":1}"])]
+            $0.tabs = TabSet(keys: ["new-key"], current: "new-key")
+            $0.currentKey = "new-key"
+            $0.inFlightOpens = 0
+            $0.parkedChanges = []
+        }
+
+        await store.receive(.sessionReady(key: "new-key", summary: nil)) {
+            $0.phase = .ready(model: "")
+        }
+    }
+
+    // MARK: 6. Unknown-key change with no open in flight is dropped
+
+    func testUnknownKeyChangeWithNoOpenInFlightIsDropped() async {
+        let change = TranscriptChangeDto(key: "unknown", kind: .rowAppended, index: 0, rowJson: "{\"row\":1}", title: "")
+        let store = TestStore(initialState: AppFeature.State()) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+        }
+
+        await store.send(.core(.transcript(change)))
+    }
+
+    // MARK: 7. headerUpdated change updates the session title
+
+    func testHeaderUpdatedChangeUpdatesSessionTitle() async {
+        let change = TranscriptChangeDto(
+            key: "s1", kind: .headerUpdated, index: UInt32.max, rowJson: "", title: "New title"
+        )
+        let store = TestStore(
+            initialState: AppFeature.State(
+                sessions: ["s1": SessionUiState(key: "s1", title: "Old title")],
+                tabs: TabSet(keys: ["s1"], current: "s1"),
+                currentKey: "s1"
+            )
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.openSessions = { [] }
+        }
+
+        await store.send(.core(.transcript(change))) {
+            $0.sessions["s1"]?.title = "New title"
+        }
+    }
+
+    // MARK: 8. Closing the last tab mints a new session
+
+    func testClosingLastTabMintsANewSession() async {
+        let store = TestStore(
+            initialState: AppFeature.State(
+                sessions: ["s1": SessionUiState(key: "s1", title: "Chat")],
+                tabs: TabSet(keys: ["s1"], current: "s1"),
+                currentKey: "s1"
+            )
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.closeSession = { _ in }
+            $0.gatewayClient.openSession = { _, _ in "s2" }
+            $0.gatewayClient.openSessions = { [] }
+        }
+
+        await store.send(.closeTab(key: "s1"))
+        await store.receive(.tabClosed(key: "s1")) {
+            $0.tabs = TabSet()
+            $0.sessions = [:]
+            $0.currentKey = nil
+        }
+        await store.receive(.openNewSession) {
+            $0.inFlightOpens = 1
+        }
+        await store.receive(.newSessionOpened(key: "s2")) {
+            $0.sessions = ["s2": SessionUiState(key: "s2")]
+            $0.tabs = TabSet(keys: ["s2"], current: "s2")
+            $0.currentKey = "s2"
+            $0.inFlightOpens = 0
+        }
+        await store.receive(.sessionReady(key: "s2", summary: nil)) {
+            $0.phase = .ready(model: "")
+        }
+    }
+
+    // MARK: 9. Drawer tap for an already-open profile switches tabs, never opens a bot chat
+
+    func testBotChatTapForExistingProfileSwitchesTabWithoutCallingBotChatVerb() async {
+        let store = TestStore(
+            initialState: AppFeature.State(
+                sessions: [
+                    "s1": SessionUiState(key: "s1", profile: "echo"),
+                    "s2": SessionUiState(key: "s2", profile: "other"),
+                ],
+                tabs: TabSet(keys: ["s1", "s2"], current: "s2"),
+                currentKey: "s2"
+            )
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.openSessions = { [] }
+        }
+
+        await store.send(.openBotChat(profile: "echo")) {
+            $0.tabs = TabSet(keys: ["s1", "s2"], current: "s1")
+            $0.currentKey = "s1"
+        }
+        await store.receive(.sessionReady(key: "s1", summary: nil)) {
+            $0.phase = .ready(model: "")
+        }
+    }
+
+    // MARK: 10. SessionExpired with a session already open shows the re-login overlay
+
+    func testSessionExpiredWithSessionOpenShowsOverlay() async {
+        let store = TestStore(
+            initialState: AppFeature.State(
+                phase: .ready(model: "gpt-4"),
+                endpointText: testDisplayText,
+                lastReadyModel: "gpt-4",
+                sessions: ["s1": SessionUiState(key: "s1")],
+                tabs: TabSet(keys: ["s1"], current: "s1"),
+                currentKey: "s1"
+            )
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.savedEndpoint = { testEndpoint }
+            $0.gatewayClient.connect = { throw CoreError.SessionExpired }
+        }
+
+        await store.send(.tryResume)
+        await store.receive(.resumeStarted(endpointText: testDisplayText)) {
+            $0.phase = .connecting
+        }
+        await store.receive(
+            .connectFailed(
+                errorText: "Session expired — enter the password again.",
+                isAuthShape: true,
+                closedReason: "error: session expired — re-login required"
+            )
+        ) {
+            $0.errorText = "Session expired — enter the password again."
+            $0.phase = .needsPassword(endpoint: testDisplayText, overlay: true)
+        }
+    }
+
+    // MARK: 11. Changes parked for a different key are re-queued, not discarded
+
+    func testParkedChangesForADifferentKeyAreRequeuedNotDiscarded() async {
+        let changeA = TranscriptChangeDto(key: "keyA", kind: .rowAppended, index: 0, rowJson: "{\"a\":1}", title: "")
+        let changeB = TranscriptChangeDto(key: "keyB", kind: .rowAppended, index: 0, rowJson: "{\"b\":1}", title: "")
+        let store = TestStore(initialState: AppFeature.State(inFlightOpens: 2)) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.openSessions = { [] }
+        }
+
+        await store.send(.core(.transcript(changeA))) {
+            $0.parkedChanges = [changeA]
+        }
+        await store.send(.core(.transcript(changeB))) {
+            $0.parkedChanges = [changeA, changeB]
+        }
+
+        await store.send(.existingSessionOpened(key: "keyA")) {
+            $0.sessions = ["keyA": SessionUiState(key: "keyA", rows: ["{\"a\":1}"])]
+            $0.tabs = TabSet(keys: ["keyA"], current: "keyA")
+            $0.currentKey = "keyA"
+            $0.inFlightOpens = 1
+            $0.parkedChanges = [changeB]
+        }
+        await store.receive(.sessionReady(key: "keyA", summary: nil)) {
+            $0.phase = .ready(model: "")
+        }
+
+        await store.send(.existingSessionOpened(key: "keyB")) {
+            $0.sessions = [
+                "keyA": SessionUiState(key: "keyA", rows: ["{\"a\":1}"]),
+                "keyB": SessionUiState(key: "keyB", rows: ["{\"b\":1}"]),
+            ]
+            $0.tabs = TabSet(keys: ["keyA", "keyB"], current: "keyB")
+            $0.currentKey = "keyB"
+            $0.inFlightOpens = 0
+            $0.parkedChanges = []
+        }
+        await store.receive(.sessionReady(key: "keyB", summary: nil))
+    }
+
+    // MARK: 12. A cold-start restore registers every resumed key as a tab
+
+    func testResumeRegistersTabsAndSeedsThemFromTheRegistrySnapshot() async {
+        let summaries = [
+            SessionSummary(key: "s1", title: "First", running: false, headerJson: "{}", profileName: "bot"),
+            SessionSummary(key: "s2", title: "Second", running: true, headerJson: "{}", profileName: ""),
+        ]
+        let store = TestStore(initialState: AppFeature.State()) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.savedEndpoint = { testEndpoint }
+            $0.gatewayClient.connect = {}
+            $0.gatewayClient.openSessions = { summaries }
+            $0.gatewayClient.lastActiveSession = { "s1" }
+            $0.gatewayClient.openSession = { storedId, _ in storedId ?? "minted" }
+        }
+
+        await store.send(.tryResume)
+        await store.receive(.resumeStarted(endpointText: testDisplayText)) {
+            $0.endpointText = testDisplayText
+            $0.phase = .connecting
+        }
+        await store.receive(.resumePlanned(keys: ["s1", "s2"])) {
+            $0.pendingKeys = ["s1", "s2"]
+            $0.inFlightOpens = 1
+        }
+        await store.receive(
+            .mainSessionRestored(planned: ["s1", "s2"], resumed: ["s1", "s2"], summaries: summaries, current: "s1")
+        ) {
+            $0.pendingKeys = []
+            $0.inFlightOpens = 0
+            $0.sessions = [
+                "s1": SessionUiState(key: "s1", title: "First", running: false, profile: "bot"),
+                "s2": SessionUiState(key: "s2", title: "Second", running: true, profile: ""),
+            ]
+            $0.tabs = TabSet(keys: ["s1", "s2"], current: "s1")
+            $0.currentKey = "s1"
+            $0.phase = .ready(model: "")
         }
     }
 }
