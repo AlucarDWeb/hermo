@@ -145,6 +145,16 @@ single_version_override(
     version = "0.1.5",
 )
 
+# rules_android pins go_sdk 1.22.4 for its own tools; gazelle (transitive via
+# rules_swift_package_manager) builds its go_repository tools with the only
+# registered SDK and needs go >= 1.24.12.
+single_version_override(
+    module_name = "rules_android",
+    version = "0.7.3",
+    patch_strip = 1,
+    patches = ["//third_party:rules_android_go_sdk.patch"],
+)
+
 android_ndk_repository_extension = use_extension(
     "@rules_android_ndk//:extension.bzl",
     "android_ndk_repository_extension",
