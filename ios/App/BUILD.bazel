@@ -9,6 +9,9 @@ swift_library(
     target_compatible_with = APPLE_ONLY,
     deps = [
         "//ios/Sources/HermesCore",
+        "//ios/Sources/HermoFeatures",
+        "//ios/Sources/HermoLogic",
+        "//ios/Sources/HermoUI",
         "@swiftpkg_swift_composable_architecture//:ComposableArchitecture",
     ],
 )

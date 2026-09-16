@@ -55,6 +55,12 @@ build:macos_host --config=apple --macos_minimum_os=26.0
 # incompatible even under this config.
 build:ios_sim --config=apple --ios_multi_cpus=sim_arm64 --ios_minimum_os=26.0
 build:ios_sim --platforms=@build_bazel_apple_support//platforms:ios_sim_arm64
+# This makes a bare iOS-only library buildable on its own, but only while it pulls
+# no rules_swift_package_manager dependency. Those resolve their own minimum OS
+# under an ios_application's transition and the platform's under a direct build,
+# and TCA's PerceptionCore does not compile at the platform's. It is why HermoUI
+# takes plain values and closures instead of a Store: the store wiring lives in
+# ios/App, which is an ios_application, and HermoUI keeps its own build gate.
 
 # iOS device config (arm64); no signing is configured yet.
 build:ios_device --config=apple --ios_multi_cpus=arm64 --ios_minimum_os=26.0
