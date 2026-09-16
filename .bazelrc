@@ -2,9 +2,9 @@
 # (READ-ONLY reference). Guards keep this laptop alive during full builds.
 
 # Android (primary on Linux)
-build:android --platforms=//platforms:android_arm64
-build:android_armv7 --platforms=//platforms:android_armv7
-build:android_x86_64 --platforms=//platforms:android_x86_64
+build:android --platforms=//platforms:android_arm64 --extra_toolchains=@androidndk//:all
+build:android_armv7 --platforms=//platforms:android_armv7 --extra_toolchains=@androidndk//:all
+build:android_x86_64 --platforms=//platforms:android_x86_64 --extra_toolchains=@androidndk//:all
 
 common --enable_bzlmod
 
@@ -32,9 +32,27 @@ build --strategy=KotlinCompile=worker --worker_max_instances=KotlinCompile=1
 # --fat_apk_cpu for aar_import native-lib extraction; the per-target-platform
 # cc toolchain comes from rules_android_ndk and the ABI from
 # --android_platforms. Device = arm64, emulator = x86_64.
-build:device  --android_platforms=//platforms:android_arm64 --fat_apk_cpu=arm64-v8a
-build:emulator --android_platforms=//platforms:android_x86_64 --fat_apk_cpu=x86_64
+build:device  --android_platforms=//platforms:android_arm64 --fat_apk_cpu=arm64-v8a --extra_toolchains=@androidndk//:all
+build:emulator --android_platforms=//platforms:android_x86_64 --fat_apk_cpu=x86_64 --extra_toolchains=@androidndk//:all
 
 # Low-memory profile for the NDK-toolchain builds on this laptop.
 build:lowmem --jobs=2 --worker_max_instances=1
 build:lowmem --strategy=KotlinCompile=worker --worker_max_instances=KotlinCompile=1
+
+# Apple configs. ANDROID_HOME is blanked for repo rules so rules_android emits
+# its empty SDK repo instead of failing on a Mac whose SDK has no platforms.
+build:apple --repo_env=ANDROID_HOME=
+
+# Host config for swift_test targets: they run on this Mac directly, no simulator.
+build:macos_host --config=apple --macos_minimum_os=26.0
+
+# iOS Simulator config for the app and simulator-only libraries. The simulator
+# device and runtime are per machine: set --ios_simulator_device and
+# --ios_simulator_version in user.bazelrc.
+build:ios_sim --config=apple --ios_multi_cpus=sim_arm64 --ios_minimum_os=26.0
+
+# iOS device config (arm64); no signing is configured yet.
+build:ios_device --config=apple --ios_multi_cpus=arm64 --ios_minimum_os=26.0
+
+# Per-machine flags (simulator choice, local workarounds). Untracked.
+try-import %workspace%/user.bazelrc
