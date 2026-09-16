@@ -49,7 +49,12 @@ build:macos_host --config=apple --macos_minimum_os=26.0
 # iOS Simulator config for the app and simulator-only libraries. The simulator
 # device and runtime are per machine: set --ios_simulator_device and
 # --ios_simulator_version in user.bazelrc.
+# --platforms is what binds a BARE library target to iOS. --ios_multi_cpus only
+# reaches targets under an ios_application's split transition, so without this a
+# `swift_library` marked iOS-only stays on the host platform and is skipped as
+# incompatible even under this config.
 build:ios_sim --config=apple --ios_multi_cpus=sim_arm64 --ios_minimum_os=26.0
+build:ios_sim --platforms=@build_bazel_apple_support//platforms:ios_sim_arm64
 
 # iOS device config (arm64); no signing is configured yet.
 build:ios_device --config=apple --ios_multi_cpus=arm64 --ios_minimum_os=26.0
