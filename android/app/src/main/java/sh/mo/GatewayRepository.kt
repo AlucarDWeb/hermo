@@ -572,6 +572,10 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         _sessions.value = emptyMap()
         _currentKey.value = null
         _errorText.value = ""
+        // FIX8-bis: the endpoint TEXT too — it fed the NeedsPassword banner;
+        // leaving it would resurrect the old gateway string on the next
+        // password prompt.
+        endpointText = ""
         _phase.value = AppPhase.Unpaired
     }
 

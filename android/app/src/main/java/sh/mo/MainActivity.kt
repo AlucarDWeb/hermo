@@ -173,12 +173,22 @@ fun AppScreen(
                         themeMode = themeMode,
                         onThemeModeChange = onThemeModeChange,
                     )
-                    PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
+                    PasswordSheet(
+                        endpoint = p.endpoint,
+                        errorText = errorText,
+                        onSubmit = viewModel::submitPassword,
+                        onLogout = viewModel::forgetGateway,
+                    )
                 }
             } else {
                 // First pair (Unpaired → NeedsPassword): the sheet is the
                 // screen — there is no transcript under it.
-                PasswordSheet(endpoint = p.endpoint, errorText = errorText, onSubmit = viewModel::submitPassword)
+                PasswordSheet(
+                    endpoint = p.endpoint,
+                    errorText = errorText,
+                    onSubmit = viewModel::submitPassword,
+                    onLogout = viewModel::forgetGateway,
+                )
             }
         is AppPhase.Connecting -> ConnectingScreen()
         is AppPhase.Ready ->
@@ -193,6 +203,7 @@ fun AppScreen(
                 reason = p.reason,
                 onRetry = { viewModel.retryResume() },
                 onResetSessions = { viewModel.resetSessionsAndRestart() },
+                onLogout = viewModel::forgetGateway,
             )
     }
 }

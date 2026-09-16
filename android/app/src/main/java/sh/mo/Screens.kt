@@ -34,7 +34,12 @@ import sh.mo.ui.SessionPickerSheet
  * PoC does not need. The password is typed at runtime and never persisted.
  */
 @Composable
-fun PasswordSheet(endpoint: String, errorText: String, onSubmit: (String) -> Unit) {
+fun PasswordSheet(
+    endpoint: String,
+    errorText: String,
+    onSubmit: (String) -> Unit,
+    onLogout: () -> Unit,
+) {
     var password by remember { mutableStateOf("") }
 
     Column(
@@ -61,6 +66,15 @@ fun PasswordSheet(endpoint: String, errorText: String, onSubmit: (String) -> Uni
                 .padding(top = 8.dp),
         ) {
             Text("Sign in")
+        }
+        // T14 (user: the password prompt was for the WRONG gateway and there
+        // was no way back): log out re-opens pairing so the host can be
+        // changed (e.g. LAN -> Tailscale).
+        TextButton(
+            onClick = onLogout,
+            modifier = Modifier.padding(top = 4.dp),
+        ) {
+            Text("Wrong gateway? Log out", color = MaterialTheme.colorScheme.error)
         }
         if (errorText.isNotEmpty()) {
             Text(
@@ -138,6 +152,7 @@ fun OfflineScreen(
     reason: String,
     onRetry: () -> Unit,
     onResetSessions: () -> Unit,
+    onLogout: () -> Unit,
 ) {
     var resetConfirm by remember { mutableStateOf(false) }
     Column(
@@ -153,6 +168,11 @@ fun OfflineScreen(
         }
         TextButton(onClick = { resetConfirm = true }, modifier = Modifier.padding(top = 4.dp)) {
             Text("Reset sessions", color = MaterialTheme.colorScheme.error)
+        }
+        // T14 (user: the password prompt was for the wrong gateway with no
+        // way back): forget the pairing entirely and re-open pairing.
+        TextButton(onClick = onLogout, modifier = Modifier.padding(top = 4.dp)) {
+            Text("Log out / pair another gateway", color = MaterialTheme.colorScheme.error)
         }
     }
     if (resetConfirm) {
