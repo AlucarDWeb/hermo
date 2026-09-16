@@ -552,6 +552,29 @@ class GatewayRepository(private val core: HermesCore) : EventSink {
         return openNewSession(cols)
     }
 
+    /**
+     * T14 (user: "devo uscire proprio dall'account"): forget the PAIRED
+     * gateway — endpoint file, cookie jar scope and the local tab list all
+     * go (the core verb wipes them) — and drop back to the Unpaired phase
+     * so the pairing screen shows. This is how the app moves to a
+     * DIFFERENT gateway (e.g. the Tailscale one): "Reset sessions" keeps
+     * the pairing on purpose, this does the opposite.
+     */
+    suspend fun forgetGateway() {
+        try {
+            core.forgetGateway()
+        } catch (t: Throwable) {
+            applyError(t)
+            return
+        }
+        pendingKeys.clear()
+        _tabs.value = TabSet()
+        _sessions.value = emptyMap()
+        _currentKey.value = null
+        _errorText.value = ""
+        _phase.value = AppPhase.Unpaired
+    }
+
     /** Shared tail of the picker opens / tab switch: Ready refresh. */
     private suspend fun afterOpen(key: String) {
         refreshHeader(key)

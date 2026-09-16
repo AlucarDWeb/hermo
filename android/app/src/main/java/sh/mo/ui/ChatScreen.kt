@@ -148,6 +148,9 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val drawerUi by viewModel.drawerState.collectAsState()
+    // T14: the drawer's "Log out" asks before forgetting the paired gateway
+    // (endpoint + cookies + local tabs go; the host's chats stay).
+    var logoutConfirm by remember { mutableStateOf(false) }
     val openDrawer: () -> Unit = {
         viewModel.openBotDrawer()
         scope.launch { drawerState.open() }
@@ -183,6 +186,7 @@ fun ChatScreen(
                         viewModel.openBotChat(row.profile) { scope.launch { drawerState.close() } }
                     },
                     onRetry = { viewModel.retryBotDrawer() },
+                    onLogout = { logoutConfirm = true },
                 )
             },
         ) {
@@ -261,6 +265,29 @@ fun ChatScreen(
                         viewModel.setSessionTitle(name)
                     },
                     onDismiss = { renameOpen = false },
+                )
+            }
+            if (logoutConfirm) {
+                AlertDialog(
+                    onDismissRequest = { logoutConfirm = false },
+                    title = { Text("Log out?") },
+                    text = {
+                        Text(
+                            "Forgets this gateway on the phone: the local session " +
+                                "list and the saved login go, and the pairing screen " +
+                                "comes back. The chats on the host are not deleted.",
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            logoutConfirm = false
+                            scope.launch { drawerState.close() }
+                            viewModel.forgetGateway()
+                        }) { Text("Log out") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { logoutConfirm = false }) { Text("Cancel") }
+                    },
                 )
             }
         }
