@@ -3,6 +3,32 @@ import HermesCore
 
 public enum ErrorMessages {
 
+    /// The Rust `#[error(...)]` Display text, which the Kotlin reads straight off
+    /// `Throwable.message` and folds into the Offline screen's reason. The generated
+    /// `CoreError.errorDescription` is `String(reflecting:)`, so it yields
+    /// `HermesCore.CoreError.SessionExpired` and cannot stand in for it.
+    public static func rustMessage(_ error: Error) -> String {
+        guard let coreError = error as? CoreError else {
+            return (error as? LocalizedError)?.errorDescription ?? "?"
+        }
+        switch coreError {
+        case .InvalidQr: return "invalid QR payload"
+        case .NotConnected: return "not connected"
+        case .Timeout: return "operation timed out"
+        case .Rpc(let code, let detail): return "rpc error \(code): \(detail)"
+        case .Io(let detail): return "io error: \(detail)"
+        case .Network(let detail): return "network failure: \(detail)"
+        case .InvalidCredentials: return "invalid credentials"
+        case .SessionExpired: return "session expired — re-login required"
+        case .UpgradeRejected: return "upgrade rejected by gateway"
+        case .InvalidEndpoint(let detail): return "invalid endpoint url: \(detail)"
+        case .RateLimited: return "rate limited"
+        case .UnknownProvider: return "unknown auth provider"
+        case .UnexpectedStatus: return "unexpected submit status"
+        case .Http(let status): return "http status \(status)"
+        }
+    }
+
     public static func of(_ error: Error) -> String {
         if let coreError = error as? CoreError {
             switch coreError {
