@@ -49,6 +49,8 @@ public struct ChatScreen: View {
     private let onDraftChanged: (String) -> Void
     private let onSend: (String) -> Void
     private let onStop: () -> Void
+    private let onApprovalChoice: (_ requestId: String, _ choice: String) -> Void
+    private let onClarifyAnswer: (_ requestId: String, _ answer: String, _ questionId: String?) -> Void
 
     @State private var renameOpen = false
     @State private var rowCache = TranscriptRows()
@@ -65,7 +67,9 @@ public struct ChatScreen: View {
         onAddTab: @escaping () -> Void,
         onDraftChanged: @escaping (String) -> Void,
         onSend: @escaping (String) -> Void,
-        onStop: @escaping () -> Void
+        onStop: @escaping () -> Void,
+        onApprovalChoice: @escaping (_ requestId: String, _ choice: String) -> Void,
+        onClarifyAnswer: @escaping (_ requestId: String, _ answer: String, _ questionId: String?) -> Void
     ) {
         self.value = value
         self.onMenuTap = onMenuTap
@@ -78,6 +82,8 @@ public struct ChatScreen: View {
         self.onDraftChanged = onDraftChanged
         self.onSend = onSend
         self.onStop = onStop
+        self.onApprovalChoice = onApprovalChoice
+        self.onClarifyAnswer = onClarifyAnswer
     }
 
     public var body: some View {
@@ -100,8 +106,13 @@ public struct ChatScreen: View {
                     onAdd: onAddTab
                 )
                 ErrorBanner(text: value.errorText)
-                Transcript(rows: rows, running: value.session.running)
-                    .frame(maxHeight: .infinity)
+                Transcript(
+                    rows: rows,
+                    running: value.session.running,
+                    onApprovalChoice: onApprovalChoice,
+                    onClarifyAnswer: onClarifyAnswer
+                )
+                .frame(maxHeight: .infinity)
                 StatusStrip(state: value.session, rows: rows)
                 Composer(
                     model: value.model,
@@ -166,7 +177,9 @@ public struct ChatScreen: View {
         onAddTab: {},
         onDraftChanged: { _ in },
         onSend: { _ in },
-        onStop: {}
+        onStop: {},
+        onApprovalChoice: { _, _ in },
+        onClarifyAnswer: { _, _, _ in }
     )
     .hermoTheme(.light)
 }
@@ -197,7 +210,9 @@ public struct ChatScreen: View {
         onAddTab: {},
         onDraftChanged: { _ in },
         onSend: { _ in },
-        onStop: {}
+        onStop: {},
+        onApprovalChoice: { _, _ in },
+        onClarifyAnswer: { _, _, _ in }
     )
     .hermoTheme(.dark)
 }
