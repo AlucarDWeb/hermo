@@ -101,23 +101,40 @@ public struct Chevron: View {
     }
 }
 
-/// A 14 pt cell holding a 9 pt glyph, the tool/thinking row's leading marker column (TranscriptRow.kt's `ScaffoldGlyph`).
+/// A 14 pt cell holding a 9 pt marker, the tool/thinking row's leading marker column (TranscriptRow.kt's `ScaffoldGlyph`); no default, since some call sites pass a blank spacer while `ToolCard` supplies its own `"•"` fallback for an unmapped tool (TranscriptRow.kt:388).
 public struct ScaffoldGlyph: View {
-    private let glyph: String
+    private enum Marker {
+        case text(String)
+        case symbol(String)
+    }
+
+    private let marker: Marker
     private let tint: Color?
     @Environment(\.hermoTokens) private var tokens
 
-    public init(glyph: String = "", tint: Color? = nil) {
-        self.glyph = glyph
+    public init(glyph: String, tint: Color? = nil) {
+        self.marker = .text(glyph)
+        self.tint = tint
+    }
+
+    public init(symbol: String, tint: Color? = nil) {
+        self.marker = .symbol(symbol)
         self.tint = tint
     }
 
     public var body: some View {
-        Text(glyph)
-            // 14 pt cell / 9 pt text are TranscriptRow.kt:207/214 literals, not Theme.kt tokens.
-            .font(.system(size: 9, weight: .medium))
-            .foregroundStyle(tint ?? tokens.scaffoldMeta)
-            .frame(width: 14, alignment: .leading)
+        Group {
+            switch marker {
+            case .text(let glyph):
+                Text(glyph)
+            case .symbol(let name):
+                Image(systemName: name)
+            }
+        }
+        // 14 pt cell / 9 pt marker are TranscriptRow.kt:207/214 literals, not Theme.kt tokens.
+        .font(.system(size: 9, weight: .medium))
+        .foregroundStyle(tint ?? tokens.scaffoldMeta)
+        .frame(width: 14, alignment: .leading)
     }
 }
 
@@ -260,10 +277,16 @@ private struct ThemedChevronRow: View {
 #Preview("ScaffoldGlyph") {
     HStack(spacing: 16) {
         ThemedSwatch(.light) {
-            ScaffoldGlyph(glyph: "T")
+            HStack(spacing: 8) {
+                ScaffoldGlyph(glyph: "T")
+                ScaffoldGlyph(symbol: "terminal")
+            }
         }
         ThemedSwatch(.dark) {
-            ScaffoldGlyph(glyph: "T")
+            HStack(spacing: 8) {
+                ScaffoldGlyph(glyph: "T")
+                ScaffoldGlyph(symbol: "terminal")
+            }
         }
     }
 }
