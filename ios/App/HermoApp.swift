@@ -150,6 +150,12 @@ struct RootView: View {
             onStop: {
                 guard let key = store.currentKey else { return }
                 store.send(.chat(.interrupt(key: key)))
+            },
+            onApprovalChoice: { requestId, choice in
+                store.send(.chat(.respondApproval(key: store.currentKey, requestId: requestId, choice: choice)))
+            },
+            onClarifyAnswer: { requestId, answer, questionId in
+                store.send(.chat(.respondClarify(key: store.currentKey, requestId: requestId, answer: answer, questionId: questionId ?? "")))
             }
         )
     }
