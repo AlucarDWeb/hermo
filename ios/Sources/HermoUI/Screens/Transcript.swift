@@ -2,10 +2,11 @@ import SwiftUI
 import HermoLogic
 
 /// Transcript list with the empty-state copy and stick-to-bottom scrolling from `ChatScreen.kt`'s
-/// `TranscriptList`. T13 renders user and assistant rows as plain text only; T14 ports the real
-/// row views (bubbles, tool cards, thinking, approval, clarify, status, error) for every other kind.
+/// `TranscriptList`, dispatching each row to its view the way `TranscriptRow.kt`'s own `when`
+/// does. Approval and clarify rows are T15's cards; until then they render nothing here.
 public struct Transcript: View {
     private let rows: [ChatRow]
+    private let running: Bool
 
     @Environment(\.hermoTokens) private var tokens
     @State private var nearBottom = true
@@ -15,8 +16,12 @@ public struct Transcript: View {
     /// at the bottom.
     private static let stickToBottomSlack: CGFloat = 96
 
-    public init(rows: [ChatRow]) {
+    /// `running` defaults to false because Android reads it from one `LocalTurnRunning` composition
+    /// local shared by every thinking row in the transcript (`ChatScreen.kt:684`), not a per-row
+    /// flag; the caller passes the session's own running state once it wires this parameter through.
+    public init(rows: [ChatRow], running: Bool = false) {
         self.rows = rows
+        self.running = running
     }
 
     public var body: some View {
@@ -72,37 +77,71 @@ public struct Transcript: View {
     private func rowView(_ row: ChatRow) -> some View {
         switch row {
         case .user(_, let text):
-            Text(text)
-                .font(.system(size: HermoMetrics.convFontSize))
-                .foregroundStyle(tokens.text)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-                .accessibilityIdentifier("hermo.chat.transcript.userRow")
+            UserBubble(text: text)
         case .assistant(_, let text, _, _, _):
-            Text(text)
-                .font(.system(size: HermoMetrics.convFontSize))
-                .foregroundStyle(tokens.text)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityIdentifier("hermo.chat.transcript.assistantRow")
-        default:
+            AssistantMarkdown(text: text)
+        case .thinking(_, let text):
+            ThinkingRow(text: text, live: running)
+        case .tool(let id, let name, let complete, _, let argsJson, let resultJson, let inlineDiff, let durationS, let exitCode):
+            ToolCard(
+                id: id,
+                name: name,
+                complete: complete,
+                argsJson: argsJson,
+                resultJson: resultJson,
+                inlineDiff: inlineDiff,
+                durationS: durationS,
+                exitCode: exitCode
+            )
+        case .status(_, let kind, let text):
+            if !kind.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                StatusLine(label: kind.firstCharacterUppercased, detail: firstLine(text))
+            }
+        case .error(_, let message):
+            ErrorRow(message: message)
+        case .approval, .clarify:
+            // T15 renders these as cards; the transcript contributes nothing for them yet.
             EmptyView()
         }
     }
 }
 
+private extension String {
+    /// `Kotlin`'s `replaceFirstChar { it.uppercase() }`: only the first character changes case.
+    var firstCharacterUppercased: String {
+        guard let first else { return self }
+        return first.uppercased() + dropFirst()
+    }
+}
+
+private let previewRows: [ChatRow] = [
+    .user(id: 0, text: "Can you check the build and fix the failing test?"),
+    .thinking(id: 1, text: "Weighing a couple of approaches before picking one."),
+    .tool(
+        id: 2,
+        name: "execute_code",
+        complete: true,
+        context: "",
+        argsJson: "{\"command\":\"pytest -q\"}",
+        resultJson: "{\"exit_code\":0}",
+        inlineDiff: "",
+        durationS: 1.4,
+        exitCode: 0
+    ),
+    .assistant(id: 3, text: "Fixed it, the suite is green now.", streaming: false, warning: "", usageJson: ""),
+    .status(id: 4, kind: "compacting", text: "Trimming older turns to fit the context window"),
+    .error(id: 5, message: "Error: the gateway closed the connection"),
+]
+
 #Preview("Light") {
-    Transcript(rows: [
-        .user(id: 0, text: "Hi, can you check the build?"),
-        .assistant(id: 1, text: "Sure, give me a moment.", streaming: false, warning: "", usageJson: ""),
-    ])
-    .hermoTheme(.light)
+    Transcript(rows: previewRows, running: true)
+        .hermoTheme(.light)
 }
 
 #Preview("Dark") {
-    Transcript(rows: [
-        .user(id: 0, text: "Hi, can you check the build?"),
-        .assistant(id: 1, text: "Sure, give me a moment.", streaming: false, warning: "", usageJson: ""),
-    ])
-    .hermoTheme(.dark)
+    Transcript(rows: previewRows, running: true)
+        .hermoTheme(.dark)
 }
 
 #Preview("Empty") {

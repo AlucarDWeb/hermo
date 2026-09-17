@@ -100,7 +100,7 @@ public struct ChatScreen: View {
                     onAdd: onAddTab
                 )
                 ErrorBanner(text: value.errorText)
-                Transcript(rows: rows)
+                Transcript(rows: rows, running: value.session.running)
                     .frame(maxHeight: .infinity)
                 StatusStrip(state: value.session, rows: rows)
                 Composer(

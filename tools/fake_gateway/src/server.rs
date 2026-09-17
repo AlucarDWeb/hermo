@@ -634,6 +634,12 @@ async fn run_turn(
     } else {
         33
     };
+    // The core appends the user's own row only after `prompt.submit` returns (the server
+    // never emits one), so a turn that starts streaming instantly races it and the first
+    // assistant row lands above the prompt. A real gateway has network latency here. The
+    // pre-roll is capped so the slow fixture, whose frame gap is 20 s / frame count, still
+    // starts promptly and stays inside its 20 s budget.
+    tokio::time::sleep(Duration::from_millis(per_frame_ms.min(50))).await;
     for frame in &frames {
         let event_type = frame
             .get("params")
