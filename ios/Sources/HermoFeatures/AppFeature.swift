@@ -30,6 +30,9 @@ public struct AppFeature: Sendable {
         public var parkedChanges: [TranscriptChangeDto]
         public var inFlightOpens: Int
         public var chat: ChatFeature.State
+        public var sessionPicker: SessionPickerFeature.State
+        public var botDrawer: BotDrawerFeature.State
+        public var appearance: AppearanceFeature.State
 
         public init(
             phase: AppPhase = .unpaired,
@@ -43,7 +46,10 @@ public struct AppFeature: Sendable {
             pendingKeys: Set<String> = [],
             parkedChanges: [TranscriptChangeDto] = [],
             inFlightOpens: Int = 0,
-            chat: ChatFeature.State = ChatFeature.State()
+            chat: ChatFeature.State = ChatFeature.State(),
+            sessionPicker: SessionPickerFeature.State = SessionPickerFeature.State(),
+            botDrawer: BotDrawerFeature.State = BotDrawerFeature.State(),
+            appearance: AppearanceFeature.State = AppearanceFeature.State()
         ) {
             self.phase = phase
             self.endpointText = endpointText
@@ -57,6 +63,9 @@ public struct AppFeature: Sendable {
             self.parkedChanges = parkedChanges
             self.inFlightOpens = inFlightOpens
             self.chat = chat
+            self.sessionPicker = sessionPicker
+            self.botDrawer = botDrawer
+            self.appearance = appearance
         }
 
         /// Every phase change is routed through here so `lastReadyModel` (the T11 re-login overlay's fallback) tracks Ready the same way `AppViewModel`'s separate collector did.
@@ -117,11 +126,23 @@ public struct AppFeature: Sendable {
         case sessionTitleFailed(errorText: String)
 
         case chat(ChatFeature.Action)
+        case sessionPicker(SessionPickerFeature.Action)
+        case botDrawer(BotDrawerFeature.Action)
+        case appearance(AppearanceFeature.Action)
     }
 
     public var body: some ReducerOf<Self> {
         Scope(state: \.chat, action: \.chat) {
             ChatFeature()
+        }
+        Scope(state: \.sessionPicker, action: \.sessionPicker) {
+            SessionPickerFeature()
+        }
+        Scope(state: \.botDrawer, action: \.botDrawer) {
+            BotDrawerFeature()
+        }
+        Scope(state: \.appearance, action: \.appearance) {
+            AppearanceFeature()
         }
         Reduce { state, action in
             switch action {
@@ -310,6 +331,10 @@ public struct AppFeature: Sendable {
                 state.endpointText = ""
                 state.pairingPayload = ""
                 Self.clearSessionState(&state)
+                // The drawer keeps `.ready` rows across a reopen, so without this the next
+                // gateway's drawer shows the forgotten one's profiles until its load lands.
+                state.botDrawer = BotDrawerFeature.State()
+                state.sessionPicker = SessionPickerFeature.State()
                 state.setPhase(.unpaired)
                 return .none
 
@@ -468,13 +493,38 @@ public struct AppFeature: Sendable {
                 switch delegate {
                 case let .reportError(text):
                     state.errorText = text
+                    return .none
                 case .openSessionPicker:
-                    // The picker sheet arrives in T17.
-                    break
+                    return .send(.sessionPicker(.open(hasEndpoint: !state.endpointText.isEmpty)))
                 }
-                return .none
 
             case .chat:
+                return .none
+
+            case .sessionPicker(.delegate(let delegate)):
+                state.sessionPicker.isPresented = false
+                switch delegate {
+                case let .rowTapped(storedId):
+                    return .send(.openExistingSession(storedId: storedId))
+                case .newChatTapped:
+                    return .send(.openNewSession)
+                }
+
+            case .sessionPicker:
+                return .none
+
+            case .botDrawer(.delegate(let delegate)):
+                switch delegate {
+                case let .openProfile(profile):
+                    return Self.openBotChatFromDrawer(
+                        profile: profile, state: &state, gatewayClient: gatewayClient, screenCols: screenCols
+                    )
+                }
+
+            case .botDrawer:
+                return .none
+
+            case .appearance:
                 return .none
             }
         }
@@ -571,6 +621,32 @@ public struct AppFeature: Sendable {
         guard let current = next.current else { return .none }
         state.currentKey = current
         return Self.sessionReadyEffect(key: current, gatewayClient: gatewayClient)
+    }
+
+    /// The drawer's counterpart to the plain `openBotChat` action: same open-or-switch logic, plus
+    /// `botChatOpened` / `botChatOpenFailed` back to the drawer on every path so `botOpenInFlight`
+    /// always clears, the way the Kotlin `finally` does.
+    private static func openBotChatFromDrawer(
+        profile: String, state: inout State, gatewayClient: GatewayClient, screenCols: ScreenCols
+    ) -> Effect<Action> {
+        if let openKey = openTabForProfile(sessions: state.sessions, order: state.tabs.keys, profile: profile) {
+            return .merge(
+                Self.performSwitchTab(key: openKey, state: &state, gatewayClient: gatewayClient),
+                .send(.botDrawer(.botChatOpened))
+            )
+        }
+        state.inFlightOpens += 1
+        return .run { [gatewayClient, screenCols] send in
+            let cols = await screenCols.columns()
+            do {
+                let key = try await gatewayClient.openBotChat(profile: profile, cols: Int64(cols))
+                await send(.botChatOpened(key: key, profile: profile))
+                await send(.botDrawer(.botChatOpened))
+            } catch {
+                await send(.sessionOpenFailed(errorText: ErrorMessages.of(error)))
+                await send(.botDrawer(.botChatOpenFailed))
+            }
+        }
     }
 
     private static func sessionReadyEffect(key: String, gatewayClient: GatewayClient) -> Effect<Action> {

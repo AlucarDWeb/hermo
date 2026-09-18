@@ -390,7 +390,7 @@ fn handle_session_create(
     let order = state.next_order.fetch_add(1, Ordering::SeqCst);
     state.sessions.lock().insert(
         session_id.clone(),
-        SessionRecord::new(session_id.clone(), title, now_marker(), order),
+        SessionRecord::new(session_id.clone(), title.clone(), now_marker(), order),
     );
     reply_ok(
         out,
@@ -402,6 +402,34 @@ fn handle_session_create(
             "info": {"profile_name": profile},
         }),
     );
+    // The client's registry learns a title only from an event, never from the create it
+    // sent: without this a Bot Chat stays labelled "New session".
+    if title.is_empty() {
+        return;
+    }
+    let payload = json!({"session_id": session_id, "title": title});
+    let Some(seq) = state.next_seq_and_record(&session_id, "session.title", &payload) else {
+        return;
+    };
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": "session.title",
+            "session_id": session_id,
+            "payload": payload,
+            "seq": seq,
+        }
+    })
+    .to_string();
+    // The core indexes the new live sid only after `session.create` returns, and drops any
+    // event whose sid it cannot resolve, so a frame sent back to back with the reply can
+    // lose the race and leave the tab on "New session". Same pre-roll as a turn's frames.
+    let out = out.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = out.send(frame);
+    });
 }
 
 fn handle_session_list(

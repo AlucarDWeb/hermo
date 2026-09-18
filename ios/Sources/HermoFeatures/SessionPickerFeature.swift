@@ -31,6 +31,12 @@ public struct SessionPickerFeature: Sendable {
         case dismiss
         case sessionsLoaded([RemoteSessionRow])
         case loadFailed
+        case delegate(Delegate)
+
+        public enum Delegate: Equatable, Sendable {
+            case rowTapped(storedId: String)
+            case newChatTapped
+        }
     }
 
     public var body: some ReducerOf<Self> {
@@ -63,6 +69,9 @@ public struct SessionPickerFeature: Sendable {
                 // A failed reload drops the previous rows: with no error copy on the sheet,
                 // leaving them up reads as a successful load and offers stale ids to resume.
                 state.sessions = []
+                return .none
+
+            case .delegate:
                 return .none
             }
         }

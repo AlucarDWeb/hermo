@@ -498,4 +498,124 @@ final class AppFeatureTests: XCTestCase {
             $0.errorText = "Not connected to the gateway yet."
         }
     }
+
+    // MARK: 15. A picker row tap opens that session and dismisses the sheet
+
+    func testSessionPickerRowTappedOpensThatSessionAndDismisses() async {
+        let store = TestStore(
+            initialState: AppFeature.State(sessionPicker: SessionPickerFeature.State(isPresented: true))
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.openSession = { _, _ in "s1" }
+            $0.gatewayClient.openSessions = { [] }
+        }
+
+        await store.send(.sessionPicker(.delegate(.rowTapped(storedId: "s1")))) {
+            $0.sessionPicker.isPresented = false
+        }
+        await store.receive(.openExistingSession(storedId: "s1")) {
+            $0.inFlightOpens = 1
+        }
+        await store.receive(.existingSessionOpened(key: "s1")) {
+            $0.sessions = ["s1": SessionUiState(key: "s1")]
+            $0.tabs = TabSet(keys: ["s1"], current: "s1")
+            $0.currentKey = "s1"
+            $0.inFlightOpens = 0
+        }
+        await store.receive(.sessionReady(key: "s1", summary: nil)) {
+            $0.phase = .ready(model: "")
+        }
+    }
+
+    // MARK: 16. A failed drawer profile open clears botOpenInFlight so a second tap is accepted
+
+    func testDrawerProfileOpenFailureClearsBotOpenInFlightForASecondTap() async {
+        let store = TestStore(
+            initialState: AppFeature.State(botDrawer: BotDrawerFeature.State(botOpenInFlight: true))
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.openBotChat = { _, _ in throw CoreError.NotConnected }
+        }
+
+        await store.send(.botDrawer(.delegate(.openProfile("echo")))) {
+            $0.inFlightOpens = 1
+        }
+        await store.receive(.sessionOpenFailed(errorText: "Not connected to the gateway yet.")) {
+            $0.errorText = "Not connected to the gateway yet."
+            $0.inFlightOpens = 0
+        }
+        await store.receive(.botDrawer(.botChatOpenFailed)) {
+            $0.botDrawer.botOpenInFlight = false
+        }
+
+        // The flag is clear, so a second tap is accepted rather than dropped.
+        await store.send(.botDrawer(.profileTapped(profile: "echo"))) {
+            $0.botDrawer.botOpenInFlight = true
+        }
+        await store.receive(.botDrawer(.delegate(.openProfile("echo")))) {
+            $0.inFlightOpens = 1
+        }
+        await store.receive(.sessionOpenFailed(errorText: "Not connected to the gateway yet.")) {
+            $0.errorText = "Not connected to the gateway yet."
+            $0.inFlightOpens = 0
+        }
+        await store.receive(.botDrawer(.botChatOpenFailed)) {
+            $0.botDrawer.botOpenInFlight = false
+        }
+    }
+
+    // MARK: 18. Forgetting the gateway drops the drawer rows the next one would inherit
+
+    func testForgetGatewayClearsTheDrawerAndPickerRows() async {
+        let rows = [botDrawerRow(name: "echo", model: "m", description: "")]
+        let store = TestStore(
+            initialState: AppFeature.State(
+                phase: .ready(model: "gpt-4"),
+                endpointText: testDisplayText,
+                sessionPicker: SessionPickerFeature.State(
+                    sessions: [RemoteSessionRow(id: "s1", title: "Old", preview: "", messageCount: 1)]
+                ),
+                botDrawer: BotDrawerFeature.State(drawerState: .ready(rows), isOpen: true)
+            )
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.forgetGateway = {}
+        }
+
+        await store.send(.forgetGateway)
+        await store.receive(.forgotGateway) {
+            $0.endpointText = ""
+            $0.phase = .unpaired
+            $0.sessionPicker = SessionPickerFeature.State()
+            $0.botDrawer = BotDrawerFeature.State()
+        }
+    }
+
+    // MARK: 17. The chat's openSessionPicker delegate opens the picker
+
+    func testChatOpenSessionPickerDelegateOpensThePicker() async {
+        let store = TestStore(
+            initialState: AppFeature.State(endpointText: testDisplayText)
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.listRemoteSessions = { [] }
+        }
+
+        await store.send(.chat(.delegate(.openSessionPicker)))
+        await store.receive(.sessionPicker(.open(hasEndpoint: true))) {
+            $0.sessionPicker.isPresented = true
+            $0.sessionPicker.isLoading = true
+        }
+        await store.receive(.sessionPicker(.sessionsLoaded([]))) {
+            $0.sessionPicker.isLoading = false
+        }
+    }
 }
