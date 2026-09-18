@@ -134,7 +134,10 @@ struct RootView: View {
             currentKey: store.currentKey,
             errorText: store.errorText,
             session: session,
-            draft: store.chat.draft
+            draft: store.chat.draft,
+            slashCompletions: store.chat.slashCompletions,
+            slashReplaceFrom: store.chat.slashReplaceFrom,
+            slashBanner: store.chat.slashBanner
         )
         return ChatScreen(
             value: value,
@@ -146,6 +149,7 @@ struct RootView: View {
             onCloseTab: { store.send(.closeTab(key: $0)) },
             onAddTab: { store.send(.openNewSession) },
             onDraftChanged: { store.send(.chat(.draftChanged($0))) },
+            onDismissCompletions: { store.send(.chat(.dismissCompletions)) },
             onSend: { _ in store.send(.chat(.send(key: store.currentKey))) },
             onStop: {
                 guard let key = store.currentKey else { return }

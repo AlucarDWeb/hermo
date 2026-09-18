@@ -1,11 +1,11 @@
 import HermoLogic
 import SwiftUI
 
-/// The assembled chat screen: titlebar, tab strip, error banner, transcript, status strip and
-/// composer, in the order `ChatScreen.kt`'s `Column` renders them. The bot drawer, appearance
-/// sheet, session picker and slash UI are later tasks, so this screen exposes only the surfaces
-/// T13 builds; the rename dialog is the one overlay it owns outright, since its state (open or
-/// closed) is chrome, not app state.
+/// The assembled chat screen: titlebar, tab strip, error banner, transcript, status strip, slash
+/// completions and banner, and composer, in the order `ChatScreen.kt`'s `Column` renders them.
+/// The bot drawer, appearance sheet and session picker are later tasks, so this screen exposes
+/// only the surfaces built so far; the rename dialog is the one overlay it owns outright, since
+/// its state (open or closed) is chrome, not app state.
 public struct ChatScreen: View {
     public struct Value: Equatable, Sendable {
         public var themeMode: ThemeMode
@@ -16,6 +16,9 @@ public struct ChatScreen: View {
         public var session: SessionUiState
         public var draft: String
         public var prefill: String?
+        public var slashCompletions: [SlashCompletionRow]
+        public var slashReplaceFrom: Int64
+        public var slashBanner: String
 
         public init(
             themeMode: ThemeMode,
@@ -25,7 +28,10 @@ public struct ChatScreen: View {
             errorText: String,
             session: SessionUiState,
             draft: String,
-            prefill: String? = nil
+            prefill: String? = nil,
+            slashCompletions: [SlashCompletionRow] = [],
+            slashReplaceFrom: Int64 = 1,
+            slashBanner: String = ""
         ) {
             self.themeMode = themeMode
             self.model = model
@@ -35,6 +41,9 @@ public struct ChatScreen: View {
             self.session = session
             self.draft = draft
             self.prefill = prefill
+            self.slashCompletions = slashCompletions
+            self.slashReplaceFrom = slashReplaceFrom
+            self.slashBanner = slashBanner
         }
     }
 
@@ -47,6 +56,7 @@ public struct ChatScreen: View {
     private let onCloseTab: (String) -> Void
     private let onAddTab: () -> Void
     private let onDraftChanged: (String) -> Void
+    private let onDismissCompletions: () -> Void
     private let onSend: (String) -> Void
     private let onStop: () -> Void
     private let onApprovalChoice: (_ requestId: String, _ choice: String) -> Void
@@ -66,6 +76,7 @@ public struct ChatScreen: View {
         onCloseTab: @escaping (String) -> Void,
         onAddTab: @escaping () -> Void,
         onDraftChanged: @escaping (String) -> Void,
+        onDismissCompletions: @escaping () -> Void,
         onSend: @escaping (String) -> Void,
         onStop: @escaping () -> Void,
         onApprovalChoice: @escaping (_ requestId: String, _ choice: String) -> Void,
@@ -80,6 +91,7 @@ public struct ChatScreen: View {
         self.onCloseTab = onCloseTab
         self.onAddTab = onAddTab
         self.onDraftChanged = onDraftChanged
+        self.onDismissCompletions = onDismissCompletions
         self.onSend = onSend
         self.onStop = onStop
         self.onApprovalChoice = onApprovalChoice
@@ -114,6 +126,12 @@ public struct ChatScreen: View {
                 )
                 .frame(maxHeight: .infinity)
                 StatusStrip(state: value.session, rows: rows)
+                SlashCompletionsPopup(completions: value.slashCompletions) { item in
+                    let next = SlashPolicy.insertCompletion(value.draft, item.text, value.slashReplaceFrom)
+                    onDismissCompletions()
+                    onDraftChanged(next)
+                }
+                SlashBanner(text: value.slashBanner)
                 Composer(
                     model: value.model,
                     running: value.session.running,
@@ -176,6 +194,7 @@ public struct ChatScreen: View {
         onCloseTab: { _ in },
         onAddTab: {},
         onDraftChanged: { _ in },
+        onDismissCompletions: {},
         onSend: { _ in },
         onStop: {},
         onApprovalChoice: { _, _ in },
@@ -209,6 +228,7 @@ public struct ChatScreen: View {
         onCloseTab: { _ in },
         onAddTab: {},
         onDraftChanged: { _ in },
+        onDismissCompletions: {},
         onSend: { _ in },
         onStop: {},
         onApprovalChoice: { _, _ in },
