@@ -12,9 +12,8 @@ struct HermoApp: App {
 
     var body: some Scene {
         WindowGroup {
-            // Fixed until AppearanceFeature is composed into AppFeature (T17).
             RootView(store: Self.store)
-                .hermoTheme(.system)
+                .hermoTheme(Self.store.appearance.mode)
         }
     }
 }
@@ -94,6 +93,7 @@ struct RootView: View {
         .task {
             store.send(.tryResume)
             store.send(.task)
+            store.send(.appearance(.task))
         }
         .onOpenURL { url in
             guard url.scheme == "hermes" else { return }
@@ -116,8 +116,7 @@ struct RootView: View {
     }
 
     /// Builds the chat screen's display value from `AppFeature.State` and wires its closures to
-    /// the actions that exist today. The bot drawer and appearance sheet have no reducer
-    /// composed into `AppFeature` yet (T17), so their taps are no-ops until then.
+    /// the actions that exist today.
     private func chatScreen(model: String) -> ChatScreen {
         let tabs = store.tabs.keys.map { key in
             SessionTabStrip.Tab(
@@ -128,7 +127,7 @@ struct RootView: View {
         }
         let session = store.currentKey.flatMap { store.sessions[$0] } ?? SessionUiState(key: "")
         let value = ChatScreen.Value(
-            themeMode: .system,
+            themeMode: store.appearance.mode,
             model: model,
             tabs: tabs,
             currentKey: store.currentKey,
@@ -137,13 +136,17 @@ struct RootView: View {
             draft: store.chat.draft,
             slashCompletions: store.chat.slashCompletions,
             slashReplaceFrom: store.chat.slashReplaceFrom,
-            slashBanner: store.chat.slashBanner
+            slashBanner: store.chat.slashBanner,
+            sessionPickerPresented: store.sessionPicker.isPresented,
+            sessionPickerLoading: store.sessionPicker.isLoading,
+            sessionPickerSessions: store.sessionPicker.sessions,
+            botDrawerState: store.botDrawer.drawerState,
+            botDrawerOpen: store.botDrawer.isOpen
         )
         return ChatScreen(
             value: value,
-            onMenuTap: {},
+            onMenuTap: { store.send(.botDrawer(.drawerOpened)) },
             onTitleTap: { store.send(.chat(.delegate(.openSessionPicker))) },
-            onAppearanceTap: {},
             onRename: { store.send(.setSessionTitle(title: $0)) },
             onSelectTab: { store.send(.switchTab(key: $0)) },
             onCloseTab: { store.send(.closeTab(key: $0)) },
@@ -160,7 +163,15 @@ struct RootView: View {
             },
             onClarifyAnswer: { requestId, answer, questionId in
                 store.send(.chat(.respondClarify(key: store.currentKey, requestId: requestId, answer: answer, questionId: questionId ?? "")))
-            }
+            },
+            onSessionPickerRowTap: { store.send(.sessionPicker(.delegate(.rowTapped(storedId: $0)))) },
+            onSessionPickerNewChat: { store.send(.sessionPicker(.delegate(.newChatTapped))) },
+            onSessionPickerDismiss: { store.send(.sessionPicker(.dismiss)) },
+            onBotDrawerProfileTap: { store.send(.botDrawer(.profileTapped(profile: $0))) },
+            onBotDrawerRetry: { store.send(.botDrawer(.retryTapped)) },
+            onBotDrawerDismiss: { store.send(.botDrawer(.dismissed)) },
+            onBotDrawerLogout: { store.send(.forgetGateway) },
+            onAppearanceModeChange: { store.send(.appearance(.modeSelected($0))) }
         )
     }
 }

@@ -3,9 +3,9 @@ import SwiftUI
 
 /// The assembled chat screen: titlebar, tab strip, error banner, transcript, status strip, slash
 /// completions and banner, and composer, in the order `ChatScreen.kt`'s `Column` renders them.
-/// The bot drawer, appearance sheet and session picker are later tasks, so this screen exposes
-/// only the surfaces built so far; the rename dialog is the one overlay it owns outright, since
-/// its state (open or closed) is chrome, not app state.
+/// It also owns every overlay the titlebar opens: the rename dialog, the bot drawer and the
+/// appearance sheet are chrome-only state kept locally, while the session picker's presented
+/// flag comes from `SessionPickerFeature.State` since a reducer already tracks it.
 public struct ChatScreen: View {
     public struct Value: Equatable, Sendable {
         public var themeMode: ThemeMode
@@ -19,6 +19,11 @@ public struct ChatScreen: View {
         public var slashCompletions: [SlashCompletionRow]
         public var slashReplaceFrom: Int64
         public var slashBanner: String
+        public var sessionPickerPresented: Bool
+        public var sessionPickerLoading: Bool
+        public var sessionPickerSessions: [RemoteSessionRow]
+        public var botDrawerState: DrawerUiState
+        public var botDrawerOpen: Bool
 
         public init(
             themeMode: ThemeMode,
@@ -31,7 +36,12 @@ public struct ChatScreen: View {
             prefill: String? = nil,
             slashCompletions: [SlashCompletionRow] = [],
             slashReplaceFrom: Int64 = 1,
-            slashBanner: String = ""
+            slashBanner: String = "",
+            sessionPickerPresented: Bool = false,
+            sessionPickerLoading: Bool = false,
+            sessionPickerSessions: [RemoteSessionRow] = [],
+            botDrawerState: DrawerUiState = .loading,
+            botDrawerOpen: Bool = false
         ) {
             self.themeMode = themeMode
             self.model = model
@@ -44,13 +54,17 @@ public struct ChatScreen: View {
             self.slashCompletions = slashCompletions
             self.slashReplaceFrom = slashReplaceFrom
             self.slashBanner = slashBanner
+            self.sessionPickerPresented = sessionPickerPresented
+            self.sessionPickerLoading = sessionPickerLoading
+            self.sessionPickerSessions = sessionPickerSessions
+            self.botDrawerState = botDrawerState
+            self.botDrawerOpen = botDrawerOpen
         }
     }
 
     private let value: Value
     private let onMenuTap: () -> Void
     private let onTitleTap: () -> Void
-    private let onAppearanceTap: () -> Void
     private let onRename: (String) -> Void
     private let onSelectTab: (String) -> Void
     private let onCloseTab: (String) -> Void
@@ -61,8 +75,17 @@ public struct ChatScreen: View {
     private let onStop: () -> Void
     private let onApprovalChoice: (_ requestId: String, _ choice: String) -> Void
     private let onClarifyAnswer: (_ requestId: String, _ answer: String, _ questionId: String?) -> Void
+    private let onSessionPickerRowTap: (String) -> Void
+    private let onSessionPickerNewChat: () -> Void
+    private let onSessionPickerDismiss: () -> Void
+    private let onBotDrawerProfileTap: (String) -> Void
+    private let onBotDrawerRetry: () -> Void
+    private let onBotDrawerLogout: () -> Void
+    private let onBotDrawerDismiss: () -> Void
+    private let onAppearanceModeChange: (ThemeMode) -> Void
 
     @State private var renameOpen = false
+    @State private var appearanceSheetOpen = false
     @State private var rowCache = TranscriptRows()
     @Environment(\.hermoTokens) private var tokens
 
@@ -70,7 +93,6 @@ public struct ChatScreen: View {
         value: Value,
         onMenuTap: @escaping () -> Void,
         onTitleTap: @escaping () -> Void,
-        onAppearanceTap: @escaping () -> Void,
         onRename: @escaping (String) -> Void,
         onSelectTab: @escaping (String) -> Void,
         onCloseTab: @escaping (String) -> Void,
@@ -80,12 +102,19 @@ public struct ChatScreen: View {
         onSend: @escaping (String) -> Void,
         onStop: @escaping () -> Void,
         onApprovalChoice: @escaping (_ requestId: String, _ choice: String) -> Void,
-        onClarifyAnswer: @escaping (_ requestId: String, _ answer: String, _ questionId: String?) -> Void
+        onClarifyAnswer: @escaping (_ requestId: String, _ answer: String, _ questionId: String?) -> Void,
+        onSessionPickerRowTap: @escaping (String) -> Void,
+        onSessionPickerNewChat: @escaping () -> Void,
+        onSessionPickerDismiss: @escaping () -> Void,
+        onBotDrawerProfileTap: @escaping (String) -> Void,
+        onBotDrawerRetry: @escaping () -> Void,
+        onBotDrawerDismiss: @escaping () -> Void,
+        onBotDrawerLogout: @escaping () -> Void,
+        onAppearanceModeChange: @escaping (ThemeMode) -> Void
     ) {
         self.value = value
         self.onMenuTap = onMenuTap
         self.onTitleTap = onTitleTap
-        self.onAppearanceTap = onAppearanceTap
         self.onRename = onRename
         self.onSelectTab = onSelectTab
         self.onCloseTab = onCloseTab
@@ -96,6 +125,14 @@ public struct ChatScreen: View {
         self.onStop = onStop
         self.onApprovalChoice = onApprovalChoice
         self.onClarifyAnswer = onClarifyAnswer
+        self.onSessionPickerRowTap = onSessionPickerRowTap
+        self.onSessionPickerNewChat = onSessionPickerNewChat
+        self.onSessionPickerDismiss = onSessionPickerDismiss
+        self.onBotDrawerProfileTap = onBotDrawerProfileTap
+        self.onBotDrawerRetry = onBotDrawerRetry
+        self.onBotDrawerDismiss = onBotDrawerDismiss
+        self.onBotDrawerLogout = onBotDrawerLogout
+        self.onAppearanceModeChange = onAppearanceModeChange
     }
 
     public var body: some View {
@@ -108,7 +145,7 @@ public struct ChatScreen: View {
                     onMenuTap: onMenuTap,
                     onEditTitleTap: { renameOpen = true },
                     onTitleTap: onTitleTap,
-                    onAppearanceTap: onAppearanceTap
+                    onAppearanceTap: { appearanceSheetOpen = true }
                 )
                 SessionTabStrip(
                     tabs: value.tabs,
@@ -161,8 +198,41 @@ public struct ChatScreen: View {
                     onDismiss: { renameOpen = false }
                 )
             }
+
+            BotDrawer(
+                isOpen: value.botDrawerOpen,
+                state: value.botDrawerState,
+                onProfileTap: { row in onBotDrawerProfileTap(row.profile) },
+                onRetry: onBotDrawerRetry,
+                onDismiss: onBotDrawerDismiss,
+                onLogout: onBotDrawerLogout
+            )
         }
         .onChange(of: value.session.key) { _, _ in renameOpen = false }
+        .sheet(
+            isPresented: Binding(
+                get: { value.sessionPickerPresented },
+                set: { isPresented in
+                    if !isPresented { onSessionPickerDismiss() }
+                }
+            )
+        ) {
+            SessionPickerSheet(
+                sessions: value.sessionPickerSessions,
+                loading: value.sessionPickerLoading,
+                onResume: onSessionPickerRowTap,
+                onNewChat: onSessionPickerNewChat
+            )
+        }
+        .sheet(isPresented: $appearanceSheetOpen) {
+            AppearanceSheet(
+                mode: value.themeMode,
+                onModeChange: { mode in
+                    appearanceSheetOpen = false
+                    onAppearanceModeChange(mode)
+                }
+            )
+        }
     }
 }
 
@@ -188,7 +258,6 @@ public struct ChatScreen: View {
         ),
         onMenuTap: {},
         onTitleTap: {},
-        onAppearanceTap: {},
         onRename: { _ in },
         onSelectTab: { _ in },
         onCloseTab: { _ in },
@@ -198,7 +267,15 @@ public struct ChatScreen: View {
         onSend: { _ in },
         onStop: {},
         onApprovalChoice: { _, _ in },
-        onClarifyAnswer: { _, _, _ in }
+        onClarifyAnswer: { _, _, _ in },
+        onSessionPickerRowTap: { _ in },
+        onSessionPickerNewChat: {},
+        onSessionPickerDismiss: {},
+        onBotDrawerProfileTap: { _ in },
+        onBotDrawerRetry: {},
+        onBotDrawerDismiss: {},
+        onBotDrawerLogout: {},
+        onAppearanceModeChange: { _ in }
     )
     .hermoTheme(.light)
 }
@@ -222,7 +299,6 @@ public struct ChatScreen: View {
         ),
         onMenuTap: {},
         onTitleTap: {},
-        onAppearanceTap: {},
         onRename: { _ in },
         onSelectTab: { _ in },
         onCloseTab: { _ in },
@@ -232,7 +308,15 @@ public struct ChatScreen: View {
         onSend: { _ in },
         onStop: {},
         onApprovalChoice: { _, _ in },
-        onClarifyAnswer: { _, _, _ in }
+        onClarifyAnswer: { _, _, _ in },
+        onSessionPickerRowTap: { _ in },
+        onSessionPickerNewChat: {},
+        onSessionPickerDismiss: {},
+        onBotDrawerProfileTap: { _ in },
+        onBotDrawerRetry: {},
+        onBotDrawerDismiss: {},
+        onBotDrawerLogout: {},
+        onAppearanceModeChange: { _ in }
     )
     .hermoTheme(.dark)
 }
