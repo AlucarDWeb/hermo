@@ -189,6 +189,46 @@ final class AppFeatureTests: XCTestCase {
         await store.send(.networkAvailable)
     }
 
+    func testNetworkMonitorYieldWhileOfflineRetriesResume() async {
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let store = TestStore(
+            initialState: AppFeature.State(phase: .offline(reason: "error: no session could be resumed"))
+        ) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.events = { AsyncStream { $0.finish() } }
+            $0.networkMonitor.events = { stream }
+            $0.gatewayClient.savedEndpoint = { nil }
+        }
+
+        await store.send(.task)
+        continuation.yield()
+        await store.receive(.networkAvailable)
+        await store.receive(.tryResume)
+
+        continuation.finish()
+        await store.finish()
+    }
+
+    func testNetworkMonitorYieldWhileReadyDoesNothing() async {
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let store = TestStore(initialState: AppFeature.State(phase: .ready(model: "gpt-4"))) {
+            AppFeature()
+        } withDependencies: {
+            $0.screenCols = ScreenCols(columns: { 80 })
+            $0.gatewayClient.events = { AsyncStream { $0.finish() } }
+            $0.networkMonitor.events = { stream }
+        }
+
+        await store.send(.task)
+        continuation.yield()
+        await store.receive(.networkAvailable)
+
+        continuation.finish()
+        await store.finish()
+    }
+
     func testCameraPermissionDeniedSetsErrorText() async {
         let store = TestStore(initialState: AppFeature.State()) {
             AppFeature()

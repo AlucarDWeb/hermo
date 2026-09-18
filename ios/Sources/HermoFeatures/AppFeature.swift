@@ -8,12 +8,14 @@ import HermoLogic
 public struct AppFeature: Sendable {
     @Dependency(\.gatewayClient) var gatewayClient
     @Dependency(\.screenCols) var screenCols
+    @Dependency(\.networkMonitor) var networkMonitor
 
     public init() {}
 
     private enum CancelID: Hashable {
         case events
         case connect
+        case network
     }
 
     @ObservableState
@@ -147,12 +149,20 @@ public struct AppFeature: Sendable {
         Reduce { state, action in
             switch action {
             case .task:
-                return .run { [gatewayClient] send in
-                    for await event in gatewayClient.events() {
-                        await send(.core(event))
+                return .merge(
+                    .run { [gatewayClient] send in
+                        for await event in gatewayClient.events() {
+                            await send(.core(event))
+                        }
                     }
-                }
-                .cancellable(id: CancelID.events, cancelInFlight: true)
+                    .cancellable(id: CancelID.events, cancelInFlight: true),
+                    .run { [networkMonitor] send in
+                        for await _ in networkMonitor.events() {
+                            await send(.networkAvailable)
+                        }
+                    }
+                    .cancellable(id: CancelID.network, cancelInFlight: true)
+                )
 
             case .tryResume:
                 return .run { [gatewayClient, screenCols] send in

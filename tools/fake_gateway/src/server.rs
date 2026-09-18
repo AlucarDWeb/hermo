@@ -200,6 +200,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<GatewayState>) {
         }
     };
     if is_websocket_upgrade(&head) {
+        eprintln!("fake gateway: websocket upgrade requested");
         accept_ws(stream, state).await;
     } else if let Err(e) = serve_http(stream, &state).await {
         eprintln!("fake gateway: http request failed: {e}");
@@ -284,6 +285,7 @@ async fn serve_ws(ws: WebSocketStream<TcpStream>, state: Arc<GatewayState>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let mut sent: usize = 0;
 
+    eprintln!("fake gateway: websocket accepted, sending gateway.ready");
     let ready_frame = json!({
         "jsonrpc": "2.0",
         "method": "event",
@@ -334,6 +336,9 @@ fn handle_rpc_line(line: &str, state: &Arc<GatewayState>, out: &mpsc::UnboundedS
     };
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    if method != "gateway.ping" {
+        eprintln!("fake gateway: ws {method}");
+    }
     let params = value.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
@@ -349,6 +354,9 @@ fn handle_rpc_line(line: &str, state: &Arc<GatewayState>, out: &mpsc::UnboundedS
         "slash.exec" => handle_slash_exec(out, id, &params),
         "command.dispatch" => handle_command_dispatch(out, id, &params),
         "complete.slash" => reply_ok(out, id, slash_completions()),
+        // The core asks for this on every (re)connect to re-emit unresolved cards. It
+        // only warns on an error, so without this arm the cards silently never come back.
+        "approval.pending" => reply_ok(out, id, json!({"pending": []})),
         "approval.respond" => reply_ok(out, id, json!({"ok": true})),
         "clarify.respond" => reply_ok(out, id, json!({"status": "ok", "remaining": []})),
         _ => reply_err(out, id, -32601, "method not found"),
@@ -778,6 +786,9 @@ fn route_http(
 ) -> (u16, Value, Vec<String>) {
     let has_session_cookie =
         cookie_header.contains("hermes_session_at") || cookie_header.contains("hermes_session_rt");
+    // Diagnosing a client that will not reconnect means knowing whether it reached us at all;
+    // logging only failures makes silence ambiguous.
+    eprintln!("fake gateway: {method} {path} (cookie: {has_session_cookie})");
 
     match (method, path) {
         ("GET", "/api/status") => (

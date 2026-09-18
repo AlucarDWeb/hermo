@@ -10,10 +10,17 @@ struct HermoApp: App {
         AppFeature()
     }
 
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some Scene {
         WindowGroup {
             RootView(store: Self.store)
                 .hermoTheme(Self.store.appearance.mode)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Self.store.send(.appDidForeground)
+            }
         }
     }
 }
