@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"event","params":{"type":"clarify.request","session_id":"SYNTH","seq":200,"payload":{"request_id":"clarify-synth-1","questions":[{"qid":"q0","question":"Quale colore preferisci, blu o verde?","choices":["Blu","Verde"],"multi_select":false}]}}}

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +28,10 @@ pub struct Config {
     pub password: String,
     pub fixture: PathBuf,
     pub synthetic: Option<PathBuf>,
+    pub clarify: Option<PathBuf>,
+    /// Fail this many `/api/profiles` requests before answering normally, so the
+    /// drawer's failed state and its Retry can both be driven in one run.
+    pub fail_profiles: usize,
     pub drop_after: Option<usize>,
 }
 
@@ -48,7 +52,11 @@ pub async fn start(config: Config) -> std::io::Result<Running> {
     let listener = TcpListener::bind(("127.0.0.1", config.port)).await?;
     let addr = listener.local_addr()?;
     let loaded = match &config.synthetic {
-        Some(synthetic) => super::fixtures::Fixtures::load_with_synthetic(&config.fixture, synthetic),
+        Some(synthetic) => super::fixtures::Fixtures::load_with_synthetic(
+            &config.fixture,
+            synthetic,
+            config.clarify.as_deref(),
+        ),
         None => super::fixtures::Fixtures::load(&config.fixture),
     }?;
     let base_url = format!("http://{addr}");
@@ -116,11 +124,15 @@ struct GatewayState {
     next_order: AtomicI64,
     tickets: Mutex<HashMap<String, bool>>,
     next_ticket: AtomicU64,
+    profile_failures_left: AtomicU64,
+    drop_armed: AtomicBool,
 }
 
 impl GatewayState {
     fn new(config: Config, fixtures: super::fixtures::Fixtures) -> Self {
         Self {
+            drop_armed: AtomicBool::new(config.drop_after.is_some()),
+            profile_failures_left: AtomicU64::new(config.fail_profiles as u64),
             config,
             fixtures,
             sessions: Mutex::new(HashMap::new()),
@@ -129,6 +141,26 @@ impl GatewayState {
             tickets: Mutex::new(HashMap::new()),
             next_ticket: AtomicU64::new(1),
         }
+    }
+
+    /// The drop fires once for the whole process: re-arming it on every
+    /// connection means the reconnect ladder drops again and the app never
+    /// gets past it, which is the opposite of what the exercise is for.
+    fn should_drop(&self, sent: usize) -> bool {
+        match self.config.drop_after {
+            Some(n) if sent >= n => self
+                .drop_armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            _ => false,
+        }
+    }
+
+    /// True while a `--fail-profiles` budget remains, consuming one.
+    fn take_profile_failure(&self) -> bool {
+        self.profile_failures_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+            .is_ok()
     }
 
     fn mint_ticket(&self) -> String {
@@ -295,7 +327,7 @@ async fn serve_ws(ws: WebSocketStream<TcpStream>, state: Arc<GatewayState>) {
         return;
     }
     sent += 1;
-    if state.config.drop_after.is_some_and(|n| sent >= n) {
+    if state.should_drop(sent) {
         return;
     }
 
@@ -307,7 +339,7 @@ async fn serve_ws(ws: WebSocketStream<TcpStream>, state: Arc<GatewayState>) {
                     return;
                 }
                 sent += 1;
-                if state.config.drop_after.is_some_and(|n| sent >= n) {
+                if state.should_drop(sent) {
                     return;
                 }
             }
@@ -348,6 +380,7 @@ fn handle_rpc_line(line: &str, state: &Arc<GatewayState>, out: &mpsc::UnboundedS
         "session.most_recent" => handle_session_most_recent(state, out, id),
         "session.resume" => handle_session_resume(state, out, id, &params),
         "session.events.since" => handle_events_since(state, out, id, &params),
+        "session.title" => handle_session_title(state, out, id, &params),
         "session.close" => handle_session_close(state, out, id, &params),
         "session.interrupt" => handle_session_interrupt(state, out, id, &params),
         "prompt.submit" => handle_prompt_submit(state, out, id, &params),
@@ -383,6 +416,35 @@ fn session_entry_json(record: &SessionRecord) -> Value {
         "message_count": 0,
         "source": "fake",
     })
+}
+
+/// `session.title` both reads and writes: the rename path sends a title, the
+/// auto-title path sends none and expects whatever the server holds. The core
+/// pushes its own `session.title` event once this reply lands, so the server
+/// sends no frame of its own.
+fn handle_session_title(
+    state: &Arc<GatewayState>,
+    out: &mpsc::UnboundedSender<String>,
+    id: Value,
+    params: &Value,
+) {
+    let session_id = params.get("session_id").and_then(Value::as_str).unwrap_or_default();
+    let requested = params.get("title").and_then(Value::as_str);
+    let mut sessions = state.sessions.lock();
+    let record = sessions.entry(session_id.to_string()).or_insert_with(|| {
+        SessionRecord::new(
+            session_id.to_string(),
+            String::new(),
+            now_marker(),
+            state.next_order.fetch_add(1, Ordering::SeqCst),
+        )
+    });
+    if let Some(title) = requested {
+        record.title = title.to_string();
+    }
+    let title = record.title.clone();
+    drop(sessions);
+    reply_ok(out, id, json!({"title": title, "pending": false}));
 }
 
 fn handle_session_create(
@@ -825,6 +887,9 @@ fn route_http(
                 "hermes_session_rt=; Path=/; HttpOnly; Max-Age=0".to_string(),
             ],
         ),
+        ("GET", "/api/profiles") if state.take_profile_failure() => {
+            (500, json!({"detail": "profiles unavailable"}), Vec::new())
+        }
         ("GET", "/api/profiles") => {
             if has_session_cookie {
                 (200, profiles_body(), Vec::new())

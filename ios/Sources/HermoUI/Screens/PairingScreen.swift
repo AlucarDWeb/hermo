@@ -46,6 +46,11 @@ public struct PairingScreen: View {
                 text: Binding(get: { pairingPayload }, set: onPairingPayloadChanged)
             )
             .textFieldStyle(.roundedBorder)
+            // The payload is a machine string: iOS capitalises the scheme and
+            // autocorrects the host, where Compose leaves the field alone.
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .keyboardType(.URL)
             .padding(.top, 16)
             .accessibilityIdentifier("hermo.pairing.payloadField")
             Button(action: onPair) {

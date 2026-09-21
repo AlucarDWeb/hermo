@@ -42,6 +42,7 @@ public struct BotDrawer: View {
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture { onDismiss() }
+                    .accessibilityHidden(true)
                     .accessibilityIdentifier("hermo.drawer.scrim")
 
                 BotDrawerPanel(
@@ -53,6 +54,8 @@ public struct BotDrawer: View {
                 .frame(maxWidth: Self.panelMaxWidth, maxHeight: .infinity, alignment: .leading)
                 .glassEffect(.regular, in: .rect(cornerRadius: 24))
                 .accessibilityElement(children: .contain)
+                .accessibilityAddTraits(logoutConfirm ? [] : .isModal)
+                .accessibilityAction(.escape) { onDismiss() }
                 .accessibilityIdentifier("hermo.drawer.panel")
 
                 if logoutConfirm {
@@ -60,6 +63,7 @@ public struct BotDrawer: View {
                         .ignoresSafeArea()
                         .contentShape(Rectangle())
                         .onTapGesture { logoutConfirm = false }
+                        .accessibilityHidden(true)
                     LogoutConfirmDialog(
                         onConfirm: {
                             logoutConfirm = false
@@ -68,6 +72,8 @@ public struct BotDrawer: View {
                         },
                         onCancel: { logoutConfirm = false }
                     )
+                    .accessibilityAddTraits(.isModal)
+                    .accessibilityAction(.escape) { logoutConfirm = false }
                 }
             }
         }
@@ -185,6 +191,7 @@ private struct BotDrawerRowView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityHint("Opens this bot's chat")
         .accessibilityIdentifier("hermo.drawer.profile.\(row.name)")
     }
 }

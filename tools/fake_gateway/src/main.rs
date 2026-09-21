@@ -8,6 +8,9 @@ use hermes_fake_gateway::server;
 /// The recorded fixtures live in the core crate and are read, never written.
 const CORE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../hermes_core/tests/fixtures");
 
+/// This crate's own fixtures, for frames the recording never carried.
+const CRATE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures");
+
 fn print_usage() {
     println!("hermes-fake-gateway [flags]");
     println!();
@@ -20,7 +23,9 @@ fn print_usage() {
     println!(
         "  --synthetic <path>     synthetic fixture (default: ../../hermes_core/tests/fixtures/events_synthetic.jsonl)"
     );
-    println!("  --drop-after <n>       drop the websocket connection after n frames");
+    println!("  --clarify <path>       synthetic clarify request (default: fixtures/clarify_synthetic.jsonl)");
+    println!("  --fail-profiles <n>    answer the first n /api/profiles requests with a 500");
+    println!("  --drop-after <n>       drop the first websocket connection after n frames (once)");
     println!("  --name <name>          pairing display name (default: fake)");
     println!("  --help                 print this message");
 }
@@ -32,7 +37,10 @@ async fn main() {
     let mut password = "hermo".to_string();
     let mut fixture = PathBuf::from(CORE_FIXTURES).join("events.jsonl");
     let mut synthetic = PathBuf::from(CORE_FIXTURES).join("events_synthetic.jsonl");
+    let default_clarify = PathBuf::from(CRATE_FIXTURES).join("clarify_synthetic.jsonl");
+    let mut clarify: Option<PathBuf> = default_clarify.exists().then_some(default_clarify);
     let mut drop_after: Option<usize> = None;
+    let mut fail_profiles: usize = 0;
     let mut name = "fake".to_string();
 
     let mut it = std::env::args().skip(1);
@@ -58,6 +66,14 @@ async fn main() {
             "--password" => password = take("--password"),
             "--fixture" => fixture = PathBuf::from(take("--fixture")),
             "--synthetic" => synthetic = PathBuf::from(take("--synthetic")),
+            "--clarify" => clarify = Some(PathBuf::from(take("--clarify"))),
+            "--fail-profiles" => {
+                let v = take("--fail-profiles");
+                fail_profiles = v.parse().unwrap_or_else(|_| {
+                    eprintln!("hermes-fake-gateway: --fail-profiles must be a number");
+                    std::process::exit(2);
+                });
+            }
             "--drop-after" => {
                 let v = take("--drop-after");
                 let n: usize = v.parse().unwrap_or_else(|_| {
@@ -84,6 +100,8 @@ async fn main() {
         password,
         fixture,
         synthetic: Some(synthetic),
+        clarify,
+        fail_profiles,
         drop_after,
     };
 

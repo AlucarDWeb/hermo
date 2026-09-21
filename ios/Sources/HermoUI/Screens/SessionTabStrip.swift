@@ -62,6 +62,7 @@ public struct SessionTabStrip: View {
                     .frame(width: 40, height: 40)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("New session tab")
             .accessibilityIdentifier("hermo.chat.tab.add")
         }
     }
@@ -76,6 +77,10 @@ private struct SessionTabPill: View {
     let onClose: () -> Void
     @Environment(\.hermoTokens) private var tokens
 
+    private var titleLabel: String {
+        tab.title.isEmpty ? "New session" : tab.title
+    }
+
     var body: some View {
         GlassPill(active: active) {
             HStack(spacing: 6) {
@@ -89,6 +94,11 @@ private struct SessionTabPill: View {
                     .foregroundStyle(active ? tokens.text : tokens.textTertiary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .accessibilityLabel(titleLabel)
+                    .accessibilityValue(tab.running ? "Running" : "")
+                    .accessibilityAddTraits(active ? [.isButton, .isSelected] : [.isButton])
+                    .accessibilityHint("Switches to this session")
+                    .accessibilityAction { onSelect() }
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .medium))
@@ -96,6 +106,7 @@ private struct SessionTabPill: View {
                         .frame(width: 40, height: 40)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Close \(titleLabel)")
                 .accessibilityIdentifier("hermo.chat.tab.\(tab.key).close")
             }
             .padding(.leading, 10)

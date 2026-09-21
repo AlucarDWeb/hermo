@@ -109,6 +109,8 @@ async fn core_pairs_logs_in_and_streams_a_turn() {
         password: "hermo".to_string(),
         fixture: PathBuf::from(CORE_FIXTURES).join("events.jsonl"),
         synthetic: Some(PathBuf::from(CORE_FIXTURES).join("events_synthetic.jsonl")),
+        clarify: None,
+        fail_profiles: 0,
         drop_after: None,
     })
     .await

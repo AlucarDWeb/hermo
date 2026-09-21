@@ -31,6 +31,14 @@ public struct ChatTitlebar: View {
         title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var appearanceValue: String {
+        switch themeMode {
+        case .light: "Light"
+        case .dark: "Dark"
+        case .system: "System"
+        }
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             GlassBar {
@@ -41,6 +49,7 @@ public struct ChatTitlebar: View {
                                 .foregroundStyle(tokens.textSecondary)
                                 .frame(width: 40, height: 40)
                         }
+                        .accessibilityLabel("Open bots drawer")
                         .accessibilityIdentifier("hermo.chat.menu")
                     }
 
@@ -50,6 +59,7 @@ public struct ChatTitlebar: View {
                                 .foregroundStyle(tokens.textSecondary)
                                 .frame(width: 40, height: 40)
                         }
+                        .accessibilityLabel("Rename session")
                         .accessibilityIdentifier("hermo.chat.rename")
                     }
 
@@ -67,6 +77,8 @@ public struct ChatTitlebar: View {
                             .padding(.horizontal, 12)
                             .frame(height: 40)
                         }
+                        .accessibilityLabel("Open session picker")
+                        .accessibilityValue(isBlankTitle ? "New session" : title)
                         .accessibilityIdentifier("hermo.chat.titlePicker")
                     }
                     .frame(maxWidth: .infinity)
@@ -77,6 +89,8 @@ public struct ChatTitlebar: View {
                                 .foregroundStyle(tokens.textSecondary)
                                 .frame(width: 40, height: 40)
                         }
+                        .accessibilityLabel("Appearance settings")
+                        .accessibilityValue(appearanceValue)
                         .accessibilityIdentifier("hermo.chat.appearance")
                     }
                 }

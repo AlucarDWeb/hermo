@@ -22,6 +22,7 @@ pub struct Fixtures {
     scenarios: HashMap<TurnKind, Vec<Value>>,
     ready: Value,
     approval_frame: Option<Value>,
+    clarify_frame: Option<Value>,
     session_info: Option<Value>,
 }
 
@@ -32,13 +33,23 @@ impl Fixtures {
             scenarios,
             ready,
             approval_frame: None,
+            clarify_frame: None,
             session_info,
         })
     }
 
-    pub fn load_with_synthetic(events: &Path, synthetic: &Path) -> io::Result<Fixtures> {
+    /// The recording's clarify turn arrives already answered, so a live card
+    /// only exists when `clarify` supplies a synthetic `clarify.request`.
+    pub fn load_with_synthetic(
+        events: &Path,
+        synthetic: &Path,
+        clarify: Option<&Path>,
+    ) -> io::Result<Fixtures> {
         let mut fixtures = Fixtures::load(events)?;
         fixtures.approval_frame = load_first_object(synthetic)?;
+        if let Some(clarify) = clarify {
+            fixtures.clarify_frame = load_first_object(clarify)?;
+        }
         Ok(fixtures)
     }
 
@@ -67,11 +78,18 @@ impl Fixtures {
                 .cloned()
                 .unwrap_or_else(|| self.plain_frames()),
             TurnKind::Tool => self.scenarios.get(&TurnKind::Tool).cloned().unwrap_or_default(),
-            TurnKind::Clarify => self
-                .scenarios
-                .get(&TurnKind::Clarify)
-                .cloned()
-                .unwrap_or_default(),
+            TurnKind::Clarify => match &self.clarify_frame {
+                Some(frame) => {
+                    let mut frames = vec![frame.clone()];
+                    frames.extend(self.plain_frames());
+                    frames
+                }
+                None => self
+                    .scenarios
+                    .get(&TurnKind::Clarify)
+                    .cloned()
+                    .unwrap_or_default(),
+            },
             TurnKind::Approval => {
                 let mut frames = Vec::new();
                 if let Some(frame) = &self.approval_frame {
@@ -230,4 +248,47 @@ fn load_first_object(path: &Path) -> io::Result<Option<Value>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CORE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../hermes_core/tests/fixtures");
+    const CRATE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures");
+
+    fn event_type(frame: &Value) -> &str {
+        frame
+            .get("params")
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn clarify_turn_opens_with_the_synthetic_request() {
+        let fixtures = Fixtures::load_with_synthetic(
+            &Path::new(CORE_FIXTURES).join("events.jsonl"),
+            &Path::new(CORE_FIXTURES).join("events_synthetic.jsonl"),
+            Some(&Path::new(CRATE_FIXTURES).join("clarify_synthetic.jsonl")),
+        )
+        .expect("fixtures load");
+
+        let frames = fixtures.turn(TurnKind::Clarify);
+        assert_eq!(event_type(&frames[0]), "clarify.request");
+        assert!(frames.len() > 1, "the clarify request is followed by a turn");
+    }
+
+    #[test]
+    fn clarify_turn_without_the_file_replays_the_recording() {
+        let fixtures = Fixtures::load_with_synthetic(
+            &Path::new(CORE_FIXTURES).join("events.jsonl"),
+            &Path::new(CORE_FIXTURES).join("events_synthetic.jsonl"),
+            None,
+        )
+        .expect("fixtures load");
+
+        let frames = fixtures.turn(TurnKind::Clarify);
+        assert_ne!(event_type(&frames[0]), "clarify.request");
+    }
 }

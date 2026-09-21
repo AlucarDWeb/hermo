@@ -105,12 +105,16 @@ private struct SessionPickerRow: View {
                 .fill(tokens.midground)
                 .frame(width: 8, height: 8)
                 .padding(4)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 0) {
                 Text(title)
                     .font(.system(size: HermoMetrics.convFontSize))
                     .foregroundStyle(tokens.text)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint("Opens this session")
+                    .accessibilityAction { onTap() }
                 if !preview.isEmpty {
                     Text(preview)
                         .font(.system(size: HermoMetrics.convToolFontSize))
