@@ -28,6 +28,7 @@ public struct StatusStrip: View {
             Circle()
                 .fill(state.running ? tokens.midground : tokens.successDot)
                 .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
                 .accessibilityIdentifier("hermo.chat.statusStrip.dot")
             Text(state.running ? "Hermes is working" : "Ready")
                 .font(.system(size: HermoMetrics.convToolFontSize))
@@ -38,6 +39,8 @@ public struct StatusStrip: View {
                 Text(usageLabel)
                     .font(.system(size: 10))
                     .foregroundStyle(tokens.scaffoldMeta)
+                    .accessibilityLabel("Context usage")
+                    .accessibilityValue(usageLabel)
                     .accessibilityIdentifier("hermo.chat.statusStrip.usage")
             }
             if state.running || elapsed > 0 {
@@ -45,6 +48,8 @@ public struct StatusStrip: View {
                     .font(.system(size: 9))
                     .tracking(0.2)
                     .foregroundStyle(tokens.midground.opacity(0.55))
+                    .accessibilityLabel("Elapsed time")
+                    .accessibilityValue(ToolCardModel.formatElapsed(elapsed))
                     .accessibilityIdentifier("hermo.chat.statusStrip.elapsed")
             }
         }

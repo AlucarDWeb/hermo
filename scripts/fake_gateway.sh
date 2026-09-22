@@ -6,6 +6,7 @@
 # Usage:
 #   scripts/fake_gateway.sh [start] [--port <n>] [--user <name>] [--password <pw>]
 #                            [--fixture <path>] [--drop-after <n>]
+#                            [--clarify <path>] [--fail-profiles <n>]
 #   scripts/fake_gateway.sh stop
 #   scripts/fake_gateway.sh status
 #
@@ -38,6 +39,8 @@ GW_USER=""
 GW_PASSWORD=""
 FIXTURE=""
 DROP_AFTER=""
+CLARIFY=""
+FAIL_PROFILES=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +49,8 @@ while [[ $# -gt 0 ]]; do
         --password)   GW_PASSWORD="$2"; shift 2 ;;
         --fixture)    FIXTURE="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
         --drop-after) DROP_AFTER="$2"; shift 2 ;;
+        --clarify)    CLARIFY="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
+        --fail-profiles) FAIL_PROFILES="$2"; shift 2 ;;
         -h|--help)
             awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -96,6 +101,8 @@ do_start() {
     [[ -n "$GW_PASSWORD" ]] && bin_args+=(--password "$GW_PASSWORD")
     [[ -n "$FIXTURE" ]] && bin_args+=(--fixture "$FIXTURE")
     [[ -n "$DROP_AFTER" ]] && bin_args+=(--drop-after "$DROP_AFTER")
+    [[ -n "$CLARIFY" ]] && bin_args+=(--clarify "$CLARIFY")
+    [[ -n "$FAIL_PROFILES" ]] && bin_args+=(--fail-profiles "$FAIL_PROFILES")
 
     : > "$LOG_FILE"
     (

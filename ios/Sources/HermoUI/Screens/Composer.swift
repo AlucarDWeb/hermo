@@ -56,6 +56,7 @@ public struct Composer: View {
             .tint(tokens.midground)
             .focused($focused)
             .frame(minHeight: HermoMetrics.composerControlRowHeight)
+            .accessibilityLabel("Message")
             .accessibilityIdentifier("hermo.chat.composer.field")
             if !model.isEmpty {
                 ModelPill(model: model)
@@ -75,6 +76,7 @@ public struct Composer: View {
             .buttonStyle(.glassProminent)
             .tint(tokens.primary)
             .disabled(!sendEnabled)
+            .accessibilityLabel(running ? "Stop the running turn" : "Send message")
             .accessibilityIdentifier(running ? "hermo.chat.composer.stop" : "hermo.chat.composer.send")
         }
         .padding(.horizontal, HermoMetrics.composerSurfacePadX)

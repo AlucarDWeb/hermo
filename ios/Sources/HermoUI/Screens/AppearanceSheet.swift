@@ -56,6 +56,7 @@ private struct AppearanceRow: View {
                         .fill(tokens.midground)
                         .frame(width: 8, height: 8)
                         .padding(4)
+                        .accessibilityHidden(true)
                 }
             }
             .padding(.horizontal, 16)
@@ -63,6 +64,7 @@ private struct AppearanceRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
         .accessibilityIdentifier("hermo.appearance.\(mode.rawValue.lowercased())")
     }
 }

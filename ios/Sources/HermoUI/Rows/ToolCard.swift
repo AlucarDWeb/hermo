@@ -83,6 +83,7 @@ public struct ToolCard: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityHint(open ? "Collapses the tool trace" : "Expands the tool trace")
         .accessibilityIdentifier("hermo.chat.row.tool.\(id).toggle")
     }
 

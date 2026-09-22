@@ -123,7 +123,9 @@ private struct ClarifyQuestionBlock: View {
                             ChoiceButton(
                                 label: choice,
                                 primary: selected.contains(choice),
-                                identifier: "\(identifierPrefix).choice.\(index)"
+                                identifier: "\(identifierPrefix).choice.\(index)",
+                                hint: "Picks this answer",
+                                selected: selected.contains(choice)
                             ) {
                                 pick(choice)
                             }
@@ -137,6 +139,9 @@ private struct ClarifyQuestionBlock: View {
                     .padding(.top, 8)
                     .padding(.bottom, 4)
                 TextField("", text: $draft)
+                    // The answer reaches the agent verbatim, like the composer draft.
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
                     .font(.system(size: HermoMetrics.convFontSize))
                     .foregroundStyle(tokens.text)
                     .tint(tokens.primary)
@@ -155,8 +160,14 @@ private struct ClarifyQuestionBlock: View {
                             selected = []
                         }
                     }
+                    .accessibilityLabel("Other answer")
                     .accessibilityIdentifier("\(identifierPrefix).other")
-                ChoiceButton(label: "Continue", primary: true, identifier: "\(identifierPrefix).continue") {
+                ChoiceButton(
+                    label: "Continue",
+                    primary: true,
+                    identifier: "\(identifierPrefix).continue",
+                    hint: "Sends the answer"
+                ) {
                     let answer = encodeClarifyAnswer(question, picks: selected, draft: draft)
                     if !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         onSubmit(answer)

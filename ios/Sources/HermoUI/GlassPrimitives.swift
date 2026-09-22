@@ -40,13 +40,24 @@ public struct ChoiceButton: View {
     private let label: String
     private let primary: Bool
     private let identifier: String?
+    private let hint: String?
+    private let selected: Bool
     private let action: () -> Void
     @Environment(\.hermoTokens) private var tokens
 
-    public init(label: String, primary: Bool, identifier: String? = nil, action: @escaping () -> Void) {
+    public init(
+        label: String,
+        primary: Bool,
+        identifier: String? = nil,
+        hint: String? = nil,
+        selected: Bool = false,
+        action: @escaping () -> Void
+    ) {
         self.label = label
         self.primary = primary
         self.identifier = identifier
+        self.hint = hint
+        self.selected = selected
         self.action = action
     }
 
@@ -57,6 +68,9 @@ public struct ChoiceButton: View {
         }
         .buttonStyle(.glass)
         .tint(primary ? tokens.primarySolid : nil)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .modifier(OptionalAccessibilityHint(hint: hint))
         .modifier(OptionalAccessibilityIdentifier(identifier: identifier))
     }
 }
@@ -98,6 +112,7 @@ public struct Chevron: View {
             // 11 pt is TranscriptRow.kt:340's literal, not a Theme.kt token.
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(tint)
+            .accessibilityHidden(true)
     }
 }
 
@@ -135,6 +150,19 @@ public struct ScaffoldGlyph: View {
         .font(.system(size: 9, weight: .medium))
         .foregroundStyle(tint ?? tokens.scaffoldMeta)
         .frame(width: 14, alignment: .leading)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct OptionalAccessibilityHint: ViewModifier {
+    let hint: String?
+
+    func body(content: Content) -> some View {
+        if let hint {
+            content.accessibilityHint(hint)
+        } else {
+            content
+        }
     }
 }
 

@@ -111,7 +111,8 @@ public struct ApprovalCard: View {
                 ChoiceButton(
                     label: ApprovalCopy.alwaysConfirm,
                     primary: true,
-                    identifier: "hermo.chat.row.approval.\(id).always.confirm"
+                    identifier: "hermo.chat.row.approval.\(id).always.confirm",
+                    hint: "Approves this command and every later one like it"
                 ) {
                     onChoice(requestId, "always")
                     confirmingAlways = false
@@ -119,7 +120,8 @@ public struct ApprovalCard: View {
                 ChoiceButton(
                     label: ApprovalCopy.alwaysCancel,
                     primary: false,
-                    identifier: "hermo.chat.row.approval.\(id).always.cancel"
+                    identifier: "hermo.chat.row.approval.\(id).always.cancel",
+                    hint: "Returns to the approval choices"
                 ) {
                     confirmingAlways = false
                 }
@@ -137,7 +139,8 @@ public struct ApprovalCard: View {
                 ChoiceButton(
                     label: label,
                     primary: isPrimary,
-                    identifier: "hermo.chat.row.approval.\(id).choice.\(wire)"
+                    identifier: "hermo.chat.row.approval.\(id).choice.\(wire)",
+                    hint: "Answers the approval request"
                 ) {
                     if wire == "always" {
                         confirmingAlways = true

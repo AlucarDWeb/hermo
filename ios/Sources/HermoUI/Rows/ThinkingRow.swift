@@ -74,7 +74,9 @@ public struct ThinkingRow: View {
         .onTapGesture {
             userToggledOpen = !(userToggledOpen ?? live)
         }
+        .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
+        .accessibilityHint(open ? "Collapses the reasoning" : "Expands the reasoning")
         .accessibilityIdentifier("hermo.chat.row.thinking.toggle")
     }
 }
